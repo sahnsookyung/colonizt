@@ -1,0 +1,478 @@
+import { readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import pg from "pg";
+
+const { Pool } = pg;
+
+export interface DbConfig {
+  connectionString: string;
+}
+
+export const createPool = (config: DbConfig): pg.Pool => new Pool({ connectionString: config.connectionString });
+
+const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), "../migrations");
+
+export const migrationFiles = ["001_init.sql", "002_sessions_and_event_writes.sql", "003_command_results_and_room_metadata.sql"];
+
+export const readMigration = async (name: string): Promise<string> => readFile(join(migrationsDir, name), "utf8");
+
+export const runMigrations = async (pool: pg.Pool): Promise<void> => {
+  await pool.query("CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())");
+  for (const file of migrationFiles) {
+    const applied = await pool.query("SELECT 1 FROM schema_migrations WHERE name = $1", [file]);
+    if ((applied.rowCount ?? 0) > 0) continue;
+    const sql = await readMigration(file);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(sql);
+      await client.query("INSERT INTO schema_migrations(name) VALUES ($1)", [file]);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+};
+
+export const appendMatchEvents = async (
+  pool: pg.Pool,
+  matchId: string,
+  events: Array<{ seq: number; type: string; payload: unknown }>,
+): Promise<void> => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const event of events) {
+      await client.query(
+        "INSERT INTO match_events(match_id, seq, event_type, payload_json) VALUES ($1, $2, $3, $4)",
+        [matchId, event.seq, event.type, event.payload],
+      );
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
+export interface PersistRoomInput {
+  id: string;
+  mode: string;
+  status: string;
+  hostUserId: string;
+  settings: unknown;
+  seats: Array<{ seatIndex: number; userId?: string; botId?: string; ready: boolean; connected: boolean }>;
+}
+
+export interface PersistMatchInput {
+  id: string;
+  roomId: string;
+  mode: string;
+  ranked: boolean;
+  seedHash: string;
+  config: unknown;
+  board: unknown;
+  players: Array<{ userId: string; seatIndex: number }>;
+}
+
+export interface PersistSessionInput {
+  tokenHash: string;
+  userId: string;
+  displayName: string;
+  expiresAt?: string;
+}
+
+export const upsertSession = async (pool: pg.Pool, session: PersistSessionInput): Promise<void> => {
+  await pool.query(
+    `INSERT INTO sessions(token, user_id, display_name, expires_at)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (token) DO UPDATE
+     SET user_id = EXCLUDED.user_id,
+         display_name = EXCLUDED.display_name,
+         expires_at = EXCLUDED.expires_at,
+         last_seen_at = now(),
+         revoked_at = NULL`,
+    [session.tokenHash, session.userId, session.displayName, session.expiresAt ?? null],
+  );
+  await pool.query(
+    `INSERT INTO users(id, display_name)
+     VALUES ($1, $2)
+     ON CONFLICT (id) DO UPDATE
+     SET display_name = EXCLUDED.display_name`,
+    [session.userId, session.displayName],
+  );
+};
+
+export interface PersistedSessionRecord {
+  tokenHash: string;
+  userId: string;
+  displayName: string;
+  expiresAt?: string;
+}
+
+export const listPersistedSessions = async (pool: pg.Pool, limit = 200): Promise<PersistedSessionRecord[]> => {
+  const result = await pool.query(
+    `SELECT token, user_id, display_name, expires_at
+     FROM sessions
+     WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())
+     ORDER BY last_seen_at DESC
+     LIMIT $1`,
+    [limit],
+  );
+  return result.rows.map((row) => ({
+    tokenHash: row.token,
+    userId: row.user_id,
+    displayName: row.display_name,
+    expiresAt: row.expires_at ? (row.expires_at instanceof Date ? row.expires_at.toISOString() : String(row.expires_at)) : undefined,
+  }));
+};
+
+export const findPersistedSessionByTokenHash = async (pool: pg.Pool, tokenHash: string): Promise<PersistedSessionRecord | undefined> => {
+  const result = await pool.query(
+    `UPDATE sessions
+     SET last_seen_at = now()
+     WHERE token = $1
+       AND revoked_at IS NULL
+       AND (expires_at IS NULL OR expires_at > now())
+     RETURNING token, user_id, display_name, expires_at`,
+    [tokenHash],
+  );
+  const row = result.rows[0];
+  return row ? {
+    tokenHash: row.token,
+    userId: row.user_id,
+    displayName: row.display_name,
+    expiresAt: row.expires_at ? (row.expires_at instanceof Date ? row.expires_at.toISOString() : String(row.expires_at)) : undefined,
+  } : undefined;
+};
+
+export const upsertRoom = async (pool: pg.Pool, room: PersistRoomInput): Promise<void> => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO rooms(id, mode, status, host_user_id, settings_json)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (id) DO UPDATE
+       SET mode = EXCLUDED.mode,
+           status = EXCLUDED.status,
+           settings_json = EXCLUDED.settings_json,
+           updated_at = now()`,
+      [room.id, room.mode, room.status, room.hostUserId, room.settings],
+    );
+    for (const seat of room.seats) {
+      await client.query(
+        `INSERT INTO room_seats(room_id, seat_index, user_id, bot_id, ready, connected)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (room_id, seat_index) DO UPDATE
+         SET user_id = EXCLUDED.user_id,
+             bot_id = EXCLUDED.bot_id,
+             ready = EXCLUDED.ready,
+             connected = EXCLUDED.connected`,
+        [room.id, seat.seatIndex, seat.userId ?? null, seat.botId ?? null, seat.ready, seat.connected],
+      );
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
+export const insertMatch = async (pool: pg.Pool, match: PersistMatchInput): Promise<void> => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO matches(id, room_id, mode, ranked, seed_hash, config_json, board_json)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (id) DO NOTHING`,
+      [match.id, match.roomId, match.mode, match.ranked, match.seedHash, match.config, match.board],
+    );
+    for (const player of match.players) {
+      await client.query(
+        `INSERT INTO match_players(match_id, user_id, seat_index)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (match_id, user_id) DO NOTHING`,
+        [match.id, player.userId, player.seatIndex],
+      );
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
+export const markMatchFinished = async (pool: pg.Pool, matchId: string, winnerUserId: string): Promise<void> => {
+  await pool.query("UPDATE matches SET ended_at = now(), winner_user_id = $2 WHERE id = $1", [matchId, winnerUserId]);
+};
+
+export const insertChatMessage = async (
+  pool: pg.Pool,
+  message: { id: string; matchId?: string; userId: string; message: string },
+): Promise<void> => {
+  await pool.query(
+    `INSERT INTO chat_messages(id, match_id, user_id, message)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (id) DO NOTHING`,
+    [message.id, message.matchId ?? null, message.userId, message.message],
+  );
+};
+
+export const insertReport = async (
+  pool: pg.Pool,
+  report: { id: string; reporterUserId: string; reportedUserId: string; matchId?: string; reason: string; status: string },
+): Promise<void> => {
+  await pool.query(
+    `INSERT INTO reports(id, reporter_user_id, reported_user_id, match_id, reason, status)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (id) DO NOTHING`,
+    [report.id, report.reporterUserId, report.reportedUserId, report.matchId ?? null, report.reason, report.status],
+  );
+};
+
+export const insertAnalyticsEvent = async (
+  pool: pg.Pool,
+  event: { id: string; userId?: string; matchId?: string; eventName: string; payload: unknown },
+): Promise<void> => {
+  await pool.query(
+    `INSERT INTO analytics_events(id, user_id, match_id, event_name, payload_json)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (id) DO NOTHING`,
+    [event.id, event.userId ?? null, event.matchId ?? null, event.eventName, event.payload],
+  );
+};
+
+export interface PersistCommandResultInput {
+  roomId: string;
+  matchId?: string;
+  userId: string;
+  clientSeq: number;
+  commandHash: string;
+  ok: boolean;
+  seqStart?: number;
+  seqEnd?: number;
+  events?: unknown[];
+  rejectionCode?: string;
+  rejectionMessage?: string;
+}
+
+export const upsertCommandResult = async (pool: pg.Pool, result: PersistCommandResultInput): Promise<void> => {
+  await pool.query(
+    `INSERT INTO command_results(
+       room_id, match_id, user_id, client_seq, command_hash, ok,
+       seq_start, seq_end, events_json, rejection_code, rejection_message
+     )
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+     ON CONFLICT (room_id, user_id, client_seq) DO NOTHING`,
+    [
+      result.roomId,
+      result.matchId ?? null,
+      result.userId,
+      result.clientSeq,
+      result.commandHash,
+      result.ok,
+      result.seqStart ?? null,
+      result.seqEnd ?? null,
+      result.events ?? null,
+      result.rejectionCode ?? null,
+      result.rejectionMessage ?? null,
+    ],
+  );
+};
+
+export interface PersistedCommandResultRecord {
+  roomId: string;
+  matchId?: string;
+  userId: string;
+  clientSeq: number;
+  commandHash: string;
+  ok: boolean;
+  seqStart?: number;
+  seqEnd?: number;
+  events?: unknown[];
+  rejectionCode?: string;
+  rejectionMessage?: string;
+}
+
+export const findCommandResult = async (
+  pool: pg.Pool,
+  roomId: string,
+  userId: string,
+  clientSeq: number,
+): Promise<PersistedCommandResultRecord | undefined> => {
+  const result = await pool.query(
+    `SELECT room_id, match_id, user_id, client_seq, command_hash, ok, seq_start, seq_end, events_json, rejection_code, rejection_message
+     FROM command_results
+     WHERE room_id = $1 AND user_id = $2 AND client_seq = $3`,
+    [roomId, userId, clientSeq],
+  );
+  const row = result.rows[0];
+  if (!row) return undefined;
+  const record: PersistedCommandResultRecord = {
+    roomId: row.room_id,
+    userId: row.user_id,
+    clientSeq: Number(row.client_seq),
+    commandHash: row.command_hash,
+    ok: row.ok,
+  };
+  if (row.match_id) record.matchId = row.match_id;
+  if (row.seq_start != null) record.seqStart = Number(row.seq_start);
+  if (row.seq_end != null) record.seqEnd = Number(row.seq_end);
+  if (row.events_json) record.events = row.events_json;
+  if (row.rejection_code) record.rejectionCode = row.rejection_code;
+  if (row.rejection_message) record.rejectionMessage = row.rejection_message;
+  return record;
+};
+
+export const loadReplayLog = async (pool: pg.Pool, matchId: string): Promise<{ config: unknown; board: unknown; events: unknown[] } | undefined> => {
+  const match = await pool.query("SELECT config_json, board_json FROM matches WHERE id = $1", [matchId]);
+  if ((match.rowCount ?? 0) === 0) return undefined;
+  const events = await pool.query("SELECT payload_json FROM match_events WHERE match_id = $1 ORDER BY seq ASC", [matchId]);
+  return {
+    config: match.rows[0].config_json,
+    board: match.rows[0].board_json,
+    events: events.rows.map((row) => row.payload_json),
+  };
+};
+
+export const loadReplayLogByRoomId = async (
+  pool: pg.Pool,
+  roomId: string,
+): Promise<{ matchId: string; config: unknown; board: unknown; events: unknown[] } | undefined> => {
+  const match = await pool.query("SELECT id FROM matches WHERE room_id = $1 ORDER BY started_at DESC LIMIT 1", [roomId]);
+  if ((match.rowCount ?? 0) === 0) return undefined;
+  const matchId = match.rows[0].id as string;
+  const replayLog = await loadReplayLog(pool, matchId);
+  return replayLog ? { matchId, ...replayLog } : undefined;
+};
+
+export interface MatchSummary {
+  id: string;
+  roomId: string;
+  mode: string;
+  ranked: boolean;
+  startedAt: string;
+  endedAt?: string;
+  winnerUserId?: string;
+  eventCount: number;
+  playerIds: string[];
+}
+
+export const listMatchSummaries = async (pool: pg.Pool, limit = 20): Promise<MatchSummary[]> => {
+  const result = await pool.query(
+    `SELECT
+       m.id,
+       m.room_id,
+       m.mode,
+       m.ranked,
+       m.started_at,
+       m.ended_at,
+       m.winner_user_id,
+       COALESCE((SELECT MAX(seq) FROM match_events e WHERE e.match_id = m.id), 0)::int AS event_count,
+       COALESCE((SELECT json_agg(mp.user_id ORDER BY mp.seat_index) FROM match_players mp WHERE mp.match_id = m.id), '[]'::json) AS player_ids
+     FROM matches m
+     ORDER BY m.started_at DESC
+     LIMIT $1`,
+    [limit],
+  );
+  return result.rows.map((row) => ({
+    id: row.id,
+    roomId: row.room_id,
+    mode: row.mode,
+    ranked: row.ranked,
+    startedAt: row.started_at instanceof Date ? row.started_at.toISOString() : String(row.started_at),
+    endedAt: row.ended_at ? (row.ended_at instanceof Date ? row.ended_at.toISOString() : String(row.ended_at)) : undefined,
+    winnerUserId: row.winner_user_id ?? undefined,
+    eventCount: Number(row.event_count),
+    playerIds: row.player_ids ?? [],
+  }));
+};
+
+export interface PersistedRoomRecord {
+  id: string;
+  mode: string;
+  status: string;
+  hostUserId: string;
+  settings: unknown;
+  createdAt: string;
+  seats: Array<{ seatIndex: number; userId?: string; botId?: string; ready: boolean; connected: boolean }>;
+  match?: {
+    id: string;
+    config: unknown;
+    board: unknown;
+    events: unknown[];
+    endedAt?: string;
+    winnerUserId?: string;
+  };
+}
+
+export const listPersistedRooms = async (pool: pg.Pool, limit = 50): Promise<PersistedRoomRecord[]> => {
+  const rooms = await pool.query(
+    `SELECT id, mode, status, host_user_id, settings_json, created_at
+     FROM rooms
+     ORDER BY created_at DESC
+     LIMIT $1`,
+    [limit],
+  );
+  const records: PersistedRoomRecord[] = [];
+  for (const row of rooms.rows) {
+    const seats = await pool.query(
+      `SELECT seat_index, user_id, bot_id, ready, connected
+       FROM room_seats
+       WHERE room_id = $1
+       ORDER BY seat_index ASC`,
+      [row.id],
+    );
+    const match = await pool.query(
+      `SELECT id, config_json, board_json, ended_at, winner_user_id
+       FROM matches
+       WHERE room_id = $1
+       ORDER BY started_at DESC
+       LIMIT 1`,
+      [row.id],
+    );
+    const matchRow = match.rows[0];
+    const events = matchRow
+      ? await pool.query("SELECT payload_json FROM match_events WHERE match_id = $1 ORDER BY seq ASC", [matchRow.id])
+      : undefined;
+    const record: PersistedRoomRecord = {
+      id: row.id,
+      mode: row.mode,
+      status: row.status,
+      hostUserId: row.host_user_id,
+      settings: row.settings_json,
+      createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
+      seats: seats.rows.map((seat) => ({
+        seatIndex: seat.seat_index,
+        userId: seat.user_id ?? undefined,
+        botId: seat.bot_id ?? undefined,
+        ready: seat.ready,
+        connected: false,
+      })),
+    };
+    if (matchRow) {
+      record.match = {
+        id: matchRow.id,
+        config: matchRow.config_json,
+        board: matchRow.board_json,
+        events: events?.rows.map((event) => event.payload_json) ?? [],
+      };
+      if (matchRow.ended_at) record.match.endedAt = matchRow.ended_at instanceof Date ? matchRow.ended_at.toISOString() : String(matchRow.ended_at);
+      if (matchRow.winner_user_id) record.match.winnerUserId = matchRow.winner_user_id;
+    }
+    records.push(record);
+  }
+  return records;
+};

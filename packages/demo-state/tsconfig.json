@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "composite": true,
+    "rootDir": "src",
+    "outDir": "dist",
+    "declaration": true
+  },
+  "references": [
+    { "path": "../game-core" },
+    { "path": "../bots" }
+  ],
+  "include": ["src/**/*.ts"]
+}

@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: colonizt
+          POSTGRES_PASSWORD: colonizt
+          POSTGRES_DB: colonizt
+        ports:
+          - 54329:5432
+        options: >-
+          --health-cmd "pg_isready -U colonizt -d colonizt"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6389:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://colonizt:colonizt@127.0.0.1:54329/colonizt
+      REDIS_URL: redis://127.0.0.1:6389
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run scan:branding
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run test:unit
+      - run: npm run test:property
+      - run: npm run test:integration
+      - run: npm --workspace @colonizt/web run test
+      - run: npm run replay:fixtures
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e -- --project=chromium
+      - run: npm --workspace @colonizt/db run migrate
+      - run: npm run smoke:local
+      - run: npm run smoke:network

@@ -1,0 +1,10 @@
+.git
+node_modules
+packages/*/dist
+packages/*/coverage
+coverage
+playwright-report
+test-results
+.env
+.DS_Store
+npm-debug.log*

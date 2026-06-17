@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "composite": true,
+    "rootDir": "src",
+    "outDir": "dist",
+    "declaration": true,
+    "jsx": "react-jsx",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"]
+  },
+  "references": [
+    { "path": "../game-core" },
+    { "path": "../bots" },
+    { "path": "../demo-state" }
+  ],
+  "include": ["src/**/*.ts", "src/**/*.tsx"]
+}

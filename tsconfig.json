@@ -1,0 +1,22 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/game-core" },
+    { "path": "./packages/bots" },
+    { "path": "./packages/demo-state" },
+    { "path": "./packages/test-utils" },
+    { "path": "./packages/db" },
+    { "path": "./packages/server" },
+    { "path": "./packages/web" }
+  ],
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  }
+}
