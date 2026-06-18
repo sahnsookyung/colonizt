@@ -15,6 +15,7 @@ type RoomMessage = {
 };
 type EventsMessage = { type: "EVENTS"; events: Array<{ seq: number; type: string }>; snapshot?: { eventSeq: number } };
 type ResyncMessage = { type: "RESYNC"; events: Array<{ seq: number; type: string }>; snapshot?: { eventSeq: number } };
+type CommandRejectedMessage = { type: "COMMAND_REJECTED"; clientSeq: number; code: string; message: string };
 
 const timeoutMs = Number(process.env.SMOKE_TIMEOUT_MS ?? 15_000);
 const publicApiUrl = process.env.PUBLIC_API_URL?.replace(/\/$/, "");
@@ -64,6 +65,26 @@ const waitForMessage = <T extends { type: string }>(socket: WebSocket, type: str
     };
     socket.on("message", listener);
   }), type);
+
+const waitForCommandRejected = (socket: WebSocket, clientSeq: number): { promise: Promise<never>; cleanup: () => void } => {
+  let listener: ((raw: WebSocket.RawData) => void) | undefined;
+  const promise = new Promise<never>((_, reject) => {
+    listener = (raw: WebSocket.RawData) => {
+      const message = JSON.parse(raw.toString()) as CommandRejectedMessage | { type: string };
+      if (message.type === "COMMAND_REJECTED" && "clientSeq" in message && message.clientSeq === clientSeq) {
+        if (listener) socket.off("message", listener);
+        reject(new Error(`COMMAND rejected: ${message.code} ${message.message}`));
+      }
+    };
+    socket.on("message", listener);
+  });
+  return {
+    promise,
+    cleanup: () => {
+      if (listener) socket.off("message", listener);
+    },
+  };
+};
 
 const createSession = (displayName: string): Promise<Session> =>
   requestJson(`${apiBase}/sessions`, {
@@ -134,13 +155,17 @@ try {
 
   const hostEventsPromise = waitForMessage<EventsMessage>(hostSocket, "EVENTS");
   const peerEventsPromises = playerSockets.slice(1).map((socket) => waitForMessage<EventsMessage>(socket, "EVENTS"));
+  const commandRejected = waitForCommandRejected(activeSocket, 1);
   activeSocket.send(JSON.stringify({
     type: "COMMAND",
     roomId: room.id,
     clientSeq: 1,
     command: { type: "PLACE_SETUP", playerId: activePlayerId, vertexId, edgeId },
   }));
-  const [hostEvents, ...peerEvents] = await Promise.all([hostEventsPromise, ...peerEventsPromises]);
+  const [hostEvents, ...peerEvents] = await Promise.race([
+    Promise.all([hostEventsPromise, ...peerEventsPromises]),
+    commandRejected.promise,
+  ]).finally(commandRejected.cleanup);
   const canonicalSeq = hostEvents.events.map((event) => event.seq).join(",");
   for (const events of peerEvents) {
     if (canonicalSeq !== events.events.map((event) => event.seq).join(",")) {
