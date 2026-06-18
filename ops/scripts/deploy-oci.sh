@@ -48,7 +48,8 @@ remote "sudo docker ps --format '{{.Names}}' | grep -qx jobscout-cloud-caddy"
 remote "sudo test -f ${JOBSCOUT_ROOT}/ops/caddy/Caddyfile"
 
 echo "==> Preparing remote Colonizt directories"
-remote "sudo mkdir -p ${REMOTE_ROOT}/deploy/compose ${REMOTE_ROOT}/ops/caddy ${REMOTE_ROOT}/data/postgres ${REMOTE_STAGING}"
+remote "sudo mkdir -p ${REMOTE_ROOT}/deploy/compose ${REMOTE_ROOT}/ops/caddy ${REMOTE_ROOT}/data/postgres"
+remote "sudo rm -rf ${REMOTE_STAGING} && mkdir -p ${REMOTE_STAGING}"
 
 echo "==> Syncing Colonizt compose and env"
 "${SCP[@]}" "$ENV_FILE" "${REMOTE_USER}@${SERVER_IP}:${REMOTE_STAGING}/.env"
@@ -86,8 +87,10 @@ remote "sudo docker exec jobscout-cloud-caddy caddy reload --config /etc/caddy/C
 
 echo "==> Verifying public endpoints"
 curl -fsS --resolve "jobscout.sookyungahn.com:443:${SERVER_IP}" "https://jobscout.sookyungahn.com/" >/dev/null
-curl -fsS --resolve "colonizt.sookyungahn.com:443:${SERVER_IP}" "https://colonizt.sookyungahn.com/health" | node -e "let data=''; process.stdin.on('data', c => data += c); process.stdin.on('end', () => { const json = JSON.parse(data); if (!json.ok || json.presence !== 'memory') process.exit(1); console.log(JSON.stringify(json)); });"
-curl -fsS --resolve "colonizt.sookyungahn.com:443:${SERVER_IP}" "https://colonizt.sookyungahn.com/config" | node -e "let data=''; process.stdin.on('data', c => data += c); process.stdin.on('end', () => { const json = JSON.parse(data); if (json.apiBaseUrl !== 'https://colonizt.sookyungahn.com' || json.wsBaseUrl !== 'wss://colonizt.sookyungahn.com') process.exit(1); console.log(JSON.stringify({ apiBaseUrl: json.apiBaseUrl, wsBaseUrl: json.wsBaseUrl })); });"
+curl -kfsS --resolve "colonizt.sookyungahn.com:443:${SERVER_IP}" "https://colonizt.sookyungahn.com/health" | node -e "let data=''; process.stdin.on('data', c => data += c); process.stdin.on('end', () => { const json = JSON.parse(data); if (!json.ok || json.presence !== 'memory') process.exit(1); console.log(JSON.stringify({ origin: true, ...json })); });"
+curl -kfsS --resolve "colonizt.sookyungahn.com:443:${SERVER_IP}" "https://colonizt.sookyungahn.com/config" | node -e "let data=''; process.stdin.on('data', c => data += c); process.stdin.on('end', () => { const json = JSON.parse(data); if (json.apiBaseUrl !== 'https://colonizt.sookyungahn.com' || json.wsBaseUrl !== 'wss://colonizt.sookyungahn.com') process.exit(1); console.log(JSON.stringify({ origin: true, apiBaseUrl: json.apiBaseUrl, wsBaseUrl: json.wsBaseUrl })); });"
+curl -fsS "https://colonizt.sookyungahn.com/health" | node -e "let data=''; process.stdin.on('data', c => data += c); process.stdin.on('end', () => { const json = JSON.parse(data); if (!json.ok || json.presence !== 'memory') process.exit(1); console.log(JSON.stringify({ public: true, ...json })); });"
+curl -fsS "https://colonizt.sookyungahn.com/config" | node -e "let data=''; process.stdin.on('data', c => data += c); process.stdin.on('end', () => { const json = JSON.parse(data); if (json.apiBaseUrl !== 'https://colonizt.sookyungahn.com' || json.wsBaseUrl !== 'wss://colonizt.sookyungahn.com') process.exit(1); console.log(JSON.stringify({ public: true, apiBaseUrl: json.apiBaseUrl, wsBaseUrl: json.wsBaseUrl })); });"
 
 remote "rm -rf ${REMOTE_STAGING}"
 echo "Colonizt deployed successfully at https://colonizt.sookyungahn.com"

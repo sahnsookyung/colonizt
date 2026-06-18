@@ -35,3 +35,9 @@ Colonizt can run beside JobScout on the existing OCI host without sharing app st
 ```
 
 Production intentionally omits `REDIS_URL`; `/health` should report `presence: "memory"`.
+
+If `colonizt.sookyungahn.com` is proxied through Cloudflare before Caddy has a
+certificate, Let's Encrypt HTTP/TLS challenges can fail with Cloudflare 525. For
+the first deploy, either set the DNS record to DNS-only until Caddy obtains the
+certificate, or use a Cloudflare DNS-01/API-token based certificate flow. After
+Caddy has a valid public certificate, the record can be proxied again.
