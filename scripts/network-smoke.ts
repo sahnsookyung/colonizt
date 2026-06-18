@@ -88,12 +88,16 @@ try {
   const hostSocket = playerSockets[0];
   if (!hostSocket) throw new Error("No host socket");
 
+  const joinedPromises = playerSockets.map((socket) => waitForMessage<RoomMessage>(socket, "ROOM_STATE"));
   for (const socket of playerSockets) socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.id }));
-  await Promise.all(playerSockets.map((socket) => waitForMessage<RoomMessage>(socket, "ROOM_STATE")));
+  await Promise.all(joinedPromises);
 
+  const startedPromises = playerSockets.map((socket) =>
+    waitForMessage<RoomMessage>(socket, "ROOM_STATE", (message) => message.room.status === "IN_GAME" && Boolean(message.room.game)),
+  );
   for (const socket of playerSockets) socket.send(JSON.stringify({ type: "READY", roomId: room.id, ready: true }));
-  const started = await waitForMessage<RoomMessage>(hostSocket, "ROOM_STATE", (message) => message.room.status === "IN_GAME" && Boolean(message.room.game));
-  await Promise.all(playerSockets.slice(1).map((socket) => waitForMessage<RoomMessage>(socket, "ROOM_STATE", (message) => message.room.status === "IN_GAME" && Boolean(message.room.game))));
+  const [started] = await Promise.all(startedPromises);
+  if (!started) throw new Error("No started room state observed");
 
   const activePlayerId = started.room.game!.phase.activePlayerId;
   if (!activePlayerId) throw new Error("Started game did not expose an active setup player");
@@ -123,8 +127,9 @@ try {
   hostSocket.close();
   const reconnected = await connect(httpBase, wsBase, host.token);
   sockets.push(reconnected);
+  const reconnectedStatePromise = waitForMessage<RoomMessage>(reconnected, "ROOM_STATE");
   reconnected.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.id }));
-  await waitForMessage<RoomMessage>(reconnected, "ROOM_STATE");
+  await reconnectedStatePromise;
   reconnected.send(JSON.stringify({ type: "RESYNC", roomId: room.id, lastSeq: 0 }));
   const resync = await waitForMessage<ResyncMessage>(reconnected, "RESYNC");
   if (resync.snapshot?.eventSeq !== hostEvents.snapshot?.eventSeq) throw new Error("Reconnect snapshot did not match committed sequence");

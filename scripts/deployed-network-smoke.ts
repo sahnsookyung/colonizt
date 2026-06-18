@@ -8,6 +8,7 @@ type RoomMessage = {
     status: string;
     game?: {
       eventSeq: number;
+      phase: { type: string; activePlayerId?: string };
       board: { adjacency: { vertexToEdges: Record<string, string[]> } };
     };
   };
@@ -111,24 +112,33 @@ try {
   sockets.push(...playerSockets);
   const hostSocket = playerSockets[0];
   if (!hostSocket) throw new Error("No host socket");
+  const joinedPromises = playerSockets.map((socket) => waitForMessage<RoomMessage>(socket, "ROOM_STATE"));
   for (const socket of playerSockets) socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.id }));
-  await Promise.all(playerSockets.map((socket) => waitForMessage<RoomMessage>(socket, "ROOM_STATE")));
+  await Promise.all(joinedPromises);
 
+  const startedPromises = playerSockets.map((socket) =>
+    waitForMessage<RoomMessage>(socket, "ROOM_STATE", (message) => message.room.status === "IN_GAME" && Boolean(message.room.game)),
+  );
   for (const socket of playerSockets) socket.send(JSON.stringify({ type: "READY", roomId: room.id, ready: true }));
-  const started = await waitForMessage<RoomMessage>(hostSocket, "ROOM_STATE", (message) => message.room.status === "IN_GAME" && Boolean(message.room.game));
-  await Promise.all(playerSockets.slice(1).map((socket) => waitForMessage<RoomMessage>(socket, "ROOM_STATE", (message) => message.room.status === "IN_GAME" && Boolean(message.room.game))));
+  const [started] = await Promise.all(startedPromises);
+  if (!started) throw new Error("No started room state observed");
 
+  const activePlayerId = started.room.game!.phase.activePlayerId;
+  if (!activePlayerId) throw new Error("Started game did not expose an active setup player");
+  const activePlayerIndex = players.findIndex((player) => player.userId === activePlayerId);
+  const activeSocket = playerSockets[activePlayerIndex];
+  if (activePlayerIndex < 0 || !activeSocket) throw new Error(`Active player ${activePlayerId} is not connected`);
   const vertexId = Object.keys(started.room.game!.board.adjacency.vertexToEdges)[0];
   const edgeId = vertexId ? started.room.game!.board.adjacency.vertexToEdges[vertexId]?.[0] : undefined;
   if (!vertexId || !edgeId) throw new Error("No legal setup target found in deployed room snapshot");
 
   const hostEventsPromise = waitForMessage<EventsMessage>(hostSocket, "EVENTS");
   const peerEventsPromises = playerSockets.slice(1).map((socket) => waitForMessage<EventsMessage>(socket, "EVENTS"));
-  hostSocket.send(JSON.stringify({
+  activeSocket.send(JSON.stringify({
     type: "COMMAND",
     roomId: room.id,
     clientSeq: 1,
-    command: { type: "PLACE_SETUP", playerId: host.userId, vertexId, edgeId },
+    command: { type: "PLACE_SETUP", playerId: activePlayerId, vertexId, edgeId },
   }));
   const [hostEvents, ...peerEvents] = await Promise.all([hostEventsPromise, ...peerEventsPromises]);
   const canonicalSeq = hostEvents.events.map((event) => event.seq).join(",");
@@ -141,8 +151,9 @@ try {
   hostSocket.close();
   const reconnected = await connect(host.token);
   sockets.push(reconnected);
+  const reconnectedStatePromise = waitForMessage<RoomMessage>(reconnected, "ROOM_STATE");
   reconnected.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.id }));
-  await waitForMessage<RoomMessage>(reconnected, "ROOM_STATE");
+  await reconnectedStatePromise;
   reconnected.send(JSON.stringify({ type: "RESYNC", roomId: room.id, lastSeq: 0 }));
   const resync = await waitForMessage<ResyncMessage>(reconnected, "RESYNC");
   if (resync.snapshot?.eventSeq !== hostEvents.snapshot?.eventSeq) throw new Error("Deployed reconnect snapshot mismatch");
