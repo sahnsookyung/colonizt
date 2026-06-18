@@ -13,7 +13,12 @@ export const createPool = (config: DbConfig): pg.Pool => new Pool({ connectionSt
 
 const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), "../migrations");
 
-export const migrationFiles = ["001_init.sql", "002_sessions_and_event_writes.sql", "003_command_results_and_room_metadata.sql"];
+export const migrationFiles = [
+  "001_init.sql",
+  "002_sessions_and_event_writes.sql",
+  "003_command_results_and_room_metadata.sql",
+  "004_session_column_backfill.sql",
+];
 
 export const readMigration = async (name: string): Promise<string> => readFile(join(migrationsDir, name), "utf8");
 
@@ -285,7 +290,7 @@ export const upsertCommandResult = async (pool: pg.Pool, result: PersistCommandR
       result.ok,
       result.seqStart ?? null,
       result.seqEnd ?? null,
-      result.events ?? null,
+      result.events ? JSON.stringify(result.events) : null,
       result.rejectionCode ?? null,
       result.rejectionMessage ?? null,
     ],
