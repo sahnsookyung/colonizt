@@ -2,6 +2,7 @@ import type pg from "pg";
 import type { BoardGraph, GameConfig, GameEvent, GameState } from "@colonizt/game-core";
 import {
   appendMatchEvents,
+  findPersistedRoomByRef,
   findCommandResult,
   findPersistedSessionByTokenHash,
   insertAnalyticsEvent,
@@ -33,10 +34,16 @@ export type StoredMatchSummary = MatchSummary;
 
 export interface StoredRoomRecord {
   id: string;
+  code?: string;
   status: Room["status"];
   hostUserId: string;
   settings: Room["settings"];
   createdAt: string;
+  lastActivityAt?: string;
+  emptySince?: string;
+  pausedAt?: string;
+  archivedAt?: string;
+  cleanupReason?: string;
   seats: Room["seats"];
   match?: {
     id: string;
@@ -62,6 +69,7 @@ export interface EventStore {
   loadReplayByRoomId(roomId: string): Promise<StoredReplayLog | undefined>;
   listMatches(limit?: number): Promise<StoredMatchSummary[]>;
   loadRooms(limit?: number): Promise<StoredRoomRecord[]>;
+  loadRoomByRef?(roomRef: string): Promise<StoredRoomRecord | undefined>;
   loadSessions(limit?: number): Promise<Session[]>;
   persistCommandResult?(result: StoredCommandResult): Promise<void>;
   loadCommandResult?(roomId: string, userId: string, clientSeq: number): Promise<StoredCommandResult | undefined>;
@@ -147,25 +155,43 @@ export class MemoryEventStore implements EventStore {
   }
 
   async loadRooms(limit = 50): Promise<StoredRoomRecord[]> {
-    return [...this.rooms.values()].slice(-limit).reverse().map((room) => {
-      const record: StoredRoomRecord = {
-        id: room.id,
-        status: room.status,
-        hostUserId: room.hostUserId,
-        settings: room.settings,
-        createdAt: room.createdAt,
-        seats: room.seats,
+    return [...this.rooms.values()]
+      .filter((room) => !room.archivedAt && room.status !== "EXPIRED" && room.status !== "ABANDONED")
+      .slice(-limit)
+      .reverse()
+      .map((room) => this.storedRecordFromRoom(room));
+  }
+
+  async loadRoomByRef(roomRef: string): Promise<StoredRoomRecord | undefined> {
+    const normalizedRef = roomRef.trim().toUpperCase();
+    const room = [...this.rooms.values()].find((candidate) => candidate.id === roomRef || candidate.code === normalizedRef);
+    return room ? this.storedRecordFromRoom(room) : undefined;
+  }
+
+  private storedRecordFromRoom(room: Room): StoredRoomRecord {
+    const record: StoredRoomRecord = {
+      id: room.id,
+      ...(room.code ? { code: room.code } : {}),
+      status: room.status,
+      hostUserId: room.hostUserId,
+      settings: room.settings,
+      createdAt: room.createdAt,
+      lastActivityAt: room.lastActivityAt,
+      seats: room.seats,
+    };
+    if (room.emptySince) record.emptySince = room.emptySince;
+    if (room.pausedAt) record.pausedAt = room.pausedAt;
+    if (room.archivedAt) record.archivedAt = room.archivedAt;
+    if (room.cleanupReason) record.cleanupReason = room.cleanupReason;
+    if (room.game) {
+      record.match = {
+        id: room.game.config.matchId,
+        config: room.game.config,
+        board: room.game.board,
+        events: room.events,
       };
-      if (room.game) {
-        record.match = {
-          id: room.game.config.matchId,
-          config: room.game.config,
-          board: room.game.board,
-          events: room.events,
-        };
-      }
-      return record;
-    });
+    }
+    return record;
   }
 
   async loadSessions(limit = 200): Promise<Session[]> {
@@ -213,6 +239,12 @@ export class PostgresEventStore implements EventStore {
       hostUserId: room.hostUserId,
       settings: room.settings,
       seats: room.seats,
+      code: room.code,
+      lastActivityAt: room.lastActivityAt,
+      ...(room.emptySince ? { emptySince: room.emptySince } : {}),
+      ...(room.pausedAt ? { pausedAt: room.pausedAt } : {}),
+      ...(room.archivedAt ? { archivedAt: room.archivedAt } : {}),
+      ...(room.cleanupReason ? { cleanupReason: room.cleanupReason } : {}),
     });
   }
 
@@ -297,10 +329,16 @@ export class PostgresEventStore implements EventStore {
     return records.map((record: PersistedRoomRecord) => {
       const stored: StoredRoomRecord = {
         id: record.id,
+        ...(record.code ? { code: record.code } : {}),
         status: record.status as Room["status"],
         hostUserId: record.hostUserId,
         settings: record.settings as Room["settings"],
         createdAt: record.createdAt,
+        ...(record.lastActivityAt ? { lastActivityAt: record.lastActivityAt } : {}),
+        ...(record.emptySince ? { emptySince: record.emptySince } : {}),
+        ...(record.pausedAt ? { pausedAt: record.pausedAt } : {}),
+        ...(record.archivedAt ? { archivedAt: record.archivedAt } : {}),
+        ...(record.cleanupReason ? { cleanupReason: record.cleanupReason } : {}),
         seats: record.seats,
       };
       if (record.match) {
@@ -315,6 +353,36 @@ export class PostgresEventStore implements EventStore {
       }
       return stored;
     });
+  }
+
+  async loadRoomByRef(roomRef: string): Promise<StoredRoomRecord | undefined> {
+    const record = await findPersistedRoomByRef(this.pool, roomRef);
+    if (!record) return undefined;
+    const stored: StoredRoomRecord = {
+      id: record.id,
+      ...(record.code ? { code: record.code } : {}),
+      status: record.status as Room["status"],
+      hostUserId: record.hostUserId,
+      settings: record.settings as Room["settings"],
+      createdAt: record.createdAt,
+      ...(record.lastActivityAt ? { lastActivityAt: record.lastActivityAt } : {}),
+      ...(record.emptySince ? { emptySince: record.emptySince } : {}),
+      ...(record.pausedAt ? { pausedAt: record.pausedAt } : {}),
+      ...(record.archivedAt ? { archivedAt: record.archivedAt } : {}),
+      ...(record.cleanupReason ? { cleanupReason: record.cleanupReason } : {}),
+      seats: record.seats,
+    };
+    if (record.match) {
+      stored.match = {
+        id: record.match.id,
+        config: record.match.config as GameConfig,
+        board: record.match.board as BoardGraph,
+        events: record.match.events as GameEvent[],
+      };
+      if (record.match.endedAt) stored.match.endedAt = record.match.endedAt;
+      if (record.match.winnerUserId) stored.match.winnerUserId = record.match.winnerUserId;
+    }
+    return stored;
   }
 
   async loadSessions(limit?: number): Promise<Session[]> {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   applyCommand,
   applyEvents,
@@ -9,10 +9,13 @@ import {
   emptyResources,
   getLegalActions,
   hasResources,
+  cityCost,
   maritimeTradeRatio,
   replay,
   resourceCount,
+  roadCost,
   serializeForViewer,
+  settlementCost,
   specialCardCost,
   resources,
   subtractResources,
@@ -63,6 +66,8 @@ interface TradeDraft {
   offer: ResourceBundle;
   request: ResourceBundle;
 }
+
+type BuildMode = "road" | "settlement" | "city";
 
 interface MatchOptions {
   botDifficulty: BotDifficulty;
@@ -125,6 +130,13 @@ const resourceLabels: Record<Resource, string> = {
 const terrainLabels: Record<Terrain, string> = {
   ...resourceLabels,
   desert: "Desert",
+};
+
+const formatCost = (cost: ResourceBundle): string => {
+  const parts = resources
+    .filter((resource) => cost[resource] > 0)
+    .map((resource) => `${cost[resource]} ${resourceLabels[resource]}`);
+  return parts.length > 0 ? parts.join(", ") : "no resources";
 };
 
 const dicePips: Record<number, number[]> = {
@@ -589,6 +601,8 @@ const applyEventsToViewer = (
 
 interface PublicRoomPayload {
   id: string;
+  code?: string;
+  inviteUrl?: string;
   status: string;
   settings?: {
     botDifficulty?: BotDifficulty;
@@ -596,6 +610,12 @@ interface PublicRoomPayload {
   };
   events?: GameEvent[];
   game?: ViewerState;
+}
+
+interface NetworkRoomInfo {
+  id: string;
+  code?: string;
+  inviteUrl?: string;
 }
 
 interface ReplayLogState {
@@ -653,7 +673,7 @@ export const App = () => {
   const [tradeOpen, setTradeOpen] = useState(false);
   const [selectedTradeResponder, setSelectedTradeResponder] = useState<PlayerId | null>(null);
   const [localTradeDeadlines, setLocalTradeDeadlines] = useState<Record<string, number>>({});
-  const [buildMode, setBuildMode] = useState<"road" | "settlement" | "city">("road");
+  const [buildMode, setBuildMode] = useState<BuildMode>("road");
   const [matchOptions, setMatchOptions] = useState<MatchOptions>(defaultMatchOptions);
   const [pendingSetupVertex, setPendingSetupVertex] = useState<VertexId | null>(null);
   const [diceAnimating, setDiceAnimating] = useState(false);
@@ -662,6 +682,7 @@ export const App = () => {
   const [networkStatus, setNetworkStatus] = useState("Local game");
   const [networkSession, setNetworkSession] = useState<{ token: string; userId: PlayerId } | null>(null);
   const [networkRoomId, setNetworkRoomId] = useState<string | null>(null);
+  const [networkRoomInfo, setNetworkRoomInfo] = useState<NetworkRoomInfo | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const shouldReconnectRef = useRef(true);
@@ -905,6 +926,7 @@ export const App = () => {
     socketRef.current = null;
     setNetworkSession(null);
     setNetworkRoomId(null);
+    setNetworkRoomInfo(null);
     clientSeqRef.current = 1;
     lastServerSeqRef.current = 0;
     clearResumeState();
@@ -978,7 +1000,7 @@ export const App = () => {
     setTradeOpen(true);
     track("trade_panel_opened", { mode: socketRef.current ? "network" : "local", platform: platform(), source: "action_button" });
   };
-  const chooseBuildMode = (mode: "road" | "settlement" | "city") => {
+  const chooseBuildMode = (mode: BuildMode) => {
     if (state.phase.type !== "ACTION_PHASE" && !(mode === "road" && pendingSetupVertex)) return;
     playSound("select");
     setBuildMode(mode);
@@ -986,6 +1008,43 @@ export const App = () => {
     if (mode !== "road") setSelectedEdge(null);
     if (mode !== "settlement" && mode !== "city") setSelectedVertex(null);
   };
+  const constructionActions: Array<{
+    mode: BuildMode;
+    label: string;
+    ariaLabel: string;
+    tooltip: string;
+    selected: boolean;
+    disabled: boolean;
+    icon: ReactNode;
+  }> = [
+    {
+      mode: "road",
+      label: "Road",
+      ariaLabel: "Build road",
+      tooltip: `Road: build on a glowing edge connected to your network. Cost: ${formatCost(roadCost())}.`,
+      selected: buildMode === "road" || setupRoadActive,
+      disabled: state.phase.type === "SETUP_PLACEMENT" ? !setupRoadActive : state.phase.type !== "ACTION_PHASE" || !canBuildRoadAction,
+      icon: <RoadSymbol />,
+    },
+    {
+      mode: "settlement",
+      label: "Settlement",
+      ariaLabel: "Build settlement",
+      tooltip: `Settlement: build a house on a glowing corner at least two edges away from other houses. Cost: ${formatCost(settlementCost())}.`,
+      selected: buildMode === "settlement" || setupSettlementActive,
+      disabled: state.phase.type === "SETUP_PLACEMENT" ? !setupSettlementActive : state.phase.type !== "ACTION_PHASE" || !canBuildSettlement,
+      icon: <HouseSymbol />,
+    },
+    {
+      mode: "city",
+      label: "City",
+      ariaLabel: "Upgrade city",
+      tooltip: `City: upgrade one of your settlements for another point and double production. Cost: ${formatCost(cityCost())}.`,
+      selected: buildMode === "city",
+      disabled: state.phase.type !== "ACTION_PHASE" || !canUpgradeCity,
+      icon: <HouseSymbol city />,
+    },
+  ];
   const openTradeFromResource = (resource: Resource) => {
     setTradeOpen(true);
     playSound("select");
@@ -1061,6 +1120,15 @@ export const App = () => {
     setSelectedTradeResponder(null);
     track("trade_cancelled", { mode: socketRef.current ? "network" : "local", platform: platform(), tradeId });
   };
+  const copyInvite = () => {
+    if (!networkRoomInfo) return;
+    const inviteUrl = networkRoomInfo.inviteUrl ?? `${window.location.origin}/?room=${encodeURIComponent(networkRoomInfo.code ?? networkRoomInfo.id)}`;
+    void navigator.clipboard?.writeText(inviteUrl).then(() => {
+      setNetworkStatus(`Copied invite ${networkRoomInfo.code ?? networkRoomInfo.id}`);
+    }).catch(() => {
+      setNetworkStatus(inviteUrl);
+    });
+  };
 
   const connectOnlineSession = (session: { token: string; userId: PlayerId }, roomId: string, ready: boolean) => {
     shouldReconnectRef.current = true;
@@ -1113,10 +1181,23 @@ export const App = () => {
           setServerViewer(publicRoom.game);
           lastServerSeqRef.current = Math.max(lastServerSeqRef.current, publicRoom.game.eventSeq, ...(publicRoom.events ?? []).map((event) => event.seq));
         }
+        setNetworkRoomId(publicRoom.id);
+        setNetworkRoomInfo({
+          id: publicRoom.id,
+          ...(publicRoom.code ? { code: publicRoom.code } : {}),
+          ...(publicRoom.inviteUrl ? { inviteUrl: publicRoom.inviteUrl } : {}),
+        });
         writeResumeState({ token: session.token, userId: session.userId, roomId: publicRoom.id, clientSeq: clientSeqRef.current, lastSeq: lastServerSeqRef.current });
-        setNetworkStatus(`Online ${publicRoom.id} · ${publicRoom.status}`);
+        setNetworkStatus(`Online ${publicRoom.code ?? publicRoom.id} · ${publicRoom.status}`);
       },
-      onError: (incomingError) => setError(JSON.stringify(incomingError)),
+      onError: (incomingError) => {
+        const code = typeof incomingError === "object" && incomingError && "code" in incomingError ? String((incomingError as { code?: unknown }).code) : "";
+        if (code === "ROOM_EXPIRED" || code === "ROOM_ABANDONED" || code === "ROOM_CLOSED") {
+          resetNetworkSession();
+          setNetworkStatus("Room closed");
+        }
+        setError(JSON.stringify(incomingError));
+      },
       onClose: () => {
         setNetworkStatus("Online connection closed");
         if (!shouldReconnectRef.current) return;
@@ -1155,6 +1236,7 @@ export const App = () => {
       });
       setNetworkSession({ token: session.token, userId: session.userId });
       setNetworkRoomId(room.id);
+      setNetworkRoomInfo({ id: room.id, ...(room.code ? { code: room.code } : {}), ...(room.inviteUrl ? { inviteUrl: room.inviteUrl } : {}) });
       clientSeqRef.current = 1;
       lastServerSeqRef.current = 0;
       writeResumeState({ token: session.token, userId: session.userId, roomId: room.id, clientSeq: clientSeqRef.current, lastSeq: lastServerSeqRef.current });
@@ -1178,6 +1260,7 @@ export const App = () => {
       const session = await client.createSession("Browser Player");
       setNetworkSession({ token: session.token, userId: session.userId });
       setNetworkRoomId(roomId);
+      setNetworkRoomInfo({ id: roomId });
       clientSeqRef.current = 1;
       lastServerSeqRef.current = 0;
       writeResumeState({ token: session.token, userId: session.userId, roomId, clientSeq: clientSeqRef.current, lastSeq: lastServerSeqRef.current });
@@ -1196,7 +1279,8 @@ export const App = () => {
   };
 
   useEffect(() => {
-    const inviteRoomId = new URLSearchParams(window.location.search).get("roomId");
+    const search = new URLSearchParams(window.location.search);
+    const inviteRoomId = search.get("room") ?? search.get("roomId");
     const saved = readResumeState();
     const resumable = saved && (!inviteRoomId || saved.roomId === inviteRoomId) ? saved : undefined;
     if (!resumable) {
@@ -1211,6 +1295,7 @@ export const App = () => {
     lastServerSeqRef.current = resumable.lastSeq;
     setNetworkSession({ token: resumable.token, userId: resumable.userId });
     setNetworkRoomId(resumable.roomId);
+    setNetworkRoomInfo({ id: resumable.roomId });
     setNetworkStatus("Resuming online room...");
     connectOnlineSession({ token: resumable.token, userId: resumable.userId }, resumable.roomId, false);
     return cleanupOnlineSession;
@@ -1277,10 +1362,10 @@ export const App = () => {
     }
 
     const durationMs = phaseMode === "roll" ? rollDeadlineMs : actionDeadlineMs;
-    const key = `${state.config.matchId}:${state.eventSeq}:${state.phase.type}:${activePlayer}`;
+    const key = `${state.config.matchId}:${state.turn}:${state.phase.type}:${activePlayer}`;
     const dueAt = Date.now() + durationMs;
     setNowMs(Date.now());
-    setTurnDeadline({ key, dueAt, durationMs, mode: phaseMode });
+    setTurnDeadline((current) => current?.key === key ? current : { key, dueAt, durationMs, mode: phaseMode });
 
     const interval = setInterval(() => setNowMs(Date.now()), 1000);
     const timeout = setTimeout(() => {
@@ -1288,7 +1373,7 @@ export const App = () => {
       const current = stateRef.current;
       const currentActive = "activePlayerId" in current.phase ? current.phase.activePlayerId : undefined;
       const currentKey = current.phase.type !== "GAME_OVER" && currentActive
-        ? `${current.config.matchId}:${current.eventSeq}:${current.phase.type}:${currentActive}`
+        ? `${current.config.matchId}:${current.turn}:${current.phase.type}:${currentActive}`
         : null;
       if (currentKey !== key || currentActive !== humanPlayerId) return;
       if (current.phase.type === "WAITING_FOR_ROLL") {
@@ -1308,7 +1393,7 @@ export const App = () => {
       clearInterval(interval);
       clearTimeout(timeout);
     };
-  }, [activePlayer, humanPlayerId, matchMenuOpen, networkRoomId, replayIndex, state.config.matchId, state.eventSeq, state.phase.type]);
+  }, [activePlayer, humanPlayerId, matchMenuOpen, networkRoomId, replayIndex, state.config.matchId, state.phase.type, state.turn]);
 
   const botAutomationKey = !networkRoomId && replayIndex === null && !matchMenuOpen && state.phase.type !== "GAME_OVER" && activePlayer && botIds.has(activePlayer)
     ? `${state.config.matchId}:${state.eventSeq}:${state.phase.type}:${activePlayer}`
@@ -1894,36 +1979,21 @@ export const App = () => {
                 <span>Special Card</span>
                 <small>{resourceCount(specialCost)}</small>
               </button>
-              <button
-                type="button"
-                className={`board-action ${buildMode === "road" || setupRoadActive ? "selected" : ""}`}
-                onClick={() => chooseBuildMode("road")}
-                disabled={state.phase.type === "SETUP_PLACEMENT" ? !setupRoadActive : state.phase.type !== "ACTION_PHASE" || !canBuildRoadAction}
-                aria-label="Build road"
-              >
-                <RoadSymbol />
-                <span>Road</span>
-              </button>
-              <button
-                type="button"
-                className={`board-action ${buildMode === "settlement" || setupSettlementActive ? "selected" : ""}`}
-                onClick={() => chooseBuildMode("settlement")}
-                disabled={state.phase.type === "SETUP_PLACEMENT" ? !setupSettlementActive : state.phase.type !== "ACTION_PHASE" || !canBuildSettlement}
-                aria-label="Build settlement"
-              >
-                <HouseSymbol />
-                <span>Settlement</span>
-              </button>
-              <button
-                type="button"
-                className={`board-action ${buildMode === "city" ? "selected" : ""}`}
-                onClick={() => chooseBuildMode("city")}
-                disabled={state.phase.type !== "ACTION_PHASE" || !canUpgradeCity}
-                aria-label="Upgrade city"
-              >
-                <HouseSymbol city />
-                <span>City</span>
-              </button>
+              {constructionActions.map((action) => (
+                <button
+                  key={action.mode}
+                  type="button"
+                  className={`board-action ${action.selected ? "selected" : ""}`}
+                  onClick={() => chooseBuildMode(action.mode)}
+                  disabled={action.disabled}
+                  aria-label={action.ariaLabel}
+                  title={action.tooltip}
+                  data-tooltip={action.tooltip}
+                >
+                  {action.icon}
+                  <span>{action.label}</span>
+                </button>
+              ))}
               <button
                 type="button"
                 className="board-action end-action"
@@ -2077,6 +2147,13 @@ export const App = () => {
 
             <div className="phase-card">
               <span className="eyebrow">{networkStatus}</span>
+              {networkRoomInfo ? (
+                <div className="room-share">
+                  <span>Room Code</span>
+                  <strong>{networkRoomInfo.code ?? networkRoomInfo.id}</strong>
+                  <button type="button" onClick={copyInvite}>Copy Invite</button>
+                </div>
+              ) : null}
               <strong>{activeName ? `Active: ${activeName}` : "Game over"}</strong>
               <span>{state.lastRoll ? `${state.lastRoll.dice[0]} + ${state.lastRoll.dice[1]} = ${state.lastRoll.sum}` : "Dice have not rolled yet"}</span>
               {turnTimerLabel ? <span>{turnTimerLabel} remaining</span> : null}

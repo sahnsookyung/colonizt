@@ -263,6 +263,23 @@ const tradeDifficulty = (difficulty: BotDifficulty = "medium") => {
 const tradeTemperament = (view: BotView, salt: string): number =>
   randomFloatAt(`${view.state.config.seed}:${view.state.config.matchId}:turn-${view.state.turn}:${view.botId}:${salt}`, 0);
 
+type OfferTradeCommand = Extract<GameCommand, { type: "OFFER_TRADE" }>;
+
+const tradeBundleKey = (bundle: ResourceBundle): string =>
+  resources.map((resource) => `${resource}:${bundle[resource] ?? 0}`).join("|");
+
+const tradeRecipientsKey = (recipients: TradeOffer["recipients"] | OfferTradeCommand["recipients"]): string =>
+  recipients === "ANY" ? "ANY" : [...recipients].sort().join(",");
+
+const tradeShapeKey = (trade: Pick<TradeOffer | OfferTradeCommand, "offered" | "requested" | "recipients">): string =>
+  `${tradeBundleKey(trade.offered)}>${tradeBundleKey(trade.requested)}@${tradeRecipientsKey(trade.recipients)}`;
+
+export const hasEquivalentBotTradeOffer = (view: BotView, command: OfferTradeCommand): boolean =>
+  Object.values(view.state.trades).some((trade) =>
+    trade.fromPlayerId === view.botId
+    && tradeShapeKey(trade) === tradeShapeKey(command),
+  );
+
 const strategicTradeBonus = (view: BotView, beforeHand: ResourceBundle, afterHand: ResourceBundle, gained: ResourceBundle, paid: ResourceBundle): number => {
   const production = productionResources(view.state, view.botId);
   const beforeShortfall = objectiveShortfall(beforeHand);
@@ -327,6 +344,7 @@ const chooseTradeOffer = (view: BotView, idFactory: BotIdFactory, profile: BotPr
         recipients: "ANY",
         ttlEvents: 10,
       };
+      if (hasEquivalentBotTradeOffer(view, command)) continue;
       const before = evaluateState(view);
       const afterHand = addResources(subtractResources(view.ownResources, command.offered), command.requested);
       const after = evaluateState(view, afterHand);

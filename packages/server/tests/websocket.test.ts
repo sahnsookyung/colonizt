@@ -159,6 +159,36 @@ describe("WebSocket gateway", () => {
     expect(spectatorMessage.snapshot.players.find((player) => player.id === host.userId)?.resources).toBeUndefined();
   });
 
+  it("allows websocket joins by short room code and broadcasts on the canonical room id", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Host");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: true, ranked: false });
+    const ready = await manager.setReady(room.id, host, true);
+    if (!ready.ok || !ready.room.game) throw new Error("Failed to start room");
+    const app = await buildServer({ manager });
+    servers.push({ close: () => app.close() });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const hostSocket = await openSocket(app, host.token);
+
+    hostSocket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.code }));
+    const joined = await waitForMessage<{ type: "ROOM_STATE"; room: { id: string; code: string } }>(hostSocket, "ROOM_STATE");
+    expect(joined.room).toMatchObject({ id: room.id, code: room.code });
+
+    const vertexId = getLegalActions(ready.room.game, host.userId).find((action) => action.type === "PLACE_SETUP")!.vertices[0]!;
+    const edgeId = ready.room.game.board.adjacency.vertexToEdges[vertexId]![0]!;
+    const events = waitForMessage<{ type: "EVENTS"; roomId: string; events: GameEvent[] }>(hostSocket, "EVENTS");
+    hostSocket.send(JSON.stringify({
+      type: "COMMAND",
+      roomId: room.code,
+      clientSeq: 1,
+      command: { type: "PLACE_SETUP", playerId: host.userId, vertexId, edgeId },
+    }));
+
+    const message = await events;
+    expect(message.roomId).toBe(room.id);
+    expect(message.events[0]).toMatchObject({ type: "SETUP_PLACED" });
+  });
+
   it("acknowledges duplicate accepted commands without rebroadcasting old events", async () => {
     const manager = new RoomManager();
     const host = await manager.createSession("Host");

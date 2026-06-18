@@ -9,6 +9,7 @@ export interface PresenceStore {
   joinRoom(session: Session, socketId: string, roomId: string): Promise<void>;
   disconnect(session: Session, socketId: string, roomId?: string): Promise<void>;
   roomUserCount(roomId: string): Promise<number>;
+  roomUserIds(roomId: string): Promise<Set<string>>;
   close(): Promise<void>;
 }
 
@@ -29,7 +30,11 @@ export class MemoryPresenceStore implements PresenceStore {
   }
 
   async roomUserCount(roomId: string): Promise<number> {
-    return new Set([...this.sockets.values()].filter((socket) => socket.roomId === roomId).map((socket) => socket.userId)).size;
+    return (await this.roomUserIds(roomId)).size;
+  }
+
+  async roomUserIds(roomId: string): Promise<Set<string>> {
+    return new Set([...this.sockets.values()].filter((socket) => socket.roomId === roomId).map((socket) => socket.userId));
   }
 
   async close(): Promise<void> {
@@ -64,6 +69,10 @@ export class RedisPresenceStore implements PresenceStore {
   }
 
   async roomUserCount(roomId: string): Promise<number> {
+    return (await this.roomUserIds(roomId)).size;
+  }
+
+  async roomUserIds(roomId: string): Promise<Set<string>> {
     const socketIds = await this.client.sMembers(this.roomKey(roomId));
     const users = new Set<string>();
     for (const socketId of socketIds) {
@@ -71,7 +80,7 @@ export class RedisPresenceStore implements PresenceStore {
       if (userId) users.add(userId);
       else await this.client.sRem(this.roomKey(roomId), socketId);
     }
-    return users.size;
+    return users;
   }
 
   async close(): Promise<void> {

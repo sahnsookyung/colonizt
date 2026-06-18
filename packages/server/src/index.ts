@@ -7,7 +7,7 @@ import { createPool, runMigrations } from "@colonizt/db";
 import { PostgresEventStore } from "./event-store.js";
 import { createPresenceStore, type PresenceStore } from "./presence.js";
 import { analyticsEventSchema, createRoomSchema, wsClientMessageSchema } from "./schemas.js";
-import { RoomManager, type Session } from "./room-manager.js";
+import { defaultRoomCleanupPolicy, RoomCapacityError, RoomManager, type Room, type RoomCleanupPolicy, type Session } from "./room-manager.js";
 
 export { RoomManager } from "./room-manager.js";
 export { MemoryEventStore, PostgresEventStore } from "./event-store.js";
@@ -21,6 +21,8 @@ export interface BuildServerOptions {
   publicWsBaseUrl?: string;
   publicWebUrl?: string;
   wsTicketTtlMs?: number;
+  roomCleanupPolicy?: Partial<RoomCleanupPolicy>;
+  roomCleanupIntervalMs?: number;
 }
 
 type SocketClient = { socket: WebSocketLike; session: Session; roomId?: string; asSpectator?: boolean };
@@ -47,16 +49,29 @@ const requireSession = async (manager: RoomManager, request: { headers: Record<s
   return session;
 };
 
+const positiveInt = (value: string | undefined, fallback: number): number => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
 export const buildServer = async (options: BuildServerOptions = {}): Promise<FastifyInstance> => {
+  const cleanupPolicy: RoomCleanupPolicy = {
+    ...defaultRoomCleanupPolicy,
+    maxActiveRooms: positiveInt(process.env.MAX_ACTIVE_ROOMS, defaultRoomCleanupPolicy.maxActiveRooms),
+    emptyLobbyTtlMs: positiveInt(process.env.EMPTY_LOBBY_TTL_MS, defaultRoomCleanupPolicy.emptyLobbyTtlMs),
+    emptyGameTtlMs: positiveInt(process.env.EMPTY_GAME_TTL_MS, defaultRoomCleanupPolicy.emptyGameTtlMs),
+    finishedRoomUnloadMs: positiveInt(process.env.FINISHED_ROOM_UNLOAD_MS, defaultRoomCleanupPolicy.finishedRoomUnloadMs),
+    ...options.roomCleanupPolicy,
+  };
   let manager = options.manager;
   let pool: ReturnType<typeof createPool> | undefined;
   if (!manager && process.env.DATABASE_URL) {
     pool = createPool({ connectionString: process.env.DATABASE_URL });
     await runMigrations(pool);
-    manager = new RoomManager(new PostgresEventStore(pool));
+    manager = new RoomManager(new PostgresEventStore(pool), cleanupPolicy);
     await manager.hydrateFromStore();
   }
-  manager ??= new RoomManager();
+  manager ??= new RoomManager(undefined, cleanupPolicy);
   const presence: PresenceStore = await createPresenceStore(process.env.REDIS_URL);
   const allowedOrigins = options.allowedOrigins ?? [process.env.WEB_ORIGIN ?? "http://127.0.0.1:5173"];
   const allowLegacySessionToken = options.allowLegacySessionToken ?? false;
@@ -123,6 +138,32 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     }
   };
 
+  const roomInviteUrl = (request: { headers: Record<string, unknown>; protocol?: string; hostname?: string } | undefined, room: Room): string => {
+    const webUrl = (options.publicWebUrl ?? process.env.PUBLIC_WEB_URL ?? process.env.WEB_ORIGIN ?? (request ? externalBaseUrl(request) : allowedOrigins[0] ?? "http://127.0.0.1:5173")).replace(/\/$/, "");
+    return `${webUrl}/?room=${encodeURIComponent(room.code)}`;
+  };
+
+  const publicRoomWithInvite = (
+    request: { headers: Record<string, unknown>; protocol?: string; hostname?: string } | undefined,
+    room: Room,
+    viewerId: Session["userId"] | "spectator" = "spectator",
+  ) => ({
+    ...manager.publicRoom(room, viewerId),
+    inviteUrl: roomInviteUrl(request, room),
+  });
+
+  const broadcastRoomState = (room: Room): void => {
+    broadcastRoom(room.id, (target) => ({ type: "ROOM_STATE", room: publicRoomWithInvite(undefined, room, viewerIdFor(target)) }));
+  };
+
+  const closeRoomClients = (roomId: string, code: string, message: string): void => {
+    for (const client of [...clients]) {
+      if (client.roomId !== roomId) continue;
+      send(client, { type: "ERROR", code, message });
+      client.socket.close(1000, message);
+    }
+  };
+
   const timeoutInterval = setInterval(() => {
     for (const room of manager.rooms.values()) {
       void manager.expireTurn(room.id).then((result) => {
@@ -147,8 +188,20 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
   }, 1000);
   timeoutInterval.unref?.();
 
+  const cleanupIntervalMs = options.roomCleanupIntervalMs ?? positiveInt(process.env.ROOM_CLEANUP_INTERVAL_MS, 30_000);
+  const cleanupInterval = setInterval(() => {
+    void manager.cleanupRooms().then((closedRooms) => {
+      for (const closed of closedRooms) {
+        const code = closed.status === "EXPIRED" ? "ROOM_EXPIRED" : closed.status === "ABANDONED" ? "ROOM_ABANDONED" : "ROOM_CLOSED";
+        closeRoomClients(closed.roomId, code, closed.cleanupReason ?? "Room closed");
+      }
+    }).catch(() => undefined);
+  }, cleanupIntervalMs);
+  cleanupInterval.unref?.();
+
   app.addHook("onClose", async () => {
     clearInterval(timeoutInterval);
+    clearInterval(cleanupInterval);
     await presence.close();
     await pool?.end();
   });
@@ -190,10 +243,12 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
   app.post("/analytics", async (request, reply) => {
     const parsed = analyticsEventSchema.safeParse(request.body ?? {});
     if (!parsed.success) return reply.status(400).send({ code: "BAD_REQUEST", issues: parsed.error.issues });
+    const token = tokenFromHeader(request.headers.authorization, request.headers["x-session-token"]);
+    const session = token ? await manager.resolveSession(token) : undefined;
     const event = {
       eventName: parsed.data.eventName,
       payload: parsed.data.payload,
-      ...(parsed.data.userId ? { userId: parsed.data.userId } : {}),
+      ...(session ? { userId: session.userId } : {}),
       ...(parsed.data.matchId ? { matchId: parsed.data.matchId } : {}),
     };
     await manager.recordAnalytics(event);
@@ -201,6 +256,15 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
   });
 
   app.get("/rooms", async () => manager.listRooms());
+
+  app.get<{ Params: { roomRef: string } }>("/rooms/:roomRef", async (request, reply) => {
+    const room = manager.roomForRef(request.params.roomRef);
+    if (room) return publicRoomWithInvite(request, room);
+    const stored = await manager.loadRoomStatusByRef(request.params.roomRef);
+    if (!stored) return reply.status(404).send({ code: "ROOM_NOT_FOUND" });
+    const code = stored.status === "EXPIRED" ? "ROOM_EXPIRED" : stored.status === "ABANDONED" ? "ROOM_ABANDONED" : "ROOM_CLOSED";
+    return reply.status(410).send({ code, status: stored.status, cleanupReason: stored.cleanupReason });
+  });
 
   app.get<{ Querystring: { limit?: string } }>("/matches", async (request) => {
     const limit = Number(request.query.limit ?? 20);
@@ -220,7 +284,12 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     const settings = parsed.data.minPlayers === undefined
       ? (({ minPlayers: _minPlayers, ...rest }) => rest)(parsed.data)
       : parsed.data;
-    return manager.publicRoom(await manager.createRoom(session, settings), session.userId);
+    try {
+      return publicRoomWithInvite(request, await manager.createRoom(session, settings), session.userId);
+    } catch (error) {
+      if (error instanceof RoomCapacityError) return reply.status(503).send({ code: error.code, message: error.message });
+      throw error;
+    }
   });
 
   app.get<{ Params: { replayId: string } }>("/matches/:replayId/replay", async (request, reply) => {
@@ -235,8 +304,8 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     mode: "CLASSIC",
     seasonId: "local-admin",
     rankedPublicQueue: "deferred",
-    rows: manager.listRooms().flatMap((room) =>
-      room.game?.players.map((player) => ({ userId: player.id, score: player.score, rating: 1000 + player.score * 25 })) ?? [],
+    rows: [...manager.rooms.values()].flatMap((room) =>
+      Object.values(room.game?.players ?? {}).map((player) => ({ userId: player.id, score: player.score, rating: 1000 + player.score * 25 })),
     ),
   }));
 
@@ -269,7 +338,13 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     void presence.connect(session, socketId).catch(() => undefined);
     socket.on("close", () => {
       clients.delete(client);
-      void presence.disconnect(session, socketId, client.roomId).catch(() => undefined);
+      const roomId = client.roomId;
+      void (async () => {
+        await presence.disconnect(session, socketId, roomId);
+        if (!roomId) return;
+        const room = await manager.syncConnections(roomId, await presence.roomUserIds(roomId));
+        if (room) broadcastRoomState(room);
+      })().catch(() => undefined);
     });
 
     socket.on("message", (raw) => {
@@ -302,10 +377,13 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
             send(client, { type: "ERROR", code: joined.code, message: joined.message });
             return;
           }
-          client.roomId = message.roomId;
+          client.roomId = joined.room.id;
           client.asSpectator = joined.room.spectators.has(session.userId) && !manager.isMember(joined.room, session.userId);
-          void presence.joinRoom(session, socketId, message.roomId).catch(() => undefined);
-          broadcastRoom(message.roomId, (target) => ({ type: "ROOM_STATE", room: manager.publicRoom(joined.room, viewerIdFor(target)) }));
+          void presence.joinRoom(session, socketId, joined.room.id).then(async () => {
+            const synced = await manager.syncConnections(joined.room.id, await presence.roomUserIds(joined.room.id));
+            if (synced) broadcastRoomState(synced);
+            else broadcastRoomState(joined.room);
+          }).catch(() => undefined);
         }).catch((error) => send(client, { type: "ERROR", code: "JOIN_FAILED", message: error instanceof Error ? error.message : "Join failed" }));
         return;
       }
@@ -315,7 +393,7 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
             send(client, { type: "ERROR", code: ready.code, message: ready.message });
             return;
           }
-          broadcastRoom(message.roomId, (target) => ({ type: "ROOM_STATE", room: manager.publicRoom(ready.room, viewerIdFor(target)) }));
+          broadcastRoomState(ready.room);
         }).catch((error) => send(client, { type: "ERROR", code: "READY_FAILED", message: error instanceof Error ? error.message : "Ready failed" }));
         return;
       }
@@ -324,6 +402,7 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
           send(client, { type: "COMMAND_REJECTED", code: "RATE_LIMITED", message: "Too many commands", clientSeq: message.clientSeq });
           return;
         }
+        const canonicalRoomId = manager.roomForRef(message.roomId)?.id ?? message.roomId;
         void manager.submitCommand(message.roomId, session, message.clientSeq, message.command as GameCommand).then((result) => {
           if (!result.ok) {
             send(client, { type: "COMMAND_REJECTED", code: result.code, message: result.message, clientSeq: message.clientSeq });
@@ -332,18 +411,18 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
           if (result.replayed) {
             send(client, {
               type: "COMMAND_ACK",
-              roomId: message.roomId,
+              roomId: canonicalRoomId,
               clientSeq: message.clientSeq,
               seqStart: result.seqStart,
               seqEnd: result.seqEnd,
             });
             return;
           }
-          broadcastRoom(message.roomId, (target) => ({
+          broadcastRoom(canonicalRoomId, (target) => ({
             type: "EVENTS",
-            roomId: message.roomId,
+            roomId: canonicalRoomId,
             events: serializeEventsForViewer(result.events, viewerIdFor(target), result.state.playerOrder),
-            snapshot: snapshotFor(message.roomId, result.state, target),
+            snapshot: snapshotFor(canonicalRoomId, result.state, target),
           }));
         }).catch((error) => send(client, { type: "COMMAND_REJECTED", code: "COMMAND_FAILED", message: error instanceof Error ? error.message : "Command failed", clientSeq: message.clientSeq }));
         return;
@@ -353,15 +432,17 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
           send(client, { type: "ERROR", code: "RATE_LIMITED", message: "Too many chat messages" });
           return;
         }
+        const canonicalRoomId = manager.roomForRef(message.roomId)?.id ?? message.roomId;
         void manager.addChat(message.roomId, session, message.message).then((chat) => {
           if (!chat) send(client, { type: "ERROR", code: "CHAT_REJECTED" });
-          else broadcastRoom(message.roomId, () => ({ type: "CHAT", roomId: message.roomId, chat }));
+          else broadcastRoom(canonicalRoomId, () => ({ type: "CHAT", roomId: canonicalRoomId, chat }));
         }).catch((error) => send(client, { type: "ERROR", code: "CHAT_FAILED", message: error instanceof Error ? error.message : "Chat failed" }));
         return;
       }
       if (message.type === "RESYNC") {
+        const canonicalRoomId = manager.roomForRef(message.roomId)?.id ?? message.roomId;
         const resync = manager.resync(message.roomId, session, message.lastSeq);
-        send(client, resync ? { type: "RESYNC", roomId: message.roomId, ...resync } : { type: "ERROR", code: "RESYNC_FAILED" });
+        send(client, resync ? { type: "RESYNC", roomId: canonicalRoomId, ...resync } : { type: "ERROR", code: "RESYNC_FAILED" });
       }
     });
   });

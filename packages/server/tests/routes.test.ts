@@ -2,6 +2,14 @@ import { describe, expect, it } from "vitest";
 import { buildServer, MemoryEventStore } from "../src/index.js";
 import { RoomManager } from "../src/room-manager.js";
 
+class CapturingAnalyticsStore extends MemoryEventStore {
+  readonly analytics: Array<{ id: string; userId?: string; matchId?: string; eventName: string; payload: unknown }> = [];
+
+  async persistAnalytics(event: { id: string; userId?: string; matchId?: string; eventName: string; payload: unknown }): Promise<void> {
+    this.analytics.push(event);
+  }
+}
+
 describe("REST routes", () => {
   it("serves public runtime config for deployed clients", async () => {
     const app = await buildServer({
@@ -38,6 +46,32 @@ describe("REST routes", () => {
     expect(health.json()).toMatchObject({ ok: true });
     expect(["memory", "redis"]).toContain(health.json().presence);
     expect(analytics.statusCode).toBe(202);
+  });
+
+  it("does not trust client-supplied analytics user ids", async () => {
+    const store = new CapturingAnalyticsStore();
+    const manager = new RoomManager(store);
+    const session = await manager.createSession("Telemetry");
+    const app = await buildServer({ manager });
+
+    const anonymous = await app.inject({
+      method: "POST",
+      url: "/analytics",
+      payload: { userId: "spoofed", eventName: "anonymous_event", payload: { mode: "test" } },
+    });
+    const authenticated = await app.inject({
+      method: "POST",
+      url: "/analytics",
+      headers: { "x-session-token": session.token },
+      payload: { userId: "spoofed", eventName: "authenticated_event", payload: { mode: "test" } },
+    });
+    await app.close();
+
+    expect(anonymous.statusCode).toBe(202);
+    expect(authenticated.statusCode).toBe(202);
+    expect(store.analytics[0]).toMatchObject({ eventName: "anonymous_event" });
+    expect(store.analytics[0]?.userId).toBeUndefined();
+    expect(store.analytics[1]).toMatchObject({ eventName: "authenticated_event", userId: session.userId });
   });
 
   it("lists match history and serves replay by room id or match id", async () => {
@@ -109,6 +143,44 @@ describe("REST routes", () => {
     expect(response.statusCode).toBe(201);
     expect(response.json()).toMatchObject({ ticket: expect.stringMatching(/^wst_/) });
     expect(restartedManager.getSession(session.token)?.userId).toBe(session.userId);
+  });
+
+  it("returns short room codes and resolves rooms by code", async () => {
+    const manager = new RoomManager();
+    const session = await manager.createSession("Host");
+    const app = await buildServer({ manager, publicWebUrl: "https://colonizt.example" });
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/rooms",
+      headers: { "x-session-token": session.token },
+      payload: { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 4 },
+    });
+    const createdBody = created.json() as { id: string; code: string; inviteUrl: string };
+    const byCode = await app.inject({ method: "GET", url: `/rooms/${createdBody.code}` });
+    await app.close();
+
+    expect(created.statusCode).toBe(200);
+    expect(createdBody.code).toMatch(/^[A-Z2-9]{6}$/);
+    expect(createdBody.inviteUrl).toBe(`https://colonizt.example/?room=${createdBody.code}`);
+    expect(byCode.statusCode).toBe(200);
+    expect(byCode.json()).toMatchObject({ id: createdBody.id, code: createdBody.code });
+  });
+
+  it("returns gone for archived room invite codes", async () => {
+    const store = new MemoryEventStore();
+    const manager = new RoomManager(store, { emptyLobbyTtlMs: 1_000 });
+    const session = await manager.createSession("Host");
+    const room = await manager.createRoom(session, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 4 });
+    await manager.syncConnections(room.id, new Set(), 1_000);
+    await manager.cleanupRooms(2_100);
+    const app = await buildServer({ manager });
+
+    const response = await app.inject({ method: "GET", url: `/rooms/${room.code}` });
+    await app.close();
+
+    expect(response.statusCode).toBe(410);
+    expect(response.json()).toMatchObject({ code: "ROOM_EXPIRED", status: "EXPIRED" });
   });
 
   it("keeps classic player rooms human-only until all four occupied seats are ready", async () => {

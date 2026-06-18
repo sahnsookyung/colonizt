@@ -14,5 +14,6 @@ describe("PresenceStore", () => {
     await store.disconnect(session, "socket-a", "room_1");
 
     expect(await store.roomUserCount("room_1")).toBe(1);
+    expect(await store.roomUserIds("room_1")).toEqual(new Set(["u_1"]));
   });
 });

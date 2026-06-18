@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { emptyResources, getLegalActions, serializeForViewer, type GameCommand, type TradeOffer } from "@colonizt/game-core";
 import { MemoryEventStore, type EventStore } from "../src/event-store.js";
-import { RoomManager, type Room } from "../src/room-manager.js";
+import { RoomCapacityError, RoomManager, type Room } from "../src/room-manager.js";
 import type { GameEvent } from "@colonizt/game-core";
 
 const startedRoom = async (eventStore?: EventStore) => {
@@ -27,6 +27,16 @@ describe("RoomManager", () => {
     const room = await manager.createRoom(session, { mode: "CLASSIC", botFill: true, ranked: false });
     expect(manager.getSession(session.token)?.userId).toBe(session.userId);
     expect(room.seats[0]?.userId).toBe(session.userId);
+    expect(room.code).toMatch(/^[A-Z2-9]{6}$/);
+    expect(manager.roomForRef(room.code)?.id).toBe(room.id);
+  });
+
+  it("rejects new rooms when active room capacity is reached", async () => {
+    const manager = new RoomManager(new MemoryEventStore(), { maxActiveRooms: 1 });
+    const first = await manager.createSession("First");
+    const second = await manager.createSession("Second");
+    await manager.createRoom(first, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 4 });
+    await expect(manager.createRoom(second, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 4 })).rejects.toBeInstanceOf(RoomCapacityError);
   });
 
   it("bot-fills and starts after ready", async () => {
@@ -273,6 +283,75 @@ describe("RoomManager", () => {
     expect(room.timer?.expiresAt).toBeGreaterThan(Date.now());
   });
 
+  it("does not extend the action timer for commands in the same active phase", async () => {
+    const { manager, session, room } = await startedRoom();
+    room.game!.phase = { type: "ACTION_PHASE", activePlayerId: session.userId };
+    room.game!.turn = 8;
+    room.game!.players[session.userId]!.resources = { ...emptyResources(), fiber: 2 };
+    const expiresAt = Date.now() + 5_000;
+    room.timer = { activePlayerId: session.userId, expiresAt };
+
+    const result = await manager.submitCommand(room.id, session, 30, {
+      type: "OFFER_TRADE",
+      playerId: session.userId,
+      tradeId: "same-phase-timer",
+      offered: { ...emptyResources(), fiber: 1 },
+      requested: { ...emptyResources(), ore: 1 },
+      recipients: "ANY",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(room.timer?.expiresAt).toBe(expiresAt);
+  });
+
+  it("pauses empty in-progress rooms and resumes without shortening timers", async () => {
+    const { manager, session, room } = await startedRoom();
+    if (!room.timer) throw new Error("missing timer");
+    room.timer.expiresAt = 10_000;
+    room.tradeResponseDeadlines.set("trade_1", 12_000);
+
+    await manager.syncConnections(room.id, new Set(), 5_000);
+    expect(room.pausedAt).toBeDefined();
+    expect(await manager.expireTurn(room.id, 20_000)).toBeUndefined();
+
+    await manager.syncConnections(room.id, new Set([session.userId]), 8_000);
+    expect(room.pausedAt).toBeUndefined();
+    expect(room.emptySince).toBeUndefined();
+    expect(room.timer.expiresAt).toBe(13_000);
+    expect(room.tradeResponseDeadlines.get("trade_1")).toBe(15_000);
+  });
+
+  it("expires empty lobbies and unloads them from active memory", async () => {
+    const store = new MemoryEventStore();
+    const manager = new RoomManager(store, { emptyLobbyTtlMs: 1_000 });
+    const session = await manager.createSession("Host");
+    const room = await manager.createRoom(session, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 4 });
+
+    await manager.syncConnections(room.id, new Set(), 1_000);
+    const cleaned = await manager.cleanupRooms(2_100);
+    const stored = await store.loadRoomByRef(room.code);
+
+    expect(cleaned).toEqual([expect.objectContaining({ roomId: room.id, status: "EXPIRED", cleanupReason: "EMPTY_LOBBY_TTL" })]);
+    expect(manager.roomForRef(room.id)).toBeUndefined();
+    expect(manager.listRooms()).toHaveLength(0);
+    expect(stored).toMatchObject({ id: room.id, status: "EXPIRED", cleanupReason: "EMPTY_LOBBY_TTL" });
+  });
+
+  it("abandons empty in-progress rooms but keeps replay history loadable", async () => {
+    const store = new MemoryEventStore();
+    const { manager, room } = await startedRoom(store);
+
+    await manager.syncConnections(room.id, new Set(), 1_000);
+    const cleaned = await manager.cleanupRooms(31 * 60 * 1000);
+    const replayLog = await manager.getReplayById(room.id);
+    const stored = await store.loadRoomByRef(room.code);
+
+    expect(cleaned).toEqual([expect.objectContaining({ roomId: room.id, status: "ABANDONED", cleanupReason: "EMPTY_GAME_TTL" })]);
+    expect(manager.roomForRef(room.id)).toBeUndefined();
+    expect(replayLog?.config.matchId).toBe(`match_${room.id}`);
+    expect(stored).toMatchObject({ id: room.id, status: "ABANDONED", cleanupReason: "EMPTY_GAME_TTL" });
+  });
+
   it("stores chat and reports outside game events", async () => {
     const { manager, session, room } = await startedRoom();
     const chat = await manager.addChat(room.id, session, "hello table");
@@ -280,5 +359,26 @@ describe("RoomManager", () => {
     expect(chat?.message).toBe("hello table");
     expect(report?.status).toBe("OPEN");
     expect(room.events).toHaveLength(0);
+  });
+
+  it("keeps reports and event history out of public room summaries", async () => {
+    const { manager, session, room } = await startedRoom();
+    await manager.addChat(room.id, session, "hello table");
+    await manager.createReport(room.id, session, "bot_2", "test report");
+
+    const snapshot = manager.publicRoom(room, session.userId) as ReturnType<RoomManager["publicRoom"]> & { reports?: unknown };
+    const summary = manager.listRooms()[0] as ReturnType<RoomManager["listRooms"]>[number] & {
+      chat?: unknown;
+      events?: unknown;
+      game?: unknown;
+      reports?: unknown;
+    };
+
+    expect(snapshot.chat).toHaveLength(1);
+    expect(snapshot.reports).toBeUndefined();
+    expect(summary.chat).toBeUndefined();
+    expect(summary.events).toBeUndefined();
+    expect(summary.game).toBeUndefined();
+    expect(summary.reports).toBeUndefined();
   });
 });

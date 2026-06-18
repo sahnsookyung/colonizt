@@ -16,6 +16,11 @@ This starts PostgreSQL, the Fastify server on `http://127.0.0.1:8787`, and the s
 - `SERVER_PORT`: server port, default `8787`.
 - `WEB_ORIGIN`: allowed browser origin for CORS.
 - `VITE_API_BASE_URL`: web build-time API URL, default `http://127.0.0.1:8787`.
+- `MAX_ACTIVE_ROOMS`: cap for active in-memory rooms, default `200`.
+- `ROOM_CLEANUP_INTERVAL_MS`: abandoned-room cleanup cadence, default `30000`.
+- `EMPTY_LOBBY_TTL_MS`: empty lobby expiry window, default `600000`.
+- `EMPTY_GAME_TTL_MS`: empty in-progress game abandonment window, default `1800000`.
+- `FINISHED_ROOM_UNLOAD_MS`: finished-room memory unload window after everyone disconnects, default `300000`.
 
 ## Operations Notes
 
@@ -23,11 +28,19 @@ This starts PostgreSQL, the Fastify server on `http://127.0.0.1:8787`, and the s
 - `GET /health` is the server health check.
 - The server handles `SIGTERM` and `SIGINT` by closing Fastify, draining WebSockets through Fastify shutdown, and closing the PostgreSQL pool.
 - On startup with `DATABASE_URL`, the server runs migrations and hydrates recent rooms from PostgreSQL event logs.
+- Rooms have short share codes and invite URLs. Empty lobbies expire, empty in-progress games pause immediately and are abandoned after the configured TTL, and finished games unload from active memory while replay history stays in PostgreSQL.
 - Sticky sessions or a room router are needed before horizontal scaling active rooms; PostgreSQL remains replay truth, while Redis should only coordinate ephemeral presence, queues, and cross-node notifications.
 
 ## OCI Colocated Deploy
 
-Colonizt can run beside JobScout on the existing OCI host without sharing app state. The deployment uses separate containers and data under `/srv/colonizt`; the only shared surface is the existing Caddy reverse proxy.
+Colonizt can run beside JobScout on the existing OCI host without sharing app state. The deployment uses separate containers and data under `/srv/colonizt`; the only shared surface is the existing Caddy reverse proxy and its certificate storage.
+
+JobScout owns the root Caddyfile and Caddy data volumes. Its Caddyfile imports
+`/etc/caddy/sites/*.Caddyfile`, and colocated apps install their own site
+snippets there. Colonizt only writes `/srv/jobscout-cloud/ops/caddy/sites/colonizt.Caddyfile`;
+it does not rewrite the JobScout site block or Caddy certificate data. Deploy the
+JobScout shared-sites Caddy mount before running the Colonizt deploy script on a
+fresh host.
 
 ```bash
 ./ops/scripts/deploy-oci.sh <jobscout-oci-ip> <git-sha-image-tag>

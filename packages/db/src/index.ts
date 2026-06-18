@@ -18,6 +18,7 @@ export const migrationFiles = [
   "002_sessions_and_event_writes.sql",
   "003_command_results_and_room_metadata.sql",
   "004_session_column_backfill.sql",
+  "005_room_lifecycle_and_invites.sql",
 ];
 
 export const readMigration = async (name: string): Promise<string> => readFile(join(migrationsDir, name), "utf8");
@@ -73,6 +74,12 @@ export interface PersistRoomInput {
   hostUserId: string;
   settings: unknown;
   seats: Array<{ seatIndex: number; userId?: string; botId?: string; ready: boolean; connected: boolean }>;
+  code?: string;
+  lastActivityAt?: string;
+  emptySince?: string;
+  pausedAt?: string;
+  archivedAt?: string;
+  cleanupReason?: string;
 }
 
 export interface PersistMatchInput {
@@ -162,14 +169,35 @@ export const upsertRoom = async (pool: pg.Pool, room: PersistRoomInput): Promise
   try {
     await client.query("BEGIN");
     await client.query(
-      `INSERT INTO rooms(id, mode, status, host_user_id, settings_json)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO rooms(
+         id, mode, status, host_user_id, settings_json, room_code,
+         last_activity_at, empty_since, paused_at, archived_at, cleanup_reason
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::timestamptz, now()), $8, $9, $10, $11)
        ON CONFLICT (id) DO UPDATE
        SET mode = EXCLUDED.mode,
            status = EXCLUDED.status,
            settings_json = EXCLUDED.settings_json,
+           room_code = EXCLUDED.room_code,
+           last_activity_at = EXCLUDED.last_activity_at,
+           empty_since = EXCLUDED.empty_since,
+           paused_at = EXCLUDED.paused_at,
+           archived_at = EXCLUDED.archived_at,
+           cleanup_reason = EXCLUDED.cleanup_reason,
            updated_at = now()`,
-      [room.id, room.mode, room.status, room.hostUserId, room.settings],
+      [
+        room.id,
+        room.mode,
+        room.status,
+        room.hostUserId,
+        room.settings,
+        room.code ?? null,
+        room.lastActivityAt ?? null,
+        room.emptySince ?? null,
+        room.pausedAt ?? null,
+        room.archivedAt ?? null,
+        room.cleanupReason ?? null,
+      ],
     );
     for (const seat of room.seats) {
       await client.query(
@@ -407,11 +435,17 @@ export const listMatchSummaries = async (pool: pg.Pool, limit = 20): Promise<Mat
 
 export interface PersistedRoomRecord {
   id: string;
+  code?: string;
   mode: string;
   status: string;
   hostUserId: string;
   settings: unknown;
   createdAt: string;
+  lastActivityAt?: string;
+  emptySince?: string;
+  pausedAt?: string;
+  archivedAt?: string;
+  cleanupReason?: string;
   seats: Array<{ seatIndex: number; userId?: string; botId?: string; ready: boolean; connected: boolean }>;
   match?: {
     id: string;
@@ -423,16 +457,14 @@ export interface PersistedRoomRecord {
   };
 }
 
-export const listPersistedRooms = async (pool: pg.Pool, limit = 50): Promise<PersistedRoomRecord[]> => {
-  const rooms = await pool.query(
-    `SELECT id, mode, status, host_user_id, settings_json, created_at
-     FROM rooms
-     ORDER BY created_at DESC
-     LIMIT $1`,
-    [limit],
-  );
+const dateString = (value: unknown): string | undefined => {
+  if (!value) return undefined;
+  return value instanceof Date ? value.toISOString() : String(value);
+};
+
+const hydratePersistedRoomRecords = async (pool: pg.Pool, rows: pg.QueryResultRow[]): Promise<PersistedRoomRecord[]> => {
   const records: PersistedRoomRecord[] = [];
-  for (const row of rooms.rows) {
+  for (const row of rows) {
     const seats = await pool.query(
       `SELECT seat_index, user_id, bot_id, ready, connected
        FROM room_seats
@@ -458,7 +490,7 @@ export const listPersistedRooms = async (pool: pg.Pool, limit = 50): Promise<Per
       status: row.status,
       hostUserId: row.host_user_id,
       settings: row.settings_json,
-      createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
+      createdAt: dateString(row.created_at) ?? new Date().toISOString(),
       seats: seats.rows.map((seat) => ({
         seatIndex: seat.seat_index,
         userId: seat.user_id ?? undefined,
@@ -467,6 +499,16 @@ export const listPersistedRooms = async (pool: pg.Pool, limit = 50): Promise<Per
         connected: false,
       })),
     };
+    if (row.room_code) record.code = row.room_code;
+    const lastActivityAt = dateString(row.last_activity_at);
+    if (lastActivityAt) record.lastActivityAt = lastActivityAt;
+    const emptySince = dateString(row.empty_since);
+    if (emptySince) record.emptySince = emptySince;
+    const pausedAt = dateString(row.paused_at);
+    if (pausedAt) record.pausedAt = pausedAt;
+    const archivedAt = dateString(row.archived_at);
+    if (archivedAt) record.archivedAt = archivedAt;
+    if (row.cleanup_reason) record.cleanupReason = row.cleanup_reason;
     if (matchRow) {
       record.match = {
         id: matchRow.id,
@@ -474,10 +516,42 @@ export const listPersistedRooms = async (pool: pg.Pool, limit = 50): Promise<Per
         board: matchRow.board_json,
         events: events?.rows.map((event) => event.payload_json) ?? [],
       };
-      if (matchRow.ended_at) record.match.endedAt = matchRow.ended_at instanceof Date ? matchRow.ended_at.toISOString() : String(matchRow.ended_at);
+      const endedAt = dateString(matchRow.ended_at);
+      if (endedAt) record.match.endedAt = endedAt;
       if (matchRow.winner_user_id) record.match.winnerUserId = matchRow.winner_user_id;
     }
     records.push(record);
   }
   return records;
+};
+
+export const listPersistedRooms = async (pool: pg.Pool, limit = 50): Promise<PersistedRoomRecord[]> => {
+  const rooms = await pool.query(
+    `SELECT
+       id, room_code, mode, status, host_user_id, settings_json, created_at,
+       last_activity_at, empty_since, paused_at, archived_at, cleanup_reason
+     FROM rooms
+     WHERE archived_at IS NULL
+       AND status NOT IN ('EXPIRED', 'ABANDONED')
+     ORDER BY created_at DESC
+     LIMIT $1`,
+    [limit],
+  );
+  return hydratePersistedRoomRecords(pool, rooms.rows);
+};
+
+export const findPersistedRoomByRef = async (pool: pg.Pool, roomRef: string): Promise<PersistedRoomRecord | undefined> => {
+  const normalizedCode = roomRef.trim().toUpperCase();
+  const rooms = await pool.query(
+    `SELECT
+       id, room_code, mode, status, host_user_id, settings_json, created_at,
+       last_activity_at, empty_since, paused_at, archived_at, cleanup_reason
+     FROM rooms
+     WHERE id = $1 OR room_code = $2
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [roomRef, normalizedCode],
+  );
+  const [record] = await hydratePersistedRoomRecords(pool, rooms.rows);
+  return record;
 };

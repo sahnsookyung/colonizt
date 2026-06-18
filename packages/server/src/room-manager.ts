@@ -1,4 +1,4 @@
-import { nanoid } from "nanoid";
+import { customAlphabet, nanoid } from "nanoid";
 import {
   applyCommand,
   activeCollectingTradeForPlayer,
@@ -24,11 +24,37 @@ import {
   type PlayerId,
   type ViewerState,
 } from "@colonizt/game-core";
-import { createBotTradeId, createBotView, evaluateState, evaluateTrade, greedyBot, plannerBot, randomLegalBot, type BotController } from "@colonizt/bots";
+import { createBotTradeId, createBotView, evaluateState, evaluateTrade, greedyBot, hasEquivalentBotTradeOffer, plannerBot, randomLegalBot, type BotController } from "@colonizt/bots";
 import { MemoryEventStore, type EventStore, type StoredCommandResult, type StoredMatchSummary, type StoredRoomRecord } from "./event-store.js";
 import { hashCommandPayload } from "./security.js";
 
 const tradeResponseWindowMs = 15_000;
+const roomCodeAlphabet = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+const generateRoomCode = customAlphabet(roomCodeAlphabet, 6);
+
+export type RoomStatus = "LOBBY" | "IN_GAME" | "FINISHED" | "EXPIRED" | "ABANDONED";
+
+export interface RoomCleanupPolicy {
+  maxActiveRooms: number;
+  emptyLobbyTtlMs: number;
+  emptyGameTtlMs: number;
+  finishedRoomUnloadMs: number;
+}
+
+export const defaultRoomCleanupPolicy: RoomCleanupPolicy = {
+  maxActiveRooms: 200,
+  emptyLobbyTtlMs: 10 * 60 * 1000,
+  emptyGameTtlMs: 30 * 60 * 1000,
+  finishedRoomUnloadMs: 5 * 60 * 1000,
+};
+
+export class RoomCapacityError extends Error {
+  readonly code = "ROOM_CAPACITY_REACHED";
+
+  constructor() {
+    super("Too many active rooms");
+  }
+}
 
 export interface Session {
   token: string;
@@ -72,12 +98,18 @@ export interface Report {
 
 export interface Room {
   id: string;
+  code: string;
   hostUserId: PlayerId;
-  status: "LOBBY" | "IN_GAME" | "FINISHED";
+  status: RoomStatus;
   settings: RoomSettings;
   seats: Seat[];
   spectators: Set<PlayerId>;
   createdAt: string;
+  lastActivityAt: string;
+  emptySince?: string;
+  pausedAt?: string;
+  archivedAt?: string;
+  cleanupReason?: string;
   game?: GameState;
   board?: GameState["board"];
   events: GameEvent[];
@@ -108,8 +140,11 @@ export class RoomManager {
   readonly sessions = new Map<string, Session>();
   readonly rooms = new Map<string, Room>();
   private readonly roomQueues = new Map<string, Promise<void>>();
+  private readonly cleanupPolicy: RoomCleanupPolicy;
 
-  constructor(private readonly eventStore: EventStore = new MemoryEventStore()) {}
+  constructor(private readonly eventStore: EventStore = new MemoryEventStore(), cleanupPolicy: Partial<RoomCleanupPolicy> = {}) {
+    this.cleanupPolicy = { ...defaultRoomCleanupPolicy, ...cleanupPolicy };
+  }
 
   async createSession(displayName: string): Promise<Session> {
     const userId = `u_${nanoid(8)}`;
@@ -132,28 +167,51 @@ export class RoomManager {
   }
 
   async createRoom(host: Session, settings: RoomSettings): Promise<Room> {
+    await this.cleanupRooms();
+    if (this.activeRoomCount() >= this.cleanupPolicy.maxActiveRooms) {
+      throw new RoomCapacityError();
+    }
+    const createdAt = new Date().toISOString();
     const room: Room = {
       id: `room_${nanoid(8)}`,
+      code: this.createUniqueRoomCode(),
       hostUserId: host.userId,
       status: "LOBBY",
       settings,
       seats: Array.from({ length: 4 }, (_, seatIndex) => ({ seatIndex, ready: false, connected: false })),
       spectators: new Set(),
-      createdAt: new Date().toISOString(),
+      createdAt,
+      lastActivityAt: createdAt,
       events: [],
       chat: [],
       reports: [],
       processedClientCommands: new Map(),
       tradeResponseDeadlines: new Map(),
     };
-    room.seats[0] = { seatIndex: 0, userId: host.userId, ready: false, connected: true };
+    room.seats[0] = { seatIndex: 0, userId: host.userId, ready: false, connected: false };
     this.rooms.set(room.id, room);
     await this.eventStore.persistRoom(room);
     return room;
   }
 
   listRooms() {
-    return [...this.rooms.values()].map((room) => this.publicRoom(room));
+    return [...this.rooms.values()].filter((room) => this.isActiveRoom(room)).map((room) => this.publicRoomSummary(room));
+  }
+
+  publicRoomSummary(room: Room) {
+    return {
+      id: room.id,
+      code: room.code,
+      hostUserId: room.hostUserId,
+      status: room.status,
+      settings: room.settings,
+      seats: room.seats,
+      spectatorCount: room.spectators.size,
+      createdAt: room.createdAt,
+      lastActivityAt: room.lastActivityAt,
+      pausedAt: room.pausedAt,
+      timer: room.timer,
+    };
   }
 
   viewerState(room: Room, state: GameState, viewerId: PlayerId | "spectator"): ViewerState {
@@ -184,6 +242,18 @@ export class RoomManager {
     return hydrated;
   }
 
+  roomForRef(roomRef: string): Room | undefined {
+    const normalizedRef = roomRef.trim().toUpperCase();
+    return this.rooms.get(roomRef) ?? [...this.rooms.values()].find((room) => room.code === normalizedRef);
+  }
+
+  async loadRoomStatusByRef(roomRef: string): Promise<{ status: RoomStatus; cleanupReason?: string } | undefined> {
+    const room = this.roomForRef(roomRef);
+    if (room) return { status: room.status, ...(room.cleanupReason ? { cleanupReason: room.cleanupReason } : {}) };
+    const stored = await this.eventStore.loadRoomByRef?.(roomRef);
+    return stored ? { status: stored.status, ...(stored.cleanupReason ? { cleanupReason: stored.cleanupReason } : {}) } : undefined;
+  }
+
   async listMatchHistory(limit = 20): Promise<StoredMatchSummary[]> {
     return this.eventStore.listMatches(limit);
   }
@@ -192,31 +262,39 @@ export class RoomManager {
     const game = room.game ? this.viewerState(room, room.game, viewerId) : undefined;
     return {
       id: room.id,
+      code: room.code,
       hostUserId: room.hostUserId,
       status: room.status,
       settings: room.settings,
       seats: room.seats,
       spectatorCount: room.spectators.size,
       createdAt: room.createdAt,
+      lastActivityAt: room.lastActivityAt,
+      pausedAt: room.pausedAt,
+      cleanupReason: room.cleanupReason,
       events: serializeEventsForViewer(room.events, viewerId, room.game?.playerOrder),
       chat: room.chat,
-      reports: room.reports,
       timer: room.timer,
       game,
     };
   }
 
   async joinRoom(roomId: string, session: Session, asSpectator = false): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
-    const room = this.rooms.get(roomId);
+    const room = this.roomForRef(roomId);
     if (!room) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
+    if (room.status === "EXPIRED") return { ok: false, code: "ROOM_EXPIRED", message: "Room expired because everyone left the lobby" };
+    if (room.status === "ABANDONED") return { ok: false, code: "ROOM_ABANDONED", message: "Room was abandoned because all seated players disconnected" };
     const existing = room.seats.find((seat) => seat.userId === session.userId);
     if (existing) {
       existing.connected = true;
+      this.touchRoom(room);
+      this.resumeRoomIfNeeded(room);
       await this.eventStore.persistRoom(room);
       return { ok: true, room };
     }
     if (asSpectator || room.status !== "LOBBY") {
       room.spectators.add(session.userId);
+      this.touchRoom(room);
       await this.eventStore.persistRoom(room);
       return { ok: true, room };
     }
@@ -224,20 +302,145 @@ export class RoomManager {
     if (!seat) return { ok: false, code: "ROOM_FULL", message: "Room is full" };
     seat.userId = session.userId;
     seat.connected = true;
+    this.touchRoom(room);
     await this.eventStore.persistRoom(room);
     return { ok: true, room };
   }
 
   async setReady(roomId: string, session: Session, ready: boolean): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
-    const room = this.rooms.get(roomId);
+    const room = this.roomForRef(roomId);
     if (!room) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
+    if (room.status === "EXPIRED" || room.status === "ABANDONED") return { ok: false, code: "ROOM_CLOSED", message: "Room is closed" };
+    if (room.status !== "LOBBY") return { ok: false, code: "ROOM_ALREADY_STARTED", message: "Room has already started" };
     const seat = room.seats.find((candidate) => candidate.userId === session.userId);
     if (!seat) return { ok: false, code: "NOT_IN_ROOM", message: "You are not seated in this room" };
     seat.ready = ready;
+    this.touchRoom(room);
     if (room.settings.botFill) this.fillBots(room);
     if (this.canStart(room)) await this.startRoom(room);
     else await this.eventStore.persistRoom(room);
     return { ok: true, room };
+  }
+
+  async syncConnections(roomId: string, connectedUserIds: Set<PlayerId>, now = Date.now()): Promise<Room | undefined> {
+    const room = this.roomForRef(roomId);
+    if (!room) return undefined;
+    let changed = false;
+    for (const seat of room.seats) {
+      if (!seat.userId) continue;
+      const connected = connectedUserIds.has(seat.userId);
+      if (seat.connected !== connected) {
+        seat.connected = connected;
+        changed = true;
+      }
+    }
+    for (const spectatorId of [...room.spectators]) {
+      if (!connectedUserIds.has(spectatorId)) {
+        room.spectators.delete(spectatorId);
+        changed = true;
+      }
+    }
+    if (this.connectedSeatedHumanCount(room) === 0) {
+      if (room.status === "IN_GAME" && !room.pausedAt) {
+        room.pausedAt = new Date(now).toISOString();
+        room.emptySince ??= room.pausedAt;
+        changed = true;
+      } else if ((room.status === "LOBBY" || room.status === "FINISHED") && !room.emptySince) {
+        room.emptySince = new Date(now).toISOString();
+        changed = true;
+      }
+    } else if (this.resumeRoomIfNeeded(room, now)) {
+      changed = true;
+    } else if (room.emptySince && room.status !== "IN_GAME") {
+      delete room.emptySince;
+      changed = true;
+    }
+    if (changed) {
+      this.touchRoom(room, now);
+      await this.eventStore.persistRoom(room);
+    }
+    return room;
+  }
+
+  async cleanupRooms(now = Date.now()): Promise<Array<{ roomId: string; code: string; status: RoomStatus; cleanupReason?: string }>> {
+    const cleaned: Array<{ roomId: string; code: string; status: RoomStatus; cleanupReason?: string }> = [];
+    for (const room of [...this.rooms.values()]) {
+      if (room.archivedAt) continue;
+      const nowIso = new Date(now).toISOString();
+      const connectedSeatedHumans = this.connectedSeatedHumanCount(room);
+      const connectedUsers = this.connectedUserCount(room);
+      let changed = false;
+
+      if (room.status === "LOBBY") {
+        if (connectedSeatedHumans === 0) {
+          if (!room.emptySince) {
+            room.emptySince = nowIso;
+            changed = true;
+          }
+          if (now - Date.parse(room.emptySince) >= this.cleanupPolicy.emptyLobbyTtlMs) {
+            room.status = "EXPIRED";
+            room.cleanupReason = "EMPTY_LOBBY_TTL";
+            room.archivedAt = nowIso;
+            changed = true;
+          }
+        } else if (room.emptySince) {
+          delete room.emptySince;
+          changed = true;
+        }
+      } else if (room.status === "IN_GAME") {
+        if (connectedSeatedHumans === 0) {
+          if (!room.emptySince) {
+            room.emptySince = nowIso;
+            changed = true;
+          }
+          if (!room.pausedAt) {
+            room.pausedAt = nowIso;
+            changed = true;
+          }
+          if (now - Date.parse(room.emptySince) >= this.cleanupPolicy.emptyGameTtlMs) {
+            room.status = "ABANDONED";
+            room.cleanupReason = "EMPTY_GAME_TTL";
+            room.archivedAt = nowIso;
+            changed = true;
+          }
+        } else if (this.resumeRoomIfNeeded(room, now)) {
+          changed = true;
+        }
+      } else if (room.status === "FINISHED") {
+        if (connectedUsers === 0) {
+          if (!room.emptySince) {
+            room.emptySince = nowIso;
+            changed = true;
+          }
+          if (now - Date.parse(room.emptySince) >= this.cleanupPolicy.finishedRoomUnloadMs) {
+            room.cleanupReason = "FINISHED_UNLOADED";
+            room.archivedAt = nowIso;
+            changed = true;
+          }
+        } else if (room.emptySince) {
+          delete room.emptySince;
+          changed = true;
+        }
+      }
+
+      if (!changed) continue;
+      this.touchRoom(room, now);
+      await this.eventStore.persistRoom(room);
+      if (room.archivedAt || room.status === "EXPIRED" || room.status === "ABANDONED") {
+        this.rooms.delete(room.id);
+        cleaned.push({
+          roomId: room.id,
+          code: room.code,
+          status: room.status,
+          ...(room.cleanupReason ? { cleanupReason: room.cleanupReason } : {}),
+        });
+      }
+    }
+    return cleaned;
+  }
+
+  activeRoomCount(): number {
+    return [...this.rooms.values()].filter((room) => this.isActiveRoom(room)).length;
   }
 
   fillBots(room: Room): void {
@@ -306,8 +509,9 @@ export class RoomManager {
   }
 
   private async submitCommandNow(roomId: string, session: Session, clientSeq: number, command: GameCommand): Promise<CommandResult> {
-    const room = this.rooms.get(roomId);
+    const room = this.roomForRef(roomId);
     if (!room?.game) return { ok: false, code: "ROOM_NOT_IN_GAME", message: "Room is not in game" };
+    if (room.pausedAt) return { ok: false, code: "ROOM_PAUSED", message: "Room is paused until a seated player reconnects" };
     if (!this.isMember(room, session.userId)) return { ok: false, code: "NOT_IN_ROOM", message: "You are not in this room" };
     if (command.playerId !== session.userId) return { ok: false, code: "COMMAND_PLAYER_MISMATCH", message: "Command player does not match session" };
 
@@ -334,7 +538,8 @@ export class RoomManager {
       return replayed;
     }
 
-    const result = applyCommand(room.game, command);
+    const previousState = room.game;
+    const result = applyCommand(previousState, command);
     if (!result.ok) {
       const rejected: StoredCommandResult = {
         roomId: room.id,
@@ -359,6 +564,7 @@ export class RoomManager {
     }
 
     room.game = result.value.nextState;
+    this.touchRoom(room);
     const allEvents = result.value.events;
     const storedResult: StoredCommandResult = {
       roomId: room.id,
@@ -379,7 +585,7 @@ export class RoomManager {
     } else {
       await this.eventStore.persistRoom(room);
     }
-    this.refreshTimer(room);
+    this.refreshTimer(room, previousState);
     return { ok: true, events: allEvents, state: room.game };
   }
 
@@ -421,13 +627,15 @@ export class RoomManager {
   }
 
   private async expireTurnNow(roomId: string, now: number): Promise<CommandResult | undefined> {
-    const room = this.rooms.get(roomId);
+    const room = this.roomForRef(roomId);
     if (!room?.game || !room.timer || room.timer.expiresAt > now || !("activePlayerId" in room.game.phase)) return undefined;
+    if (room.pausedAt) return undefined;
 
     const activePlayerId = room.game.phase.activePlayerId;
     const modalTrade = activeCollectingTradeForPlayer(room.game, activePlayerId);
     if (room.game.phase.type === "ACTION_PHASE" && modalTrade) {
-      const closed = applyCommand(room.game, { type: "EXPIRE_TRADE", playerId: activePlayerId, tradeId: modalTrade.id, reason: "RESPONSE_TIMEOUT" });
+      const previousState = room.game;
+      const closed = applyCommand(previousState, { type: "EXPIRE_TRADE", playerId: activePlayerId, tradeId: modalTrade.id, reason: "RESPONSE_TIMEOUT" });
       if (!closed.ok) return { ok: false, code: closed.error.code, message: closed.error.message };
       const ended = applyCommand(closed.value.nextState, { type: "END_TURN", playerId: activePlayerId });
       if (!ended.ok) return { ok: false, code: ended.error.code, message: ended.error.message };
@@ -439,13 +647,14 @@ export class RoomManager {
         return { ok: false, code: "EVENT_APPEND_FAILED", message: error instanceof Error ? error.message : "Event append failed" };
       }
       room.game = ended.value.nextState;
+      this.touchRoom(room, now);
       if (room.game.phase.type === "GAME_OVER") {
         room.status = "FINISHED";
         await this.eventStore.markFinished(room, room.game.phase.winnerId);
       } else {
         await this.eventStore.persistRoom(room);
       }
-      this.refreshTimer(room);
+      this.refreshTimer(room, previousState);
       return { ok: true, events: allEvents, state: room.game };
     }
 
@@ -455,7 +664,8 @@ export class RoomManager {
       return undefined;
     }
 
-    const result = applyCommand(room.game, command);
+    const previousState = room.game;
+    const result = applyCommand(previousState, command);
     if (!result.ok) return { ok: false, code: result.error.code, message: result.error.message };
 
     try {
@@ -466,6 +676,7 @@ export class RoomManager {
     }
 
     room.game = result.value.nextState;
+    this.touchRoom(room, now);
     const allEvents = result.value.events;
     if (room.game.phase.type === "GAME_OVER") {
       room.status = "FINISHED";
@@ -473,24 +684,26 @@ export class RoomManager {
     } else {
       await this.eventStore.persistRoom(room);
     }
-    this.refreshTimer(room);
+    this.refreshTimer(room, previousState);
     return { ok: true, events: allEvents, state: room.game };
   }
 
   async addChat(roomId: string, session: Session, message: string): Promise<ChatMessage | undefined> {
-    const room = this.rooms.get(roomId);
+    const room = this.roomForRef(roomId);
     if (!room || !this.isMember(room, session.userId)) return undefined;
     const chat: ChatMessage = { id: `chat_${nanoid(8)}`, userId: session.userId, message, createdAt: new Date().toISOString() };
     room.chat.push(chat);
+    this.touchRoom(room);
     await this.eventStore.persistChat(room, chat);
     return chat;
   }
 
   async createReport(roomId: string, reporter: Session, reportedUserId: string, reason: string): Promise<Report | undefined> {
-    const room = this.rooms.get(roomId);
+    const room = this.roomForRef(roomId);
     if (!room || !this.isMember(room, reporter.userId)) return undefined;
-    const report: Report = { id: `report_${nanoid(8)}`, reporterUserId: reporter.userId, reportedUserId, roomId, reason, status: "OPEN" };
+    const report: Report = { id: `report_${nanoid(8)}`, reporterUserId: reporter.userId, reportedUserId, roomId: room.id, reason, status: "OPEN" };
     room.reports.push(report);
+    this.touchRoom(room);
     await this.eventStore.persistReport(room, report);
     return report;
   }
@@ -500,7 +713,7 @@ export class RoomManager {
   }
 
   getReplay(roomId: string): { config: GameConfig; board: GameState["board"]; events: GameEvent[] } | undefined {
-    const room = this.rooms.get(roomId);
+    const room = this.roomForRef(roomId);
     if (!room?.game || !room.board) return undefined;
     return { config: room.game.config, board: room.board, events: room.events };
   }
@@ -522,7 +735,7 @@ export class RoomManager {
   }
 
   resync(roomId: string, session: Session, lastSeq: number): { snapshot?: ViewerState; events: GameEvent[] } | undefined {
-    const room = this.rooms.get(roomId);
+    const room = this.roomForRef(roomId);
     if (!room?.game) return undefined;
     const viewerId = this.isMember(room, session.userId) ? session.userId : "spectator";
     const events = room.events.filter((event) => event.seq > lastSeq);
@@ -536,15 +749,73 @@ export class RoomManager {
     return room.seats.some((seat) => seat.userId === userId || seat.botId === userId);
   }
 
-  refreshTimer(room: Room): void {
+  refreshTimer(room: Room, previousState?: GameState): void {
     if (!room.game || !("activePlayerId" in room.game.phase)) {
       delete room.timer;
+      return;
+    }
+    const nextKey = this.timerKey(room.game);
+    const previousKey = this.timerKey(previousState);
+    if (room.timer && nextKey && nextKey === previousKey && room.timer.activePlayerId === room.game.phase.activePlayerId) {
       return;
     }
     room.timer = {
       activePlayerId: room.game.phase.activePlayerId,
       expiresAt: Date.now() + room.game.config.turnSeconds * 1000,
     };
+  }
+
+  private timerKey(state?: GameState): string | undefined {
+    if (!state || !("activePlayerId" in state.phase)) return undefined;
+    return `${state.config.matchId}:${state.turn}:${state.phase.type}:${state.phase.activePlayerId}`;
+  }
+
+  private createUniqueRoomCode(): string {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const code = generateRoomCode();
+      if (![...this.rooms.values()].some((room) => room.code === code)) return code;
+    }
+    return generateRoomCode();
+  }
+
+  private touchRoom(room: Room, now = Date.now()): void {
+    room.lastActivityAt = new Date(now).toISOString();
+  }
+
+  private isActiveRoom(room: Room): boolean {
+    return !room.archivedAt && room.status !== "EXPIRED" && room.status !== "ABANDONED";
+  }
+
+  private connectedSeatedHumanCount(room: Room): number {
+    return room.seats.filter((seat) => seat.userId && seat.connected).length;
+  }
+
+  private connectedUserCount(room: Room): number {
+    const connectedIds = new Set<PlayerId>();
+    for (const seat of room.seats) {
+      if (seat.userId && seat.connected) connectedIds.add(seat.userId);
+    }
+    for (const spectatorId of room.spectators) connectedIds.add(spectatorId);
+    return connectedIds.size;
+  }
+
+  private resumeRoomIfNeeded(room: Room, now = Date.now()): boolean {
+    if (!room.pausedAt) {
+      if (room.emptySince && this.connectedSeatedHumanCount(room) > 0) {
+        delete room.emptySince;
+        return true;
+      }
+      return false;
+    }
+    if (this.connectedSeatedHumanCount(room) === 0) return false;
+    const pausedDuration = Math.max(0, now - Date.parse(room.pausedAt));
+    if (room.timer) room.timer.expiresAt += pausedDuration;
+    for (const [tradeId, deadline] of room.tradeResponseDeadlines.entries()) {
+      room.tradeResponseDeadlines.set(tradeId, deadline + pausedDuration);
+    }
+    delete room.pausedAt;
+    delete room.emptySince;
+    return true;
   }
 
   private botFor(botId: PlayerId): BotController {
@@ -556,7 +827,8 @@ export class RoomManager {
 
   private async applyInternalCommand(room: Room, command: GameCommand): Promise<CommandResult> {
     if (!room.game) return { ok: false, code: "ROOM_NOT_IN_GAME", message: "Room is not in game" };
-    const result = applyCommand(room.game, command);
+    const previousState = room.game;
+    const result = applyCommand(previousState, command);
     if (!result.ok) return { ok: false, code: result.error.code, message: result.error.message };
     try {
       await this.eventStore.appendEvents(room, result.value.events);
@@ -565,13 +837,14 @@ export class RoomManager {
       return { ok: false, code: "EVENT_APPEND_FAILED", message: error instanceof Error ? error.message : "Event append failed" };
     }
     room.game = result.value.nextState;
+    this.touchRoom(room);
     if (room.game.phase.type === "GAME_OVER") {
       room.status = "FINISHED";
       await this.eventStore.markFinished(room, room.game.phase.winnerId);
     } else {
       await this.eventStore.persistRoom(room);
     }
-    this.refreshTimer(room);
+    this.refreshTimer(room, previousState);
     return { ok: true, events: result.value.events, state: room.game };
   }
 
@@ -610,18 +883,24 @@ export class RoomManager {
     const status = game?.phase.type === "GAME_OVER" ? "FINISHED" : record.status;
     const room: Room = {
       id: record.id,
+      code: record.code ?? this.createUniqueRoomCode(),
       hostUserId: record.hostUserId,
       status,
       settings: record.settings,
       seats: record.seats.map((seat) => ({ ...seat, connected: false })),
       spectators: new Set(),
       createdAt: record.createdAt,
+      lastActivityAt: record.lastActivityAt ?? record.createdAt,
       events: record.match?.events ?? [],
       chat: [],
       reports: [],
       processedClientCommands: new Map(),
       tradeResponseDeadlines: new Map(),
     };
+    if (record.emptySince) room.emptySince = record.emptySince;
+    if (record.pausedAt) room.pausedAt = record.pausedAt;
+    if (record.archivedAt) room.archivedAt = record.archivedAt;
+    if (record.cleanupReason) room.cleanupReason = record.cleanupReason;
     if (game) room.game = game;
     if (record.match?.board) room.board = record.match.board;
     if (room.game) {
@@ -696,6 +975,7 @@ export class RoomManager {
   private async runDueBotAutomationNow(roomId: string, now: number): Promise<CommandResult | undefined> {
     const room = this.rooms.get(roomId);
     if (!room?.game || room.status !== "IN_GAME" || room.game.phase.type === "GAME_OVER") return undefined;
+    if (room.pausedAt) return undefined;
 
     const dueTrade = this.dueTradeResponseCommand(room, now);
     if (dueTrade) return this.applyInternalCommand(room, dueTrade);
@@ -710,6 +990,9 @@ export class RoomManager {
     const view = createBotView(room.game, active, bot.profile, room.game.config.botDifficulty ?? "medium");
     let command = bot.chooseCommand(view, (prefix: string) => createBotTradeId(room.game!, active, bot.profile) || prefix);
     if (!command) return undefined;
+    if (command.type === "OFFER_TRADE" && hasEquivalentBotTradeOffer(view, command)) {
+      command = { type: "END_TURN", playerId: active };
+    }
     if (command.type === "PLACE_SETUP") {
       const setupCommand = command;
       const edgeId = room.game.board.adjacency.vertexToEdges[setupCommand.vertexId]?.find((candidate) => canBuildRoad(room.game!, setupCommand.playerId, candidate, setupCommand.vertexId));

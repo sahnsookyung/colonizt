@@ -7,11 +7,13 @@ export interface AnalyticsPayload {
 export const platform = (): "desktop" | "mobile" =>
   typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(max-width: 760px)").matches ? "mobile" : "desktop";
 
-const analyticsBaseUrl = (import.meta as ImportMeta & { env?: { VITE_API_BASE_URL?: string } }).env?.VITE_API_BASE_URL ?? "http://127.0.0.1:8787";
+const analyticsEnv = (import.meta as ImportMeta & { env?: { DEV?: boolean; MODE?: string; VITE_API_BASE_URL?: string } }).env;
+const analyticsBaseUrl = analyticsEnv?.VITE_API_BASE_URL ?? "http://127.0.0.1:8787";
+const shouldLogAnalytics = Boolean(analyticsEnv?.DEV || analyticsEnv?.MODE === "test");
 
 export const track = (eventName: string, payload: AnalyticsPayload): void => {
   const event = { eventName, payload, createdAt: new Date().toISOString() };
-  console.info("[analytics]", event);
+  if (shouldLogAnalytics) console.info("[analytics]", event);
   try {
     const existing = JSON.parse(window.localStorage.getItem("colonizt.analytics") ?? "[]") as unknown[];
     existing.push(event);

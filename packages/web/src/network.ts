@@ -20,7 +20,7 @@ export interface ReplayLogPayload {
 
 export interface NetworkClient {
   createSession(displayName: string): Promise<{ token: string; userId: string; displayName: string }>;
-  createRoom(token: string, options?: { mode?: "CLASSIC" | "DUEL" | "RUSH"; botFill?: boolean; ranked?: boolean; minPlayers?: number; botDifficulty?: BotDifficulty; rules?: GameConfig["rules"] }): Promise<{ id: string }>;
+  createRoom(token: string, options?: { mode?: "CLASSIC" | "DUEL" | "RUSH"; botFill?: boolean; ranked?: boolean; minPlayers?: number; botDifficulty?: BotDifficulty; rules?: GameConfig["rules"] }): Promise<{ id: string; code?: string; inviteUrl?: string }>;
   listMatches(limit?: number): Promise<MatchSummary[]>;
   loadReplay(replayId: string, token?: string): Promise<ReplayLogPayload>;
   createWebSocketTicket(token: string): Promise<{ ticket: string; expiresAt: string; ttlMs: number }>;
@@ -132,7 +132,7 @@ export const createNetworkClient = (baseUrl = configuredBaseUrl): NetworkClient 
       body: JSON.stringify({ mode: "CLASSIC", botFill: true, ranked: false, ...options }),
     });
     if (!response.ok) throw new Error("Room creation failed");
-    return response.json() as Promise<{ id: string }>;
+    return response.json() as Promise<{ id: string; code?: string; inviteUrl?: string }>;
   },
   async listMatches(limit = 12) {
     const config = await resolveRuntimeConfig(baseUrl);
