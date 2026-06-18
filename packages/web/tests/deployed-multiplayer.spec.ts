@@ -13,14 +13,14 @@ test.describe("deployed multiplayer smoke", () => {
       await pageA.goto("/");
       await pageA.getByRole("button", { name: /Player Match/ }).click();
       const statusA = pageA.locator(".phase-card .eyebrow");
-      await expect(statusA).toContainText(/Online room_/);
+      await expect(statusA).toContainText(/Online [A-Z0-9]{6}/);
       const roomStatus = await statusA.textContent();
-      const roomId = roomStatus?.match(/room_[A-Za-z0-9_-]+/)?.[0];
-      expect(roomId, `room id in status: ${roomStatus}`).toBeTruthy();
+      const roomCode = roomStatus?.match(/[A-Z0-9]{6}/)?.[0];
+      expect(roomCode, `room code in status: ${roomStatus}`).toBeTruthy();
 
       for (const page of peerPages) {
-        await page.goto(`/?roomId=${encodeURIComponent(roomId!)}`);
-        await expect(page.locator(".phase-card .eyebrow")).toContainText(roomId!);
+        await page.goto(`/?room=${encodeURIComponent(roomCode!)}`);
+        await expect(page.locator(".phase-card .eyebrow")).toContainText(roomCode!);
       }
 
       await pageA.getByRole("button", { name: "Ready" }).click();
@@ -33,7 +33,7 @@ test.describe("deployed multiplayer smoke", () => {
 
       await peerPages[0]!.reload();
       await expect(peerPages[0]!.getByLabel("Game board and actions")).toBeVisible();
-      await expect(peerPages[0]!.locator(".phase-card .eyebrow")).toContainText(roomId!);
+      await expect(peerPages[0]!.locator(".phase-card .eyebrow")).toContainText(roomCode!);
     } finally {
       await Promise.all(contexts.map((context) => context.close()));
     }
