@@ -1606,6 +1606,7 @@ export const App = () => {
                 </span>
                 <strong>Bot Match</strong>
                 <span>Local table</span>
+                <span className="match-cta">Start</span>
               </button>
               <button type="button" className="match-choice" onClick={startPlayerMatch}>
                 <span className="match-art" aria-hidden="true">
@@ -1614,6 +1615,7 @@ export const App = () => {
                 </span>
                 <strong>Player Match</strong>
                 <span>4 player online room</span>
+                <span className="match-cta">Host</span>
               </button>
             </div>
             <div className="match-options" aria-label="Game options">
@@ -2171,6 +2173,12 @@ export const App = () => {
                       <span>{player.resourceCount} cards</span>
                       <span>{player.specialCards} special</span>
                       <span>road {player.longestRoadLength}</span>
+                    </div>
+                    <div className="player-mobile-stats" aria-hidden="true">
+                      <span>{player.score} VP</span>
+                      <span>{player.resourceCount}C</span>
+                      <span>{player.specialCards}S</span>
+                      <span>R{player.longestRoadLength}</span>
                     </div>
                   </div>
                   {player.hasLongestRoad ? <span className="badge">Longest Road</span> : null}

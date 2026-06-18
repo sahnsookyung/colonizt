@@ -17,7 +17,7 @@ test("mobile viewport keeps primary controls visible", async ({ page, isMobile }
   test.skip(!isMobile, "mobile project only");
   await page.goto("/");
   await page.getByRole("button", { name: /Bot Match/ }).click();
-  await page.getByRole("button", { name: "Ready" }).click();
+  await expect(page.getByLabel("Game board and actions")).toBeVisible();
   await expect(page.getByRole("button", { name: "Roll dice" })).toBeVisible();
   await expect(page.getByRole("button", { name: "End Turn" })).toBeVisible();
 });
