@@ -95,6 +95,12 @@ try {
   const started = await waitForMessage<RoomMessage>(hostSocket, "ROOM_STATE", (message) => message.room.status === "IN_GAME" && Boolean(message.room.game));
   await Promise.all(playerSockets.slice(1).map((socket) => waitForMessage<RoomMessage>(socket, "ROOM_STATE", (message) => message.room.status === "IN_GAME" && Boolean(message.room.game))));
 
+  const activePlayerId = started.room.game!.phase.activePlayerId;
+  if (!activePlayerId) throw new Error("Started game did not expose an active setup player");
+  const activePlayerIndex = players.findIndex((player) => player.userId === activePlayerId);
+  const activeSocket = playerSockets[activePlayerIndex];
+  if (activePlayerIndex < 0 || !activeSocket) throw new Error(`Active player ${activePlayerId} is not connected`);
+
   const vertexId = Object.keys(started.room.game!.board.adjacency.vertexToEdges)[0];
   if (!vertexId) throw new Error("No setup vertex in room state");
   const edgeId = started.room.game!.board.adjacency.vertexToEdges[vertexId]?.[0];
@@ -102,11 +108,11 @@ try {
 
   const hostEventsPromise = waitForMessage<EventsMessage>(hostSocket, "EVENTS");
   const peerEventsPromises = playerSockets.slice(1).map((socket) => waitForMessage<EventsMessage>(socket, "EVENTS"));
-  hostSocket.send(JSON.stringify({
+  activeSocket.send(JSON.stringify({
     type: "COMMAND",
     roomId: room.id,
     clientSeq: 1,
-    command: { type: "PLACE_SETUP", playerId: host.userId, vertexId, edgeId },
+    command: { type: "PLACE_SETUP", playerId: activePlayerId, vertexId, edgeId },
   }));
   const [hostEvents, ...peerEvents] = await Promise.all([hostEventsPromise, ...peerEventsPromises]);
   const canonicalSeq = hostEvents.events.map((event) => event.seq).join(",");
