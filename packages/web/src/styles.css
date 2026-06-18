@@ -1800,6 +1800,9 @@ button.resource-card {
     padding: 0;
     place-items: stretch;
     overflow: auto;
+    background:
+      radial-gradient(circle at 50% 18%, rgba(113, 203, 224, 0.38), transparent 34%),
+      linear-gradient(180deg, #2e82cb 0%, #246cb3 52%, #1e5798 100%);
   }
 
   .start-panel {
@@ -1810,6 +1813,9 @@ button.resource-card {
     padding: max(12px, env(safe-area-inset-top)) 12px max(12px, env(safe-area-inset-bottom));
     border: 0;
     border-radius: 0;
+    background: transparent;
+    color: #fffaf0;
+    box-shadow: none;
   }
 
   .start-brand {
@@ -1822,10 +1828,13 @@ button.resource-card {
   .start-brand h1 {
     font-size: clamp(30px, 11vw, 42px);
     line-height: 0.95;
+    color: #fffaf0;
+    text-shadow: 0 2px 10px rgba(10, 35, 62, 0.28);
   }
 
   .start-brand span {
     font-size: 11px;
+    color: rgba(255, 250, 240, 0.86);
   }
 
   .match-menu {
@@ -1843,6 +1852,10 @@ button.resource-card {
   .match-options {
     gap: 7px;
     padding: 10px;
+    border-color: rgba(255, 250, 240, 0.28);
+    background:
+      linear-gradient(180deg, rgba(17, 72, 125, 0.84), rgba(19, 82, 142, 0.72));
+    box-shadow: 0 14px 28px rgba(11, 29, 42, 0.16);
   }
 
   .difficulty-options {
@@ -1852,6 +1865,9 @@ button.resource-card {
   .difficulty-options button {
     min-height: 30px;
     font-size: 12px;
+    border-color: rgba(255, 250, 240, 0.28);
+    background: rgba(255, 250, 240, 0.12);
+    color: #fffaf0;
   }
 
   .match-choice {
@@ -1862,6 +1878,12 @@ button.resource-card {
     gap: 2px 9px;
     padding: 10px 11px;
     text-align: left;
+    border-color: rgba(255, 250, 240, 0.3);
+    background:
+      linear-gradient(135deg, rgba(255, 255, 255, 0.2), transparent 42%),
+      rgba(16, 79, 144, 0.82);
+    color: #fffaf0;
+    box-shadow: 0 12px 24px rgba(10, 35, 62, 0.18);
   }
 
   .match-choice .match-art {
@@ -1880,21 +1902,36 @@ button.resource-card {
 
   .match-choice span:last-child {
     font-size: 12px;
+    color: rgba(255, 250, 240, 0.78);
   }
 
-  .match-choice .match-cta {
+  .match-choice span.match-cta {
     grid-column: 3;
     grid-row: 1 / span 2;
     min-width: 52px;
     min-height: 30px;
     padding: 0 9px;
     font-size: 10px;
+    border-color: rgba(255, 250, 240, 0.38);
+    background: #fffaf0;
+    color: #1e5798;
   }
 
   .rule-toggle span,
   .option-row > span {
     font-size: 11px;
     line-height: 1.12;
+    color: rgba(255, 250, 240, 0.84);
+  }
+
+  .option-row,
+  .rule-toggle {
+    border-color: rgba(255, 250, 240, 0.22);
+    background: rgba(255, 250, 240, 0.11);
+  }
+
+  .rule-toggle input {
+    background: rgba(255, 250, 240, 0.92);
   }
 
   .app-shell,
@@ -1948,9 +1985,9 @@ button.resource-card {
 
   .board {
     position: absolute;
-    top: 72px;
+    top: clamp(74px, 9svh, 80px);
     left: 50%;
-    width: min(108vw, 400px);
+    width: min(111vw, 434px);
     height: auto;
     min-height: 0;
     transform: translateX(-50%);
