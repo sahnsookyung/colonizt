@@ -313,6 +313,9 @@ describe("WebSocket gateway", () => {
     await app.listen({ host: "127.0.0.1", port: 0 });
 
     const socket = await openSocket(app, host.token);
+    const keeperSocket = await openSocket(app, host.token);
+    keeperSocket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.id }));
+    await waitForMessage(keeperSocket, "ROOM_STATE");
     socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.id }));
     await waitForMessage(socket, "ROOM_STATE");
     socket.close();

@@ -308,6 +308,12 @@ export class RoomManager {
   }
 
   async setReady(roomId: string, session: Session, ready: boolean): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
+    const targetRoom = this.roomForRef(roomId);
+    if (!targetRoom) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
+    return this.enqueueRoom(targetRoom.id, () => this.setReadyNow(targetRoom.id, session, ready));
+  }
+
+  private async setReadyNow(roomId: string, session: Session, ready: boolean): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
     const room = this.roomForRef(roomId);
     if (!room) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
     if (room.status === "EXPIRED" || room.status === "ABANDONED") return { ok: false, code: "ROOM_CLOSED", message: "Room is closed" };
@@ -488,12 +494,21 @@ export class RoomManager {
         ...room.settings.rules,
       },
     };
-    room.board = config.rules?.mapRandomized ? createSeededBoard(room.id, 2) : createFixedBoard();
-    room.game = createGame(config, room.board);
+    const board = config.rules?.mapRandomized ? createSeededBoard(room.id, 2) : createFixedBoard();
+    const game = createGame(config, board);
+    const startedRoom: Room = {
+      ...room,
+      status: "IN_GAME",
+      board,
+      game,
+      tradeResponseDeadlines: new Map(),
+    };
+    await this.eventStore.persistMatchStart(startedRoom, game);
+    room.board = board;
+    room.game = game;
     room.status = "IN_GAME";
     room.tradeResponseDeadlines.clear();
     this.refreshTimer(room);
-    await this.eventStore.persistMatchStart(room, room.game);
   }
 
   async submitCommand(roomId: string, session: Session, clientSeq: number, command: GameCommand): Promise<CommandResult> {

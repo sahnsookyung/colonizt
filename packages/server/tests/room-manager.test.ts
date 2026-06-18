@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { emptyResources, getLegalActions, serializeForViewer, type GameCommand, type TradeOffer } from "@colonizt/game-core";
+import { emptyResources, getLegalActions, serializeForViewer, type GameCommand, type GameState, type TradeOffer } from "@colonizt/game-core";
 import { MemoryEventStore, type EventStore } from "../src/event-store.js";
 import { RoomCapacityError, RoomManager, type Room } from "../src/room-manager.js";
 import type { GameEvent } from "@colonizt/game-core";
@@ -17,6 +17,40 @@ const startedRoom = async (eventStore?: EventStore) => {
 class FailingAppendStore extends MemoryEventStore {
   async appendEvents(_room: Room, _events: GameEvent[]): Promise<void> {
     throw new Error("planned append failure");
+  }
+}
+
+class DelayedMatchStartStore extends MemoryEventStore {
+  matchStarted = false;
+  private resolveStartEntered!: () => void;
+  private releaseStart!: () => void;
+  readonly startEntered: Promise<void>;
+  private readonly startReleased: Promise<void>;
+
+  constructor() {
+    super();
+    this.startEntered = new Promise((resolve) => {
+      this.resolveStartEntered = resolve;
+    });
+    this.startReleased = new Promise((resolve) => {
+      this.releaseStart = resolve;
+    });
+  }
+
+  releaseMatchStart(): void {
+    this.releaseStart();
+  }
+
+  async persistMatchStart(room: Room, state: GameState): Promise<void> {
+    this.resolveStartEntered();
+    await this.startReleased;
+    await super.persistMatchStart(room, state);
+    this.matchStarted = true;
+  }
+
+  async appendEvents(room: Room, events: GameEvent[]): Promise<void> {
+    if (!this.matchStarted) throw new Error("append before match start");
+    await super.appendEvents(room, events);
   }
 }
 
@@ -44,6 +78,41 @@ describe("RoomManager", () => {
     expect(room.status).toBe("IN_GAME");
     expect(room.game?.phase.type).toBe("SETUP_PLACEMENT");
     expect(room.seats.every((seat) => seat.userId || seat.botId)).toBe(true);
+  });
+
+  it("does not expose started rooms before durable match start finishes", async () => {
+    const store = new DelayedMatchStartStore();
+    const manager = new RoomManager(store);
+    const sessions = await Promise.all(["Host", "P2", "P3", "P4"].map((name) => manager.createSession(name)));
+    const host = sessions[0]!;
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 4 });
+    for (const session of sessions.slice(1)) {
+      const joined = await manager.joinRoom(room.id, session);
+      expect(joined.ok).toBe(true);
+    }
+
+    const readyResultsPromise = Promise.all(sessions.map((session) => manager.setReady(room.id, session, true)));
+    await store.startEntered;
+    expect(room.status).toBe("LOBBY");
+    expect(room.game).toBeUndefined();
+
+    store.releaseMatchStart();
+    const readyResults = await readyResultsPromise;
+    expect(readyResults.some((result) => result.ok && result.room.status === "IN_GAME")).toBe(true);
+    expect(room.status).toBe("IN_GAME");
+    expect(room.game).toBeDefined();
+
+    const activePlayerId = room.game?.phase.type === "SETUP_PLACEMENT" ? room.game.phase.activePlayerId : undefined;
+    const activeSession = sessions.find((session) => session.userId === activePlayerId);
+    if (!room.game || !activePlayerId || !activeSession) throw new Error("started room missing active human player");
+    const vertexId = getLegalActions(room.game, activePlayerId).find((action) => action.type === "PLACE_SETUP")!.vertices[0]!;
+    const result = await manager.submitCommand(room.id, activeSession, 1, {
+      type: "PLACE_SETUP",
+      playerId: activePlayerId,
+      vertexId,
+      edgeId: room.game.board.adjacency.vertexToEdges[vertexId]![0]!,
+    });
+    expect(result.ok).toBe(true);
   });
 
   it("rejects command player mismatch", async () => {
