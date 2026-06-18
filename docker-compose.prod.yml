@@ -5,14 +5,11 @@ services:
       dockerfile: Dockerfile.server
     environment:
       DATABASE_URL: postgres://colonizt:colonizt@postgres:5432/colonizt
-      REDIS_URL: redis://redis:6379
       SERVER_HOST: 0.0.0.0
       SERVER_PORT: 8787
       WEB_ORIGIN: http://127.0.0.1:8080
     depends_on:
       postgres:
-        condition: service_healthy
-      redis:
         condition: service_healthy
     ports:
       - "8787:8787"

@@ -1,0 +1,32 @@
+# BEGIN COLONIZT SITE
+colonizt.sookyungahn.com {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+		X-Frame-Options "DENY"
+		Content-Security-Policy "default-src 'self'; connect-src 'self' wss://colonizt.sookyungahn.com; img-src 'self' data:; media-src 'self'; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'"
+	}
+
+	@server {
+		path /health /config /sessions /ws-tickets /analytics /rooms /rooms/* /matches /matches/* /ws
+	}
+	handle @server {
+		reverse_proxy colonizt-server:8787 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+		}
+	}
+
+	handle {
+		reverse_proxy colonizt-web:80 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+		}
+	}
+}
+# END COLONIZT SITE

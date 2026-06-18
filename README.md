@@ -2,18 +2,19 @@
 
 Colonizt is an original browser-first multiplayer resource-route board-game prototype. It is built as a portfolio and interview-preparation project for real-time full-stack product development: deterministic game rules, server-authoritative WebSockets, React/TypeScript UI, replayable event logs, mobile usability, and clear testing gates.
 
-This project does not copy Colonist/CATAN branding, art, proprietary UI, wording, or assets. Any references to those products live only in the job-preparation notes and IP context.
+This project does not copy Colonist/CATAN branding, art, proprietary UI, wording, or assets. Product research notes are kept outside the published repository.
 
 ## Quick Start
 
 ```bash
 npm install
 cp .env.example .env
-docker compose up -d postgres redis
+docker compose up -d postgres
 npm run dev
 ```
 
 The local web app runs on `http://127.0.0.1:5173` and the server runs on `http://127.0.0.1:8787`.
+Redis is optional and only exercises the non-authoritative presence adapter when `REDIS_URL` is set.
 
 ## Useful Commands
 
@@ -29,7 +30,7 @@ npm run verify:local
 ## Production-Style Run
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up --build
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up --build postgres server web
 ```
 
 See `docs/deployment.md` for environment variables, health checks, migrations, and restart recovery notes.
