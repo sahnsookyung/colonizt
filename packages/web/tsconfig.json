@@ -10,6 +10,7 @@
   },
   "references": [
     { "path": "../game-core" },
+    { "path": "../protocol" },
     { "path": "../bots" },
     { "path": "../demo-state" }
   ],

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildServer, MemoryEventStore } from "../src/index.js";
+import { MetricsRegistry, buildServer, createStructuredLogger, MemoryEventStore } from "../src/index.js";
 import { RoomManager } from "../src/room-manager.js";
 
 class CapturingAnalyticsStore extends MemoryEventStore {
@@ -46,6 +46,47 @@ describe("REST routes", () => {
     expect(health.json()).toMatchObject({ ok: true });
     expect(["memory", "redis"]).toContain(health.json().presence);
     expect(analytics.statusCode).toBe(202);
+  });
+
+  it("serves Prometheus metrics and structured request logs", async () => {
+    const records: unknown[] = [];
+    const manager = new RoomManager();
+    const metrics = new MetricsRegistry("route-test", "single");
+    const logger = createStructuredLogger("route-test", "single", (record) => records.push(record));
+    const app = await buildServer({ manager, metrics, logger, nodeId: "route-test" });
+
+    const health = await app.inject({ method: "GET", url: "/health" });
+    const metricsResponse = await app.inject({ method: "GET", url: "/metrics" });
+    await app.close();
+
+    expect(health.statusCode).toBe(200);
+    expect(health.json()).toMatchObject({ nodeId: "route-test", instanceMode: "single" });
+    expect(metricsResponse.statusCode).toBe(200);
+    expect(metricsResponse.headers["content-type"]).toContain("text/plain");
+    expect(metricsResponse.body).toContain('colonizt_active_rooms{node_id="route-test",instance_mode="single"} 0');
+    expect(records).toEqual(expect.arrayContaining([expect.objectContaining({ event: "http.request", route: "/health", statusCode: 200 })]));
+  });
+
+  it("only records request DB failures for database-shaped errors", async () => {
+    const metrics = new MetricsRegistry("route-test", "single");
+    const app = await buildServer({ manager: new RoomManager(), metrics });
+    app.get("/test/non-db-error", async () => {
+      throw new Error("plain handler failure");
+    });
+    app.get("/test/db-error", async () => {
+      throw Object.assign(new Error("duplicate key"), { code: "23505", severity: "ERROR" });
+    });
+
+    const nonDbFailure = await app.inject({ method: "GET", url: "/test/non-db-error" });
+    const afterNonDbMetrics = await app.inject({ method: "GET", url: "/metrics" });
+    const dbFailure = await app.inject({ method: "GET", url: "/test/db-error" });
+    const afterDbMetrics = await app.inject({ method: "GET", url: "/metrics" });
+    await app.close();
+
+    expect(nonDbFailure.statusCode).toBe(500);
+    expect(afterNonDbMetrics.body).not.toContain("colonizt_db_failures_total");
+    expect(dbFailure.statusCode).toBe(500);
+    expect(afterDbMetrics.body).toContain('colonizt_db_failures_total{node_id="route-test",instance_mode="single",operation="request"} 1');
   });
 
   it("does not trust client-supplied analytics user ids", async () => {

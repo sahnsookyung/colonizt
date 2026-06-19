@@ -10,6 +10,10 @@ colonizt.sookyungahn.com {
 		Content-Security-Policy "default-src 'self'; connect-src 'self' wss://colonizt.sookyungahn.com; img-src 'self' data:; media-src 'self'; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'"
 	}
 
+	handle /metrics {
+		respond 404
+	}
+
 	@server {
 		path /health /config /sessions /ws-tickets /analytics /rooms /rooms/* /matches /matches/* /ws
 	}

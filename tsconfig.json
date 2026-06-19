@@ -2,6 +2,7 @@
   "files": [],
   "references": [
     { "path": "./packages/game-core" },
+    { "path": "./packages/protocol" },
     { "path": "./packages/bots" },
     { "path": "./packages/demo-state" },
     { "path": "./packages/test-utils" },

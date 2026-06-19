@@ -2,23 +2,18 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   applyCommand,
   applyEvents,
-  addResources,
-  type BoardGraph,
   canBuildRoad,
-  createFixedBoard,
   emptyResources,
   getLegalActions,
   hasResources,
   cityCost,
   maritimeTradeRatio,
-  replay,
   resourceCount,
   roadCost,
   serializeForViewer,
   settlementCost,
   specialCardCost,
   resources,
-  subtractResources,
   type EdgeId,
   type BotDifficulty,
   type GameConfig,
@@ -28,44 +23,40 @@ import {
   type PlayerId,
   type Resource,
   type ResourceBundle,
-  type Terrain,
   type ViewerState,
   type VertexId,
 } from "@colonizt/game-core";
-import { createBotTradeId, createBotView, evaluateState, evaluateTrade, greedyBot, randomLegalBot } from "@colonizt/bots";
-import { completeSetup, createDemoConfig, createDemoGame, playBotGame } from "@colonizt/demo-state";
+import { completeSetup, createDemoGame } from "@colonizt/demo-state";
 import { platform, track } from "./analytics.js";
+import {
+  BoardHousePiece,
+  BoardIcon,
+  DicePanel,
+  EndTurnSymbol,
+  EventLine,
+  HouseSymbol,
+  ResourceCard,
+  RoadSymbol,
+  SpecialSymbol,
+  TradeBundle,
+  TradeResourceButton,
+  TradeSymbol,
+  formatCost,
+  formatTimer,
+  resourceLabels,
+  terrainLabels,
+} from "./components/game-ui.js";
+import { useLocalAutomation } from "./hooks/useLocalAutomation.js";
+import { useSyncedRef } from "./hooks/useSyncedRef.js";
 import { createNetworkClient, type MatchSummary } from "./network.js";
+import { createDemoReplayLog, replayAtIndex, type ReplayLogState } from "./replay-state.js";
+import { clearResumeState, readResumeState, writeResumeState } from "./resume.js";
 import { playSound, playSoundForEvent } from "./sounds.js";
+import { normalizeTradeDraft, type TradeDraft } from "./trade-draft.js";
 
-const botById = {
-  p2: randomLegalBot,
-  p3: greedyBot,
-  p4: randomLegalBot,
-};
-
-const botIds = new Set<PlayerId>(Object.keys(botById));
-const maxTradeWantCount = 9;
 const diceAnimationMs = 820;
 const rollDeadlineMs = 60_000;
 const actionDeadlineMs = 240_000;
-const botActionDelays = {
-  PLACE_SETUP: 450,
-  ROLL_DICE: 900,
-  BUILD_ROAD: 550,
-  BUILD_SETTLEMENT: 550,
-  UPGRADE_CITY: 550,
-  OFFER_TRADE: 500,
-  RESPOND_TRADE: 500,
-  FINALIZE_TRADE: 500,
-  END_TURN: 300,
-  DEFAULT: 450,
-} as const;
-
-interface TradeDraft {
-  offer: ResourceBundle;
-  request: ResourceBundle;
-}
 
 type BuildMode = "road" | "settlement" | "city";
 
@@ -91,23 +82,6 @@ const defaultMatchOptions: MatchOptions = {
   },
 };
 
-const normalizeTradeDraft = (
-  draft: TradeDraft,
-  playerResources: ResourceBundle,
-  bankRatioByResource: Partial<Record<Resource, number>> = {},
-): TradeDraft => {
-  const offer = emptyResources();
-  const request = emptyResources();
-  for (const resource of resources) {
-    offer[resource] = Math.max(0, Math.min(playerResources[resource], Math.floor(draft.offer[resource] ?? 0)));
-    request[resource] = Math.max(0, Math.min(maxTradeWantCount, Math.floor(draft.request[resource] ?? 0)));
-    if (offer[resource] > 0 && request[resource] > 0) request[resource] = 0;
-    const ratio = bankRatioByResource[resource];
-    if (ratio && offer[resource] > 0 && offer[resource] < ratio) offer[resource] = Math.min(offer[resource], playerResources[resource]);
-  }
-  return { offer, request };
-};
-
 const boardBounds = (state: GameState) => {
   const vertices = Object.values(state.board.vertices);
   const xs = vertices.map((vertex) => vertex.x);
@@ -119,390 +93,8 @@ const boardBounds = (state: GameState) => {
   return { minX, minY, width: maxX - minX, height: maxY - minY };
 };
 
-const resourceLabels: Record<Resource, string> = {
-  timber: "Timber",
-  brick: "Brick",
-  grain: "Grain",
-  fiber: "Fiber",
-  ore: "Ore",
-};
-
-const terrainLabels: Record<Terrain, string> = {
-  ...resourceLabels,
-  desert: "Desert",
-};
-
-const formatCost = (cost: ResourceBundle): string => {
-  const parts = resources
-    .filter((resource) => cost[resource] > 0)
-    .map((resource) => `${cost[resource]} ${resourceLabels[resource]}`);
-  return parts.length > 0 ? parts.join(", ") : "no resources";
-};
-
-const dicePips: Record<number, number[]> = {
-  1: [5],
-  2: [1, 9],
-  3: [1, 5, 9],
-  4: [1, 3, 7, 9],
-  5: [1, 3, 5, 7, 9],
-  6: [1, 3, 4, 6, 7, 9],
-};
-
-const formatTimer = (seconds: number): string => {
-  const clamped = Math.max(0, seconds);
-  const minutes = Math.floor(clamped / 60);
-  const remainder = clamped % 60;
-  return `${minutes}:${remainder.toString().padStart(2, "0")}`;
-};
-
-const ResourceSvg = ({ resource }: { resource: Resource }) => {
-  switch (resource) {
-    case "timber":
-      return (
-        <>
-          <path className="icon-fill timber-leaf" d="M51 9 19 61h18L23 85h56L65 61h17L51 9Z" />
-          <path className="icon-stroke timber-trunk" d="M51 55v33" />
-        </>
-      );
-    case "brick":
-      return (
-        <>
-          <path className="icon-fill brick-clay" d="M14 27h32v18H14zM54 27h32v18H54zM34 52h32v18H34zM14 77h32v10H14zM54 77h32v10H54z" />
-          <path className="icon-stroke" d="M14 45h72M14 70h72M46 27v18M54 77v10M34 52v18M66 52v18" />
-        </>
-      );
-    case "grain":
-      return (
-        <>
-          <path className="icon-stroke grain-stem" d="M50 88V18" />
-          <path className="icon-fill grain-head" d="M50 18c-15 7-20 18-16 29 13-1 21-10 16-29ZM50 18c15 7 20 18 16 29-13-1-21-10-16-29ZM50 40c-16 5-23 16-20 28 14 1 23-8 20-28ZM50 40c16 5 23 16 20 28-14 1-23-8-20-28Z" />
-        </>
-      );
-    case "fiber":
-      return (
-        <>
-          <path className="icon-fill fiber-body" d="M26 56c0-17 12-30 28-30s28 13 28 30c0 15-11 26-28 26S26 71 26 56Z" />
-          <circle className="icon-fill fiber-head" cx="25" cy="48" r="12" />
-          <path className="icon-stroke fiber-leg" d="M42 77v13M67 77v13M18 48h-8M21 42l-7-7" />
-        </>
-      );
-    case "ore":
-      return (
-        <>
-          <path className="icon-fill ore-rock" d="M18 70 31 34l30-13 24 28-11 33H36L18 70Z" />
-          <path className="icon-stroke ore-vein" d="M31 34 48 54 61 21M48 54 36 82M48 54l37-5" />
-        </>
-      );
-  }
-};
-
-const TerrainSvg = ({ terrain }: { terrain: Terrain }) => {
-  if (terrain !== "desert") return <ResourceSvg resource={terrain} />;
-  return (
-    <>
-      <path className="icon-fill desert-sand" d="M16 72c14-18 29-17 43-8 10 7 19 7 29-1v22H16V72Z" />
-      <path className="icon-stroke cactus" d="M48 84V24M48 43H33c-6 0-9-4-9-10v-7M48 57h17c6 0 9-4 9-10v-9" />
-      <path className="icon-stroke desert-mark" d="M21 79h68" />
-    </>
-  );
-};
-
-const BoardIcon = ({ terrain, x, y, size = 0.44 }: { terrain: Terrain; x: number; y: number; size?: number }) => (
-  <g className={`board-icon board-icon-${terrain}`} transform={`translate(${x - size / 2} ${y - size / 2}) scale(${size / 100})`}>
-    <TerrainSvg terrain={terrain} />
-  </g>
-);
-
-const ResourceIcon = ({ resource }: { resource: Resource }) => (
-  <svg className={`resource-icon resource-icon-${resource}`} viewBox="0 0 100 100" aria-hidden="true">
-    <ResourceSvg resource={resource} />
-  </svg>
-);
-
-const ResourceCard = ({
-  resource,
-  count,
-  compact = false,
-  onClick,
-  buttonLabel,
-  selected = false,
-}: {
-  resource: Resource;
-  count: number;
-  compact?: boolean;
-  onClick?: () => void;
-  buttonLabel?: string;
-  selected?: boolean;
-}) => {
-  const className = `resource-card resource-card-${resource} ${compact ? "compact" : ""} ${onClick ? "resource-card-button" : ""} ${selected ? "selected" : ""}`;
-  const content = (
-    <>
-      <ResourceIcon resource={resource} />
-      <span className="resource-count">{count}</span>
-      <small className="resource-name">{resourceLabels[resource]}</small>
-    </>
-  );
-  if (onClick) {
-    return (
-      <button type="button" className={className} onClick={onClick} aria-label={buttonLabel ?? `${resourceLabels[resource]}: ${count}`}>
-        {content}
-      </button>
-    );
-  }
-  return (
-    <div className={className} role="group" aria-label={`${resourceLabels[resource]}: ${count}`}>
-      {content}
-    </div>
-  );
-};
-
-const TradeBundle = ({ bundle }: { bundle: Partial<ResourceBundle> }) => (
-  <div className="trade-bundle">
-    {resources.filter((resource) => (bundle[resource] ?? 0) > 0).map((resource) => (
-      <ResourceCard key={resource} resource={resource} count={bundle[resource] ?? 0} compact />
-    ))}
-  </div>
-);
-
-const TradeResourceButton = ({
-  resource,
-  owned,
-  selected,
-  onIncrement,
-  onDecrement,
-  request = false,
-}: {
-  resource: Resource;
-  owned: number;
-  selected: number;
-  onIncrement: () => void;
-  onDecrement: () => void;
-  request?: boolean;
-}) => (
-  <div className={`trade-card ${selected > 0 ? "selected" : ""}`}>
-    <button
-      type="button"
-      className="trade-card-main"
-      onClick={onIncrement}
-      disabled={!request && selected >= owned}
-      aria-label={`${request ? "Request" : "Offer"} ${resourceLabels[resource]}`}
-    >
-      <ResourceCard resource={resource} count={request ? selected : owned} compact />
-      {selected > 0 ? <span className="trade-selected">x{selected}</span> : null}
-    </button>
-    <button type="button" className="trade-stepper" onClick={onDecrement} disabled={selected <= 0} aria-label={`Remove ${resourceLabels[resource]}`}>
-      -
-    </button>
-  </div>
-);
-
-const DiceFace = ({ value }: { value: number | undefined }) => (
-  <div className="die-face" aria-label={value ? `Die ${value}` : "Die not rolled"}>
-    {Array.from({ length: 9 }, (_, index) => (
-      <span key={index} className={value && dicePips[value]?.includes(index + 1) ? "pip visible" : "pip"} />
-    ))}
-  </div>
-);
-
-const DicePanel = ({
-  roll,
-  rolling,
-  canRoll,
-  onRoll,
-  timerLabel,
-  keyboardShortcutsEnabled,
-}: {
-  roll?: GameState["lastRoll"];
-  rolling: boolean;
-  canRoll: boolean;
-  onRoll: () => void;
-  timerLabel: string | undefined;
-  keyboardShortcutsEnabled: boolean;
-}) => (
-  <button
-    type="button"
-    className={`dice-panel ${rolling ? "rolling" : ""}`}
-    onClick={onRoll}
-    disabled={!canRoll}
-    aria-label="Roll dice"
-    aria-keyshortcuts={keyboardShortcutsEnabled && canRoll ? "R" : undefined}
-  >
-    <div className="dice-pair">
-      <DiceFace value={roll?.dice[0]} />
-      <DiceFace value={roll?.dice[1]} />
-    </div>
-    <strong>{roll ? `Roll ${roll.sum}${roll.doublesMultiplier ? " x2" : ""}` : "Roll --"}</strong>
-    {timerLabel ? <span>{timerLabel}</span> : null}
-  </button>
-);
-
-const HouseSymbol = ({ city = false }: { city?: boolean }) => (
-  <svg className={`piece-symbol house-symbol ${city ? "city-symbol" : ""}`} viewBox="0 0 100 100" aria-hidden="true">
-    <path className="house-roof" d="M14 47 50 17l36 30-8 9-28-23-28 23-8-9Z" />
-    <path className="house-body" d="M24 48h52v34H24z" />
-    <path className="house-door" d="M43 60h14v22H43z" />
-    {city ? <path className="house-tower" d="M62 36h22v46H62z" /> : null}
-  </svg>
-);
-
-const RoadSymbol = () => (
-  <svg className="piece-symbol road-symbol" viewBox="0 0 100 100" aria-hidden="true">
-    <rect className="road-bed" x="12" y="38" width="76" height="24" rx="12" />
-    <path className="road-shine" d="M24 45h52" />
-  </svg>
-);
-
-const TradeSymbol = () => (
-  <svg className="action-symbol" viewBox="0 0 100 100" aria-hidden="true">
-    <rect className="symbol-card card-a" x="14" y="18" width="34" height="48" rx="7" />
-    <rect className="symbol-card card-b" x="52" y="34" width="34" height="48" rx="7" />
-    <path className="symbol-stroke" d="M54 20h21l-7-7m7 7-7 7M46 80H25l7 7m-7-7 7-7" />
-  </svg>
-);
-
-const SpecialSymbol = () => (
-  <svg className="action-symbol" viewBox="0 0 100 100" aria-hidden="true">
-    <rect className="symbol-card special-card" x="24" y="14" width="52" height="72" rx="9" />
-    <path className="symbol-star" d="m50 27 7 14 16 2-12 11 3 16-14-8-14 8 3-16-12-11 16-2 7-14Z" />
-  </svg>
-);
-
-const EndTurnSymbol = ({ waiting = false }: { waiting?: boolean }) => (
-  <svg className={`action-symbol ${waiting ? "waiting-symbol" : ""}`} viewBox="0 0 100 100" aria-hidden="true">
-    {waiting ? (
-      <>
-        <path className="symbol-stroke hourglass" d="M30 15h40M30 85h40M36 15c0 20 28 20 28 35S36 65 36 85M64 15c0 20-28 20-28 35s28 15 28 35" />
-        <path className="symbol-fill sand-fill" d="M42 32h16l-8 10-8-10Zm8 26 12 18H38l12-18Z" />
-      </>
-    ) : (
-      <path className="symbol-stroke end-arrow" d="M21 50h48M52 29l21 21-21 21" />
-    )}
-  </svg>
-);
-
-const BoardHousePiece = ({ city = false }: { city?: boolean }) => (
-  <g className={`house-piece ${city ? "city" : ""}`}>
-    <path className="house-roof" d="M-0.19 -0.03 0 -0.21 0.19 -0.03 0.14 0.03 0 -0.1 -0.14 0.03Z" />
-    <path className="house-body" d="M-0.13 -0.02h0.26v0.2h-0.26Z" />
-    <path className="house-door" d="M-0.035 0.07h0.07v0.11h-0.07Z" />
-    {city ? (
-      <>
-        <path className="house-tower" d="M0.08 -0.11h0.13v0.29h-0.13Z" />
-        <path className="house-roof" d="M0.055 -0.11 0.145 -0.21 0.235 -0.11Z" />
-      </>
-    ) : null}
-  </g>
-);
-
-const bundleTotal = (bundle: Partial<Record<Resource, number>>): number =>
-  resources.reduce((sum, resource) => sum + (bundle[resource] ?? 0), 0);
-
 const bundlesEqual = (left: ResourceBundle, right: ResourceBundle): boolean =>
   resources.every((resource) => left[resource] === right[resource]);
-
-const EventLine = ({ event }: { event: GameEvent }) => {
-  const CostIcons = ({ bundle }: { bundle: Partial<ResourceBundle> }) => (
-    <span className="event-icons">
-      {resources.filter((resource) => (bundle[resource] ?? 0) > 0).map((resource) => (
-        <span key={resource} className="event-resource">
-          <ResourceIcon resource={resource} />
-          <span>{bundle[resource]}</span>
-        </span>
-      ))}
-    </span>
-  );
-
-  if (event.type === "RESOURCES_PRODUCED") {
-    return (
-      <li>
-        <span className="event-seq">{event.seq}</span>
-        <span>Produced{event.multiplier ? ` x${event.multiplier}` : ""}</span>
-        <span className="event-icons">
-          {Object.entries(event.gains).flatMap(([playerId, gains]) =>
-            resources
-              .filter((resource) => (gains[resource] ?? 0) > 0)
-              .map((resource) => (
-                <span key={`${playerId}-${resource}`} className="event-resource">
-                  <ResourceIcon resource={resource} />
-                  <span>{gains[resource]}</span>
-                </span>
-              )),
-          )}
-        </span>
-      </li>
-    );
-  }
-  if (event.type === "SETUP_PLACED" && bundleTotal(event.startingResources) > 0) {
-    return (
-      <li>
-        <span className="event-seq">{event.seq}</span>
-        <span>{event.playerId} setup</span>
-        <span className="event-icons">
-          {resources.filter((resource) => (event.startingResources[resource] ?? 0) > 0).map((resource) => (
-            <span key={resource} className="event-resource">
-              <ResourceIcon resource={resource} />
-              <span>{event.startingResources[resource]}</span>
-            </span>
-          ))}
-        </span>
-      </li>
-    );
-  }
-  if (event.type === "ROAD_BUILT") {
-    return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} built road</span><CostIcons bundle={event.cost} /></li>;
-  }
-  if (event.type === "SETTLEMENT_BUILT") {
-    return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} built settlement (+1 VP)</span><CostIcons bundle={event.cost} /></li>;
-  }
-  if (event.type === "CITY_UPGRADED") {
-    return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} upgraded city (+1 VP)</span><CostIcons bundle={event.cost} /></li>;
-  }
-  if (event.type === "SPECIAL_CARD_BOUGHT") {
-    return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} drew special card #{event.cardIndex}</span><CostIcons bundle={event.cost} /></li>;
-  }
-  if (event.type === "LONGEST_ROAD_UPDATED") {
-    return <li><span className="event-seq">{event.seq}</span><span>{event.playerId ? `${event.playerId} claimed Longest Road (${event.length})` : "Longest Road unclaimed"}</span></li>;
-  }
-  if (event.type === "MARITIME_TRADED") {
-    return (
-      <li>
-        <span className="event-seq">{event.seq}</span>
-        <span>{event.playerId} bank {event.ratio}:1</span>
-        <span className="event-resource">
-          <ResourceIcon resource={event.offered} />
-          <span>{event.ratio}</span>
-        </span>
-        <span className="event-arrow">to</span>
-        <span className="event-resource">
-          <ResourceIcon resource={event.requested} />
-          <span>1</span>
-        </span>
-      </li>
-    );
-  }
-  if (event.type === "DICE_ROLLED") {
-    return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} rolled {event.sum}{event.doublesMultiplier ? ` x${event.doublesMultiplier}` : ""}</span></li>;
-  }
-  if (event.type === "TRADE_OFFERED") {
-    return <li><span className="event-seq">{event.seq}</span><span>{event.trade.fromPlayerId} offered trade</span><CostIcons bundle={event.trade.offered} /><span className="event-arrow">for</span><CostIcons bundle={event.trade.requested} /></li>;
-  }
-  if (event.type === "TRADE_ACCEPTED") {
-    return <li><span className="event-seq">{event.seq}</span><span>{event.toPlayerId} accepted trade</span></li>;
-  }
-  if (event.type === "TRADE_RESPONSE_RECORDED") {
-    return <li><span className="event-seq">{event.seq}</span><span>{event.playerId ?? "A player"} {event.response === "WANTS_ACCEPT" ? "wants to accept" : event.response === "REJECTED" ? "rejected" : "answered"} trade</span></li>;
-  }
-  if (event.type === "TRADE_CLOSED") {
-    return <li><span className="event-seq">{event.seq}</span><span>Trade closed ({event.reason.toLowerCase().replaceAll("_", " ")})</span></li>;
-  }
-  if (event.type === "PLIGHT_STRUCK") {
-    return <li><span className="event-seq">{event.seq}</span><span>Plight destroyed {event.destroyed.length} building{event.destroyed.length === 1 ? "" : "s"}</span></li>;
-  }
-  if (event.type === "GAME_OVER") {
-    return <li><span className="event-seq">{event.seq}</span><span>{event.winnerId} won the game</span></li>;
-  }
-  return <li><span className="event-seq">{event.seq}</span><span>{event.type.replaceAll("_", " ").toLowerCase()}</span></li>;
-};
 
 const issueCommand = (state: GameState, command: GameCommand): { state: GameState; events: GameEvent[]; error?: string } => {
   const result = applyCommand(state, command);
@@ -618,44 +210,6 @@ interface NetworkRoomInfo {
   inviteUrl?: string;
 }
 
-interface ReplayLogState {
-  config: GameConfig;
-  board: BoardGraph;
-  events: GameEvent[];
-}
-
-interface NetworkResumeState {
-  token: string;
-  userId: PlayerId;
-  roomId: string;
-  clientSeq: number;
-  lastSeq: number;
-}
-
-const resumeStorageKey = "colonizt.resume";
-
-const readResumeState = (): NetworkResumeState | null => {
-  try {
-    const raw = localStorage.getItem(resumeStorageKey);
-    return raw ? JSON.parse(raw) as NetworkResumeState : null;
-  } catch {
-    return null;
-  }
-};
-
-const writeResumeState = (state: NetworkResumeState): void => {
-  localStorage.setItem(resumeStorageKey, JSON.stringify(state));
-};
-
-const clearResumeState = (): void => {
-  try {
-    if (typeof localStorage.removeItem === "function") localStorage.removeItem(resumeStorageKey);
-    else localStorage.setItem(resumeStorageKey, "");
-  } catch {
-    // Resume state is opportunistic; match startup should not depend on storage availability.
-  }
-};
-
 export const App = () => {
   const [state, setState] = useState<GameState>(() => createDemoGame("web-local"));
   const [events, setEvents] = useState<GameEvent[]>([]);
@@ -688,11 +242,8 @@ export const App = () => {
   const shouldReconnectRef = useRef(true);
   const clientSeqRef = useRef(1);
   const lastServerSeqRef = useRef(0);
-  const stateRef = useRef(state);
-  const eventsRef = useRef(events);
-  const botTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const tradeResponseTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
-  const lastBotRollSeqRef = useRef<number | null>(null);
+  const stateRef = useSyncedRef(state);
+  const eventsRef = useSyncedRef(events);
   const soundCursorRef = useRef<{ matchId: string; seq: number; initialized: boolean }>({ matchId: state.config.matchId, seq: 0, initialized: false });
 
   const humanPlayerId = networkSession?.userId ?? "p1";
@@ -819,13 +370,6 @@ export const App = () => {
     }));
   };
 
-  const clearAutomationTimers = () => {
-    if (botTimerRef.current) clearTimeout(botTimerRef.current);
-    botTimerRef.current = null;
-    for (const timer of tradeResponseTimersRef.current.values()) clearTimeout(timer);
-    tradeResponseTimersRef.current.clear();
-  };
-
   const applyLocalCommand = (command: GameCommand): { state: GameState; events: GameEvent[]; error?: string } => {
     const result = issueCommand(stateRef.current, command);
     if (result.error) {
@@ -849,6 +393,21 @@ export const App = () => {
     }
     return result;
   };
+
+  const applyLocalCommandRef = useSyncedRef(applyLocalCommand);
+  const { clearAutomationTimers } = useLocalAutomation({
+    enabled: !networkRoomId && replayIndex === null && !matchMenuOpen,
+    state,
+    events,
+    activePlayer,
+    humanPlayerId,
+    localTradeDeadlines,
+    setLocalTradeDeadlines,
+    stateRef,
+    eventsRef,
+    applyLocalCommandRef,
+    postRollAnimationMs: diceAnimationMs,
+  });
 
   const commit = (command: GameCommand) => {
     const started = performance.now();
@@ -1302,14 +861,6 @@ export const App = () => {
   }, []);
 
   useEffect(() => {
-    stateRef.current = state;
-  }, [state]);
-
-  useEffect(() => {
-    eventsRef.current = events;
-  }, [events]);
-
-  useEffect(() => {
     const matchId = state.config.matchId;
     const maxSeq = events.reduce((current, event) => Math.max(current, event.seq), 0);
     const cursor = soundCursorRef.current;
@@ -1395,115 +946,6 @@ export const App = () => {
     };
   }, [activePlayer, humanPlayerId, matchMenuOpen, networkRoomId, replayIndex, state.config.matchId, state.phase.type, state.turn]);
 
-  const botAutomationKey = !networkRoomId && replayIndex === null && !matchMenuOpen && state.phase.type !== "GAME_OVER" && activePlayer && botIds.has(activePlayer)
-    ? `${state.config.matchId}:${state.eventSeq}:${state.phase.type}:${activePlayer}`
-    : null;
-
-  useEffect(() => {
-    if (!botAutomationKey || !activePlayer || !botIds.has(activePlayer)) return undefined;
-    const latestBotRoll = [...eventsRef.current].reverse().find((event) => event.type === "DICE_ROLLED" && event.playerId === activePlayer);
-    const isPostRollAction = state.phase.type === "ACTION_PHASE" && latestBotRoll?.type === "DICE_ROLLED" && lastBotRollSeqRef.current !== latestBotRoll.seq;
-    const activeCollectingTrade = Object.values(state.trades).find((trade) =>
-      trade.status === "COLLECTING_RESPONSES"
-      && trade.fromPlayerId === activePlayer,
-    );
-    const activeTradeIncludesHuman = activeCollectingTrade
-      ? activeCollectingTrade.recipients === "ANY" || activeCollectingTrade.recipients.includes(humanPlayerId)
-      : false;
-    const baseDelay = state.phase.type === "WAITING_FOR_ROLL"
-      ? botActionDelays.ROLL_DICE
-      : state.phase.type === "SETUP_PLACEMENT"
-        ? botActionDelays.PLACE_SETUP
-        : botActionDelays.DEFAULT;
-    const tradePauseDelay = activeCollectingTrade ? (activeTradeIncludesHuman ? 3200 : 1450) : undefined;
-    const delay = tradePauseDelay ?? (isPostRollAction ? Math.max(botActionDelays.BUILD_ROAD, diceAnimationMs + 120) : baseDelay);
-    if (isPostRollAction && latestBotRoll?.type === "DICE_ROLLED") lastBotRollSeqRef.current = latestBotRoll.seq;
-    botTimerRef.current = setTimeout(() => {
-      const current = stateRef.current;
-      const currentActive = "activePlayerId" in current.phase ? current.phase.activePlayerId : undefined;
-      const currentKey = current.phase.type !== "GAME_OVER" && currentActive && botIds.has(currentActive)
-        ? `${current.config.matchId}:${current.eventSeq}:${current.phase.type}:${currentActive}`
-        : null;
-      if (currentKey !== botAutomationKey || !currentActive) return;
-      if (Object.values(current.trades).some((trade) => trade.status === "COLLECTING_RESPONSES" && trade.fromPlayerId === currentActive)) return;
-      const controller = botById[currentActive as keyof typeof botById] ?? randomLegalBot;
-      const view = createBotView(current, currentActive, controller.profile);
-      const command = controller.chooseCommand(view, (prefix: string) => createBotTradeId(current, currentActive, controller.profile) || prefix);
-      if (!command) return;
-      const result = applyLocalCommand(command);
-      if (result.error && current.phase.type === "ACTION_PHASE") {
-        applyLocalCommand({ type: "END_TURN", playerId: currentActive });
-      }
-    }, delay);
-    return () => {
-      if (botTimerRef.current) clearTimeout(botTimerRef.current);
-      botTimerRef.current = null;
-    };
-  }, [botAutomationKey, activePlayer, state.phase.type]);
-
-  useEffect(() => {
-    if (networkRoomId || replayIndex !== null || matchMenuOpen) return;
-    const collecting = Object.values(state.trades).filter((trade) => trade.status === "COLLECTING_RESPONSES");
-    setLocalTradeDeadlines((current) => {
-      const next: Record<string, number> = {};
-      for (const trade of collecting) next[trade.id] = current[trade.id] ?? Date.now() + 15_000;
-      return next;
-    });
-    collecting.forEach((trade) => {
-      const recipients = trade.recipients === "ANY" ? [...botIds].filter((botId) => botId !== trade.fromPlayerId) : trade.recipients.filter((botId) => botIds.has(botId));
-      recipients.forEach((botId, index) => {
-        if (trade.responses?.[botId]?.status !== "PENDING") return;
-        const key = `response:${trade.id}:${botId}:${trade.createdAtSeq}`;
-        if (tradeResponseTimersRef.current.has(key)) return;
-        const timer = setTimeout(() => {
-          tradeResponseTimersRef.current.delete(key);
-          const current = stateRef.current;
-          const currentTrade = current.trades[trade.id];
-          if (!currentTrade || currentTrade.status !== "COLLECTING_RESPONSES") return;
-          if (currentTrade.recipients !== "ANY" && !currentTrade.recipients.includes(botId)) return;
-          const controller = botById[botId as keyof typeof botById] ?? greedyBot;
-          const view = createBotView(current, botId, controller.profile);
-          const response = evaluateTrade(view, currentTrade, controller.profile) === "ACCEPT" ? "WANTS_ACCEPT" : "REJECTED";
-          applyLocalCommand({ type: "RESPOND_TRADE", playerId: botId, tradeId: currentTrade.id, response });
-        }, 650 + index * 450);
-        tradeResponseTimersRef.current.set(key, timer);
-      });
-
-      const deadlineKey = `deadline:${trade.id}:${trade.createdAtSeq}`;
-      if (tradeResponseTimersRef.current.has(deadlineKey)) return;
-      const timer = setTimeout(() => {
-        tradeResponseTimersRef.current.delete(deadlineKey);
-        const current = stateRef.current;
-        const currentTrade = current.trades[trade.id];
-        if (!currentTrade || currentTrade.status !== "COLLECTING_RESPONSES") return;
-        if (!botIds.has(currentTrade.fromPlayerId)) {
-          applyLocalCommand({ type: "EXPIRE_TRADE", playerId: currentTrade.fromPlayerId, tradeId: currentTrade.id, reason: "RESPONSE_TIMEOUT" });
-          return;
-        }
-        const controller = botById[currentTrade.fromPlayerId as keyof typeof botById] ?? greedyBot;
-        const view = createBotView(current, currentTrade.fromPlayerId, controller.profile);
-        const candidates = current.playerOrder
-          .filter((playerId) => playerId !== currentTrade.fromPlayerId)
-          .filter((playerId) => currentTrade.recipients === "ANY" || currentTrade.recipients.includes(playerId))
-          .filter((playerId) => currentTrade.responses?.[playerId]?.status === "WANTS_ACCEPT")
-          .filter((playerId) =>
-            hasResources(current.players[currentTrade.fromPlayerId]?.resources ?? emptyResources(), currentTrade.offered)
-            && hasResources(current.players[playerId]?.resources ?? emptyResources(), currentTrade.requested),
-          )
-          .map((playerId) => ({
-            playerId,
-            score: evaluateState(view, addResources(subtractResources(view.ownResources, currentTrade.offered), currentTrade.requested)) - (current.players[playerId]?.score ?? 0) * 0.03,
-          }))
-          .sort((left, right) => right.score - left.score || current.playerOrder.indexOf(left.playerId) - current.playerOrder.indexOf(right.playerId));
-        const selected = candidates[0]?.playerId;
-        applyLocalCommand(selected
-          ? { type: "FINALIZE_TRADE", playerId: currentTrade.fromPlayerId, tradeId: currentTrade.id, toPlayerId: selected }
-          : { type: "CANCEL_TRADE", playerId: currentTrade.fromPlayerId, tradeId: currentTrade.id });
-      }, Math.max(0, (localTradeDeadlines[trade.id] ?? Date.now() + 15_000) - Date.now()));
-      tradeResponseTimersRef.current.set(deadlineKey, timer);
-    });
-  }, [events, humanPlayerId, matchMenuOpen, networkRoomId, replayIndex, state.trades]);
-
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (!keyboardShortcutsEnabled) return;
@@ -1537,20 +979,19 @@ export const App = () => {
 
   const loadReplay = () => {
     clearAutomationTimers();
-    const played = playBotGame("web-replay", 220);
-    const log = { config: createDemoConfig("web-replay"), board: createFixedBoard(), events: played.events };
-    const replayed = replay(log);
+    const log = createDemoReplayLog();
+    const replayed = replayAtIndex(log, log.events.length);
     setState(replayed);
     setServerViewer(null);
-    setEvents(played.events);
+    setEvents(log.events);
     setReplayLog(log);
-    setReplayIndex(played.events.length);
+    setReplayIndex(log.events.length);
   };
 
   const stepReplay = (direction: -1 | 1) => {
     if (!replayLog) return;
     const nextIndex = Math.max(0, Math.min(events.length, (replayIndex ?? events.length) + direction));
-    const replayed = replay({ ...replayLog, events: replayLog.events.slice(0, nextIndex) });
+    const replayed = replayAtIndex(replayLog, nextIndex);
     setState(replayed);
     setServerViewer(null);
     setReplayIndex(nextIndex);
@@ -1574,7 +1015,7 @@ export const App = () => {
     try {
       setHistoryStatus(`Loading ${matchId}...`);
       const log = await createNetworkClient().loadReplay(matchId, networkSession?.token);
-      const replayed = replay(log);
+      const replayed = replayAtIndex(log, log.events.length);
       setState(replayed);
       setServerViewer(null);
       setEvents(log.events);

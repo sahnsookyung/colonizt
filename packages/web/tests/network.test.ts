@@ -6,7 +6,28 @@ afterEach(() => {
 });
 
 describe("network client", () => {
-  it("uses advertised runtime API config for REST requests", async () => {
+  it("prefers same-origin runtime API config over build-time fallback", async () => {
+    const requests: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requests.push(url);
+      if (url === "/config") {
+        return new Response(JSON.stringify({
+          apiBaseUrl: "https://same-origin-api.example",
+          wsBaseUrl: "wss://same-origin-socket.example",
+        }), { status: 200 });
+      }
+      if (url === "https://same-origin-api.example/matches?limit=7") {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    }));
+
+    await expect(createNetworkClient("https://bootstrap-primary.example").listMatches(7)).resolves.toEqual([]);
+    expect(requests).toEqual(["/config", "https://same-origin-api.example/matches?limit=7"]);
+  });
+
+  it("falls back to build-time runtime API config when same-origin config is unavailable", async () => {
     const requests: string[] = [];
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
@@ -24,7 +45,7 @@ describe("network client", () => {
     }));
 
     await expect(createNetworkClient("https://bootstrap.example").listMatches(7)).resolves.toEqual([]);
-    expect(requests).toEqual(["https://bootstrap.example/config", "https://api.example/matches?limit=7"]);
+    expect(requests).toEqual(["/config", "https://bootstrap.example/config", "https://api.example/matches?limit=7"]);
   });
 
   it("uses advertised runtime WSS config for websocket connections", async () => {

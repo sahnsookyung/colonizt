@@ -1,29 +1,14 @@
-import type { BoardGraph, BotDifficulty, GameCommand, GameConfig, GameEvent, ViewerState } from "@colonizt/game-core";
+import type { BotDifficulty, GameCommand, GameConfig, GameEvent, ViewerState } from "@colonizt/game-core";
+import type { CreateRoomResponse, CreateSessionResponse, MatchSummaryPayload, ReplayLogPayload, RuntimeNetworkConfig, WsTicketResponse } from "@colonizt/protocol";
 
-export interface MatchSummary {
-  id: string;
-  roomId: string;
-  mode: string;
-  ranked: boolean;
-  startedAt: string;
-  endedAt?: string;
-  winnerUserId?: string;
-  eventCount: number;
-  playerIds: string[];
-}
-
-export interface ReplayLogPayload {
-  config: GameConfig;
-  board: BoardGraph;
-  events: GameEvent[];
-}
+export type MatchSummary = MatchSummaryPayload;
 
 export interface NetworkClient {
-  createSession(displayName: string): Promise<{ token: string; userId: string; displayName: string }>;
-  createRoom(token: string, options?: { mode?: "CLASSIC" | "DUEL" | "RUSH"; botFill?: boolean; ranked?: boolean; minPlayers?: number; botDifficulty?: BotDifficulty; rules?: GameConfig["rules"] }): Promise<{ id: string; code?: string; inviteUrl?: string }>;
+  createSession(displayName: string): Promise<CreateSessionResponse>;
+  createRoom(token: string, options?: { mode?: "CLASSIC" | "DUEL" | "RUSH"; botFill?: boolean; ranked?: boolean; minPlayers?: number; botDifficulty?: BotDifficulty; rules?: GameConfig["rules"] }): Promise<CreateRoomResponse>;
   listMatches(limit?: number): Promise<MatchSummary[]>;
   loadReplay(replayId: string, token?: string): Promise<ReplayLogPayload>;
-  createWebSocketTicket(token: string): Promise<{ ticket: string; expiresAt: string; ttlMs: number }>;
+  createWebSocketTicket(token: string): Promise<WsTicketResponse>;
   connect(token: string, handlers: {
     onEvents: (events: GameEvent[], snapshot?: ViewerState) => void;
     onRoom: (room: unknown) => void;
@@ -34,10 +19,7 @@ export interface NetworkClient {
   sendCommand(socket: WebSocket, roomId: string, clientSeq: number, command: GameCommand): void;
 }
 
-interface RuntimeNetworkConfig {
-  apiBaseUrl: string;
-  wsBaseUrl: string;
-}
+type ResolvedRuntimeNetworkConfig = Pick<RuntimeNetworkConfig, "apiBaseUrl" | "wsBaseUrl">;
 
 type ClientEnv = {
   VITE_API_BASE_URL?: string;
@@ -48,7 +30,7 @@ type ClientEnv = {
 const importEnv = (import.meta as ImportMeta & { env?: ClientEnv }).env;
 const configuredBaseUrl = importEnv?.VITE_API_BASE_URL?.replace(/\/$/, "");
 const localBaseUrl = "http://127.0.0.1:8787";
-const configCache = new Map<string, Promise<RuntimeNetworkConfig>>();
+const configCache = new Map<string, Promise<ResolvedRuntimeNetworkConfig>>();
 
 const trimTrailingSlash = (value: string): string => value.replace(/\/$/, "");
 const wsFromHttp = (apiBaseUrl: string): string => trimTrailingSlash(apiBaseUrl).replace(/^http/i, "ws");
@@ -60,7 +42,7 @@ const localFallbackAllowed = (): boolean =>
   || importEnv?.MODE === "test"
   || (typeof window !== "undefined" && isLocalHostname(window.location.hostname));
 
-const runtimeConfigFromPayload = (payload: Partial<RuntimeNetworkConfig>, fallbackApiBaseUrl: string): RuntimeNetworkConfig => {
+const runtimeConfigFromPayload = (payload: Partial<RuntimeNetworkConfig>, fallbackApiBaseUrl: string): ResolvedRuntimeNetworkConfig => {
   const apiBaseUrl = trimTrailingSlash(payload.apiBaseUrl ?? fallbackApiBaseUrl);
   return {
     apiBaseUrl,
@@ -68,7 +50,7 @@ const runtimeConfigFromPayload = (payload: Partial<RuntimeNetworkConfig>, fallba
   };
 };
 
-const fetchRuntimeConfig = async (url: string, fallbackApiBaseUrl: string): Promise<RuntimeNetworkConfig | undefined> => {
+const fetchRuntimeConfig = async (url: string, fallbackApiBaseUrl: string): Promise<ResolvedRuntimeNetworkConfig | undefined> => {
   try {
     const response = await fetch(url);
     if (!response.ok) return undefined;
@@ -78,7 +60,7 @@ const fetchRuntimeConfig = async (url: string, fallbackApiBaseUrl: string): Prom
   }
 };
 
-const resolveRuntimeConfig = async (seedBaseUrl = configuredBaseUrl): Promise<RuntimeNetworkConfig> => {
+export const resolveRuntimeConfig = async (seedBaseUrl = configuredBaseUrl): Promise<ResolvedRuntimeNetworkConfig> => {
   const normalizedSeed = seedBaseUrl ? trimTrailingSlash(seedBaseUrl) : undefined;
   const cacheKey = normalizedSeed ?? "__default__";
   const cached = configCache.get(cacheKey);
@@ -91,11 +73,11 @@ const resolveRuntimeConfig = async (seedBaseUrl = configuredBaseUrl): Promise<Ru
 
     const pageOrigin = typeof window !== "undefined" ? window.location.origin : localBaseUrl;
     const fallbackBaseUrl = normalizedSeed ?? (localFallbackAllowed() ? localBaseUrl : pageOrigin);
-    const candidates = normalizedSeed
-      ? [`${normalizedSeed}/config`]
-      : localFallbackAllowed()
-        ? ["/config", `${localBaseUrl}/config`]
-        : ["/config"];
+    const candidates = [
+      "/config",
+      ...(normalizedSeed ? [`${normalizedSeed}/config`] : []),
+      ...(localFallbackAllowed() && normalizedSeed !== localBaseUrl ? [`${localBaseUrl}/config`] : []),
+    ];
 
     for (const url of candidates) {
       const resolved = await fetchRuntimeConfig(url, fallbackBaseUrl);
@@ -122,7 +104,7 @@ export const createNetworkClient = (baseUrl = configuredBaseUrl): NetworkClient 
       body: JSON.stringify({ displayName }),
     });
     if (!response.ok) throw new Error("Session creation failed");
-    return response.json() as Promise<{ token: string; userId: string; displayName: string }>;
+    return response.json() as Promise<CreateSessionResponse>;
   },
   async createRoom(token, options = {}) {
     const config = await resolveRuntimeConfig(baseUrl);
@@ -132,7 +114,7 @@ export const createNetworkClient = (baseUrl = configuredBaseUrl): NetworkClient 
       body: JSON.stringify({ mode: "CLASSIC", botFill: true, ranked: false, ...options }),
     });
     if (!response.ok) throw new Error("Room creation failed");
-    return response.json() as Promise<{ id: string; code?: string; inviteUrl?: string }>;
+    return response.json() as Promise<CreateRoomResponse>;
   },
   async listMatches(limit = 12) {
     const config = await resolveRuntimeConfig(baseUrl);
@@ -153,7 +135,7 @@ export const createNetworkClient = (baseUrl = configuredBaseUrl): NetworkClient 
       headers: { "x-session-token": token },
     });
     if (!response.ok) throw new Error("WebSocket ticket creation failed");
-    return response.json() as Promise<{ ticket: string; expiresAt: string; ttlMs: number }>;
+    return response.json() as Promise<WsTicketResponse>;
   },
   async connect(token, handlers) {
     const config = await resolveRuntimeConfig(baseUrl);

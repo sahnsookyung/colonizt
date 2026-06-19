@@ -7,10 +7,7 @@
     "declaration": true
   },
   "references": [
-    { "path": "../game-core" },
-    { "path": "../protocol" },
-    { "path": "../bots" },
-    { "path": "../db" }
+    { "path": "../game-core" }
   ],
   "include": ["src/**/*.ts"]
 }

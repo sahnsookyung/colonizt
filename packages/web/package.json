@@ -14,6 +14,7 @@
     "@colonizt/bots": "0.1.0",
     "@colonizt/demo-state": "0.1.0",
     "@colonizt/game-core": "0.1.0",
+    "@colonizt/protocol": "0.1.0",
     "react": "^19.2.1",
     "react-dom": "^19.2.1",
     "zod": "^4.2.0"

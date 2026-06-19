@@ -2,6 +2,7 @@
 set -euo pipefail
 
 npm run scan:branding
+npm run docs:diagrams
 npm run lint
 npm run typecheck
 npm run test:unit

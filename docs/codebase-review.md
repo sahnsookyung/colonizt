@@ -35,17 +35,14 @@ The biggest tightening opportunities are:
 
 ### P0: Public Multiplayer Connectivity
 
-Current local defaults make multiplayer brittle outside one machine:
+The original review called out localhost defaults that made multiplayer brittle outside one machine. The current implementation addresses the deployment-facing pieces:
 
-- Server CLI defaults to `127.0.0.1` in `packages/server/src/index.ts`.
-- Web and analytics default to `http://127.0.0.1:8787`.
-- `docker-compose.prod.yml` still builds the web image with `VITE_API_BASE_URL: http://127.0.0.1:8787`.
-- There is no obvious player-facing "join room by code/link" flow.
+- Container/server deploys bind through `SERVER_HOST=0.0.0.0`.
+- Web, WebSocket, and analytics calls discover the public API through `GET /config`, with `VITE_API_BASE_URL` kept only as an optional fallback.
+- `docker-compose.prod.yml` no longer bakes a localhost API URL into the web image.
 
-Recommended immediate changes:
+Remaining recommended work:
 
-- Default container/server deploys to `SERVER_HOST=0.0.0.0`.
-- Add a runtime web config endpoint or static `/config.json` so deployed web clients can discover the public API URL without rebuilding.
 - Add invite links and a join-room form.
 - Add a deployed smoke command, for example `npm run smoke:network -- --base-url https://api.example.com --origin https://play.example.com`.
 - Require HTTPS/WSS for non-local production.

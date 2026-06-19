@@ -3,6 +3,8 @@
 ## REST
 
 - `GET /health` returns service health and active presence adapter (`memory` or `redis`).
+- `GET /metrics` returns Prometheus-style operational metrics for the active single-node server.
+- `GET /config` returns browser runtime configuration, protocol version, WebSocket auth mode, node ID, and instance mode.
 - `GET /rooms` lists lobby rooms.
 - `POST /rooms` creates a private room.
 - `GET /matches?limit=20` lists persisted match summaries.
@@ -11,6 +13,8 @@
 - `GET /leaderboard` returns simulated/admin-only ranking data.
 - `POST /sessions` creates a guest session token.
 - `POST /rooms/:roomId/reports` creates a moderation report for a seated user.
+
+Protocol schemas live in `@colonizt/protocol` and are shared by the server and web client. Existing REST and WebSocket JSON shapes remain backward compatible.
 
 ## WebSocket
 
@@ -35,3 +39,7 @@ Server messages:
 - `RESYNC` with either viewer-safe contiguous events or a viewer-safe snapshot fallback
 - `CHAT`
 - `PONG`
+
+## Operations Metrics
+
+`GET /metrics` is intended for operators and reverse-proxy-controlled access. It includes active rooms, connected sockets, command outcomes and latency, replay load outcomes, room cleanup counts, scheduler actions, WebSocket lifecycle events, and DB failure counters. Deployment config should expose it only to trusted monitoring paths.

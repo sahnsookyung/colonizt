@@ -3,15 +3,19 @@ import websocket from "@fastify/websocket";
 import Fastify, { type FastifyInstance } from "fastify";
 import { nanoid } from "nanoid";
 import { schemaVersion, serializeEventsForViewer, serializeForViewer, type GameCommand } from "@colonizt/game-core";
+import { analyticsEventSchema, createRoomSchema, defaultWebSocketTicketTtlMs, protocolVersion, websocketAuthMode, wsClientMessageSchema } from "@colonizt/protocol";
 import { createPool, runMigrations } from "@colonizt/db";
 import { PostgresEventStore } from "./event-store.js";
+import { createStructuredLogger, MetricsRegistry, resolveInstanceMode, type StructuredLogger } from "./observability.js";
 import { createPresenceStore, type PresenceStore } from "./presence.js";
-import { analyticsEventSchema, createRoomSchema, wsClientMessageSchema } from "./schemas.js";
 import { defaultRoomCleanupPolicy, RoomCapacityError, RoomManager, type Room, type RoomCleanupPolicy, type Session } from "./room-manager.js";
+import { RoomAutomationScheduler } from "./scheduler.js";
 
 export { RoomManager } from "./room-manager.js";
 export { MemoryEventStore, PostgresEventStore } from "./event-store.js";
 export { MemoryPresenceStore, RedisPresenceStore } from "./presence.js";
+export { MetricsRegistry, createStructuredLogger, resolveInstanceMode } from "./observability.js";
+export { RoomAutomationScheduler } from "./scheduler.js";
 
 export interface BuildServerOptions {
   manager?: RoomManager;
@@ -23,6 +27,10 @@ export interface BuildServerOptions {
   wsTicketTtlMs?: number;
   roomCleanupPolicy?: Partial<RoomCleanupPolicy>;
   roomCleanupIntervalMs?: number;
+  logger?: StructuredLogger;
+  metrics?: MetricsRegistry;
+  nodeId?: string;
+  instanceMode?: "single";
 }
 
 type SocketClient = { socket: WebSocketLike; session: Session; roomId?: string; asSpectator?: boolean };
@@ -54,7 +62,21 @@ const positiveInt = (value: string | undefined, fallback: number): number => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 };
 
+const sqlStatePattern = /^[0-9A-Z]{5}$/u;
+
+const isDatabaseError = (error: unknown): boolean => {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { code?: unknown; routine?: unknown; severity?: unknown };
+  return typeof candidate.code === "string"
+    && sqlStatePattern.test(candidate.code)
+    && (typeof candidate.routine === "string" || typeof candidate.severity === "string");
+};
+
 export const buildServer = async (options: BuildServerOptions = {}): Promise<FastifyInstance> => {
+  const instanceMode = options.instanceMode ?? resolveInstanceMode();
+  const nodeId = options.nodeId ?? process.env.NODE_ID ?? "local";
+  const logger = options.logger ?? createStructuredLogger(nodeId, instanceMode);
+  const metrics = options.metrics ?? new MetricsRegistry(nodeId, instanceMode);
   const cleanupPolicy: RoomCleanupPolicy = {
     ...defaultRoomCleanupPolicy,
     maxActiveRooms: positiveInt(process.env.MAX_ACTIVE_ROOMS, defaultRoomCleanupPolicy.maxActiveRooms),
@@ -67,7 +89,13 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
   let pool: ReturnType<typeof createPool> | undefined;
   if (!manager && process.env.DATABASE_URL) {
     pool = createPool({ connectionString: process.env.DATABASE_URL });
-    await runMigrations(pool);
+    try {
+      await runMigrations(pool);
+    } catch (error) {
+      metrics.recordDbFailure("migrations");
+      logger.error("db.migrations_failed", { message: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
     manager = new RoomManager(new PostgresEventStore(pool), cleanupPolicy);
     await manager.hydrateFromStore();
   }
@@ -75,10 +103,11 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
   const presence: PresenceStore = await createPresenceStore(process.env.REDIS_URL);
   const allowedOrigins = options.allowedOrigins ?? [process.env.WEB_ORIGIN ?? "http://127.0.0.1:5173"];
   const allowLegacySessionToken = options.allowLegacySessionToken ?? false;
-  const wsTicketTtlMs = options.wsTicketTtlMs ?? 30_000;
+  const wsTicketTtlMs = options.wsTicketTtlMs ?? defaultWebSocketTicketTtlMs;
   const app = Fastify({ logger: false, bodyLimit: 32_000 });
   const clients = new Set<SocketClient>();
   const wsTickets = new Map<string, WsTicket>();
+  const requestStartedAt = new WeakMap<object, number>();
 
   const externalBaseUrl = (request: { headers: Record<string, unknown>; protocol?: string; hostname?: string }, configured?: string): string => {
     if (configured) return configured.replace(/\/$/, "");
@@ -164,44 +193,49 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     }
   };
 
-  const timeoutInterval = setInterval(() => {
-    for (const room of manager.rooms.values()) {
-      void manager.expireTurn(room.id).then((result) => {
-        if (!result?.ok || result.events.length === 0) return;
-        broadcastRoom(room.id, (target) => ({
-          type: "EVENTS",
-          roomId: room.id,
-          events: serializeEventsForViewer(result.events, viewerIdFor(target), result.state.playerOrder),
-          snapshot: snapshotFor(room.id, result.state, target),
-        }));
-      }).catch(() => undefined);
-      void manager.runDueBotAutomation(room.id).then((result) => {
-        if (!result?.ok || result.events.length === 0) return;
-        broadcastRoom(room.id, (target) => ({
-          type: "EVENTS",
-          roomId: room.id,
-          events: serializeEventsForViewer(result.events, viewerIdFor(target), result.state.playerOrder),
-          snapshot: snapshotFor(room.id, result.state, target),
-        }));
-      }).catch(() => undefined);
-    }
-  }, 1000);
-  timeoutInterval.unref?.();
-
   const cleanupIntervalMs = options.roomCleanupIntervalMs ?? positiveInt(process.env.ROOM_CLEANUP_INTERVAL_MS, 30_000);
-  const cleanupInterval = setInterval(() => {
-    void manager.cleanupRooms().then((closedRooms) => {
-      for (const closed of closedRooms) {
-        const code = closed.status === "EXPIRED" ? "ROOM_EXPIRED" : closed.status === "ABANDONED" ? "ROOM_ABANDONED" : "ROOM_CLOSED";
-        closeRoomClients(closed.roomId, code, closed.cleanupReason ?? "Room closed");
-      }
-    }).catch(() => undefined);
-  }, cleanupIntervalMs);
-  cleanupInterval.unref?.();
+  const scheduler = new RoomAutomationScheduler({
+    manager,
+    cleanupPolicy,
+    cleanupIntervalMs,
+    logger,
+    metrics,
+    onEvents: (roomId, result) => {
+      broadcastRoom(roomId, (target) => ({
+        type: "EVENTS",
+        roomId,
+        events: serializeEventsForViewer(result.events, viewerIdFor(target), result.state.playerOrder),
+        snapshot: snapshotFor(roomId, result.state, target),
+      }));
+    },
+    onRoomClosed: (closed) => {
+      const code = closed.status === "EXPIRED" ? "ROOM_EXPIRED" : closed.status === "ABANDONED" ? "ROOM_ABANDONED" : "ROOM_CLOSED";
+      closeRoomClients(closed.roomId, code, closed.cleanupReason ?? "Room closed");
+    },
+  });
+  scheduler.start();
+
+  app.addHook("onRequest", (request, _reply, done) => {
+    requestStartedAt.set(request, Date.now());
+    done();
+  });
+
+  app.addHook("onResponse", (request, reply, done) => {
+    const started = requestStartedAt.get(request) ?? Date.now();
+    const route = request.routeOptions.url ?? request.url;
+    metrics.recordHttpRequest(request.method, route, reply.statusCode, Date.now() - started);
+    logger.info("http.request", { method: request.method, route, statusCode: reply.statusCode, durationMs: Date.now() - started });
+    done();
+  });
+
+  app.addHook("onError", (request, _reply, error, done) => {
+    if (isDatabaseError(error)) metrics.recordDbFailure("request");
+    logger.error("http.error", { method: request.method, url: request.url, message: error.message });
+    done();
+  });
 
   app.addHook("onClose", async () => {
-    clearInterval(timeoutInterval);
-    clearInterval(cleanupInterval);
+    scheduler.stop();
     await presence.close();
     await pool?.end();
   });
@@ -215,18 +249,24 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
   });
   await app.register(websocket, { options: { maxPayload: 32_000 } });
 
-  app.get("/health", async () => ({ ok: true, service: "colonizt-server", presence: presence.kind }));
+  app.get("/health", async () => ({ ok: true, service: "colonizt-server", presence: presence.kind, nodeId, instanceMode }));
+
+  app.get("/metrics", async (_request, reply) =>
+    reply.header("content-type", "text/plain; version=0.0.4; charset=utf-8").send(metrics.render(manager, clients.size, presence.kind)),
+  );
 
   app.get("/config", async (request) => {
     const apiBaseUrl = externalBaseUrl(request, options.publicApiBaseUrl ?? process.env.PUBLIC_API_URL);
     const wsBaseUrl = (options.publicWsBaseUrl ?? process.env.PUBLIC_WS_URL ?? apiBaseUrl.replace(/^http/i, "ws")).replace(/\/$/, "");
     return {
       schemaVersion,
-      protocolVersion: 2,
+      protocolVersion,
       apiBaseUrl,
       wsBaseUrl,
       webOrigin: options.publicWebUrl ?? process.env.PUBLIC_WEB_URL ?? process.env.WEB_ORIGIN ?? allowedOrigins[0],
-      auth: { webSocket: "ticket", ticketTtlMs: wsTicketTtlMs },
+      auth: { webSocket: websocketAuthMode, ticketTtlMs: wsTicketTtlMs },
+      nodeId,
+      instanceMode,
     };
   });
 
@@ -295,8 +335,16 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
   app.get<{ Params: { replayId: string } }>("/matches/:replayId/replay", async (request, reply) => {
     const session = await requireSession(manager, request);
     const storedReplay = await manager.getReplayById(request.params.replayId);
-    if (!storedReplay) return reply.status(404).send({ code: "REPLAY_NOT_FOUND" });
-    if (!storedReplay.config.playerOrder.includes(session.userId)) return reply.status(403).send({ code: "REPLAY_FORBIDDEN" });
+    if (!storedReplay) {
+      metrics.recordReplay("not_found");
+      return reply.status(404).send({ code: "REPLAY_NOT_FOUND" });
+    }
+    if (!storedReplay.config.playerOrder.includes(session.userId)) {
+      metrics.recordReplay("forbidden");
+      return reply.status(403).send({ code: "REPLAY_FORBIDDEN" });
+    }
+    metrics.recordReplay("loaded");
+    logger.info("replay.loaded", { replayId: request.params.replayId, userId: session.userId, eventCount: storedReplay.events.length });
     return storedReplay;
   });
 
@@ -321,12 +369,16 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     const url = new URL(request.url, "http://localhost");
     const origin = request.headers.origin;
     if (typeof origin === "string" && !allowedOrigins.includes(origin)) {
+      metrics.recordWebSocket("rejected", "origin");
+      logger.warn("websocket.rejected", { reason: "origin", origin });
       socket.close(1008, "Origin not allowed");
       return;
     }
     const session = await consumeWsTicket(url.searchParams.get("ticket"))
       ?? (allowLegacySessionToken ? await manager.resolveSession(url.searchParams.get("sessionToken") ?? undefined) : undefined);
     if (!session) {
+      metrics.recordWebSocket("rejected", "unauthorized");
+      logger.warn("websocket.rejected", { reason: "unauthorized" });
       socket.close(1008, "Unauthorized");
       return;
     }
@@ -335,10 +387,14 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     const commandTimes: number[] = [];
     const chatTimes: number[] = [];
     clients.add(client);
+    metrics.recordWebSocket("connected");
+    logger.info("websocket.connected", { socketId, userId: session.userId });
     void presence.connect(session, socketId).catch(() => undefined);
     socket.on("close", () => {
       clients.delete(client);
       const roomId = client.roomId;
+      metrics.recordWebSocket("closed");
+      logger.info("websocket.closed", { socketId, userId: session.userId, roomId });
       void (async () => {
         await presence.disconnect(session, socketId, roomId);
         if (!roomId) return;
@@ -398,17 +454,24 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
         return;
       }
       if (message.type === "COMMAND") {
+        const commandStartedAt = Date.now();
         if (!withinLimit(commandTimes, 30, 10_000)) {
+          metrics.recordCommand("rejected", message.command.type, Date.now() - commandStartedAt);
+          logger.warn("command.rejected", { code: "RATE_LIMITED", userId: session.userId, command: message.command.type });
           send(client, { type: "COMMAND_REJECTED", code: "RATE_LIMITED", message: "Too many commands", clientSeq: message.clientSeq });
           return;
         }
         const canonicalRoomId = manager.roomForRef(message.roomId)?.id ?? message.roomId;
         void manager.submitCommand(message.roomId, session, message.clientSeq, message.command as GameCommand).then((result) => {
           if (!result.ok) {
+            metrics.recordCommand("rejected", message.command.type, Date.now() - commandStartedAt);
+            logger.warn("command.rejected", { code: result.code, userId: session.userId, roomId: canonicalRoomId, command: message.command.type });
             send(client, { type: "COMMAND_REJECTED", code: result.code, message: result.message, clientSeq: message.clientSeq });
             return;
           }
           if (result.replayed) {
+            metrics.recordCommand("replayed", message.command.type, Date.now() - commandStartedAt);
+            logger.info("command.replayed", { userId: session.userId, roomId: canonicalRoomId, command: message.command.type, clientSeq: message.clientSeq });
             send(client, {
               type: "COMMAND_ACK",
               roomId: canonicalRoomId,
@@ -418,13 +481,20 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
             });
             return;
           }
+          metrics.recordCommand("accepted", message.command.type, Date.now() - commandStartedAt);
+          logger.info("command.accepted", { userId: session.userId, roomId: canonicalRoomId, command: message.command.type, events: result.events.length });
           broadcastRoom(canonicalRoomId, (target) => ({
             type: "EVENTS",
             roomId: canonicalRoomId,
             events: serializeEventsForViewer(result.events, viewerIdFor(target), result.state.playerOrder),
             snapshot: snapshotFor(canonicalRoomId, result.state, target),
           }));
-        }).catch((error) => send(client, { type: "COMMAND_REJECTED", code: "COMMAND_FAILED", message: error instanceof Error ? error.message : "Command failed", clientSeq: message.clientSeq }));
+        }).catch((error) => {
+          metrics.recordCommand("rejected", message.command.type, Date.now() - commandStartedAt);
+          metrics.recordDbFailure("command");
+          logger.error("command.failed", { userId: session.userId, roomId: canonicalRoomId, command: message.command.type, message: error instanceof Error ? error.message : String(error) });
+          send(client, { type: "COMMAND_REJECTED", code: "COMMAND_FAILED", message: error instanceof Error ? error.message : "Command failed", clientSeq: message.clientSeq });
+        });
         return;
       }
       if (message.type === "CHAT") {

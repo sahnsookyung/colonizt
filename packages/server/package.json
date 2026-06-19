@@ -16,6 +16,7 @@
     "@colonizt/bots": "0.1.0",
     "@colonizt/db": "0.1.0",
     "@colonizt/game-core": "0.1.0",
+    "@colonizt/protocol": "0.1.0",
     "fastify": "^5.6.2",
     "@fastify/cors": "^11.1.0",
     "@fastify/websocket": "^11.2.0",
