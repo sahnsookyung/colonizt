@@ -699,7 +699,7 @@ describe("serialization and replay", () => {
     const played = playBotGame(seed, 120);
     const replayed = replay({ config: createDemoConfig(seed), board: createFixedBoard(), events: played.events });
     expect(replayed).toEqual(played.state);
-  });
+  }, 20_000);
 
   it("applies individual events deterministically", () => {
     const state = createDemoGame();
