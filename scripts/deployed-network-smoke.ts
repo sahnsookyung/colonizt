@@ -54,6 +54,11 @@ const waitForOpen = (socket: WebSocket): Promise<void> =>
     socket.once("error", reject);
   });
 
+const closeSocket = (socket: WebSocket): void => {
+  socket.removeAllListeners();
+  if (socket.readyState !== WebSocket.CLOSED) socket.terminate();
+};
+
 const waitForMessage = <T extends { type: string }>(socket: WebSocket, type: string, predicate: (message: T) => boolean = () => true): Promise<T> =>
   failAfter(new Promise((resolve) => {
     const listener = (raw: WebSocket.RawData) => {
@@ -118,6 +123,7 @@ for (const [name, value, protocol] of [
 if (config.auth.webSocket !== "ticket") throw new Error("Deployed server is not advertising ticket websocket auth");
 
 const sockets: WebSocket[] = [];
+let exitCode = 0;
 
 try {
   const players = await Promise.all(["Host", "Player 2", "Player 3", "Player 4"].map((name) => createSession(`Smoke ${name} ${Date.now()}`)));
@@ -193,6 +199,11 @@ try {
     apiBase,
     wsBase,
   }, null, 2));
+} catch (error) {
+  exitCode = 1;
+  console.error(error instanceof Error ? error.stack ?? error.message : error);
 } finally {
-  for (const socket of sockets) socket.close();
+  for (const socket of sockets) closeSocket(socket);
 }
+
+process.exit(exitCode);
