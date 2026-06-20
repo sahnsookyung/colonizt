@@ -598,7 +598,7 @@ const tradeBundleKey = (bundle: ResourceBundle): string =>
   resources.map((resource) => `${resource}:${bundle[resource] ?? 0}`).join("|");
 
 const tradeRecipientsKey = (recipients: TradeOffer["recipients"] | OfferTradeCommand["recipients"]): string =>
-  recipients === "ANY" ? "ANY" : [...recipients].sort().join(",");
+  recipients === "ANY" ? "ANY" : [...recipients].sort((left, right) => left.localeCompare(right)).join(",");
 
 export const tradeShapeKey = (trade: Pick<TradeOffer | OfferTradeCommand, "offered" | "requested" | "recipients">): string =>
   `${tradeBundleKey(trade.offered)}>${tradeBundleKey(trade.requested)}@${tradeRecipientsKey(trade.recipients)}`;

@@ -82,7 +82,7 @@ const normalizeRules = (config: GameConfig, mapRandomizedDefault: boolean): Game
 
 const initialThiefHex = (board: GameState["board"]): HexId | undefined =>
   Object.values(board.hexes).find((hex) => hex.resource === "desert")?.id
-  ?? Object.keys(board.hexes).sort()[0];
+  ?? Object.keys(board.hexes).sort((left, right) => left.localeCompare(right))[0];
 
 export const createGame = (config: GameConfig, board?: GameState["board"]): GameState => {
   const normalizedRules = normalizeRules(config, !board);
@@ -498,7 +498,7 @@ export const deterministicDiscard = (state: GameState, playerId: PlayerId, count
 };
 
 const validThiefHexes = (state: GameState): HexId[] => {
-  const hexes = Object.keys(state.board.hexes).sort() as HexId[];
+  const hexes = Object.keys(state.board.hexes).sort((left, right) => left.localeCompare(right)) as HexId[];
   return hexes.length <= 1 ? hexes : hexes.filter((hexId) => hexId !== state.thiefHexId);
 };
 

@@ -157,7 +157,7 @@ export const createBoardFromHexes = (hexSpecs: HexSpec[]): BoardGraph => {
       for (let corner = 0; corner < corners.length; corner += 1) {
         const a = corners[corner] as string;
         const b = corners[(corner + 1) % corners.length] as string;
-        const sorted = [a, b].sort() as [string, string];
+        const sorted = [a, b].sort((left, right) => left.localeCompare(right)) as [string, string];
         const edgeKey = `${sorted[0]}|${sorted[1]}`;
         const existing = edgeHexes.get(edgeKey) ?? { keys: sorted, hexes: new Set<HexId>() };
         existing.hexes.add(id);
@@ -167,14 +167,14 @@ export const createBoardFromHexes = (hexSpecs: HexSpec[]): BoardGraph => {
     }),
   ) as BoardGraph["hexes"];
 
-  const vertexKeys = [...vertexHexes.keys()].sort();
+  const vertexKeys = [...vertexHexes.keys()].sort((left, right) => left.localeCompare(right));
   const keyToVertex = new Map<string, VertexId>();
   const vertices: BoardGraph["vertices"] = {};
   vertexKeys.forEach((key, index) => {
     const id = `v${index}` as VertexId;
     keyToVertex.set(key, id);
     const { x, y } = parseKey(key);
-    vertices[id] = { id, x, y, adjacentHexes: [...(vertexHexes.get(key) ?? [])].sort() };
+    vertices[id] = { id, x, y, adjacentHexes: [...(vertexHexes.get(key) ?? [])].sort((left, right) => left.localeCompare(right)) };
   });
 
   const edges: BoardGraph["edges"] = {};
@@ -188,7 +188,7 @@ export const createBoardFromHexes = (hexSpecs: HexSpec[]): BoardGraph => {
     .forEach(([, value], index) => {
       const id = `e${index}` as EdgeId;
       const verticesForEdge = [keyToVertex.get(value.keys[0]), keyToVertex.get(value.keys[1])] as [VertexId, VertexId];
-      edges[id] = { id, vertices: verticesForEdge, adjacentHexes: [...value.hexes].sort() };
+      edges[id] = { id, vertices: verticesForEdge, adjacentHexes: [...value.hexes].sort((left, right) => left.localeCompare(right)) };
       edgeToVertices[id] = verticesForEdge;
       vertexToEdges[verticesForEdge[0]]?.push(id);
       vertexToEdges[verticesForEdge[1]]?.push(id);

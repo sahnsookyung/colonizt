@@ -30,10 +30,7 @@ export const playSound = (cue: SoundCue): void => {
       audioByCue.set(cue, audio);
     }
     audio.currentTime = 0;
-    const maybePromise = audio.play();
-    if (maybePromise && "catch" in maybePromise) {
-      void maybePromise.catch(() => undefined);
-    }
+    void audio.play().catch(() => undefined);
   } catch {
     // Browsers can block playback until a user gesture; gameplay must continue.
   }

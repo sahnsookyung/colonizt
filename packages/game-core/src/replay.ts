@@ -21,7 +21,8 @@ export const normalizeImportedState = (state: GameState): GameState => {
   next.developmentDeckCursor ??= 0;
   next.playedKnightCounts ??= Object.fromEntries(next.playerOrder.map((playerId) => [playerId, next.players[playerId]?.playedKnights ?? 0]));
   if (!next.thiefHexId) {
-    const thiefHexId = Object.values(next.board.hexes).find((hex) => hex.resource === "desert")?.id ?? Object.keys(next.board.hexes).sort()[0];
+    const thiefHexId = Object.values(next.board.hexes).find((hex) => hex.resource === "desert")?.id
+      ?? Object.keys(next.board.hexes).sort((left, right) => left.localeCompare(right))[0];
     if (thiefHexId) next.thiefHexId = thiefHexId;
   }
   for (const playerId of next.playerOrder) {
