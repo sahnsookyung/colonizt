@@ -2,7 +2,6 @@ import { customAlphabet, nanoid } from "nanoid";
 import {
   applyCommand,
   activeCollectingTradeForPlayer,
-  addResources,
   canBuildRoad,
   createFixedBoard,
   createGame,
@@ -14,7 +13,6 @@ import {
   replay,
   serializeEventsForViewer,
   serializeForViewer,
-  subtractResources,
   tradeRecipientIds,
   type BotDifficulty,
   type GameCommand,
@@ -24,21 +22,28 @@ import {
   type PlayerId,
   type ViewerState,
 } from "@colonizt/game-core";
-import { createBotTradeId, createBotView, evaluateState, evaluateTrade, greedyBot, hasEquivalentBotTradeOffer, plannerBot, randomLegalBot, type BotController } from "@colonizt/bots";
+import { createBotTradeId, createBotView, evaluateTrade, greedyBot, hasEquivalentBotTradeOffer, plannerBot, randomLegalBot, scoreTradeResponder, tradeShapeKey, type BotController } from "@colonizt/bots";
+import { DueWorkIndex } from "./due-work.js";
 import { MemoryEventStore, type EventStore, type StoredCommandResult, type StoredMatchSummary, type StoredRoomRecord } from "./event-store.js";
+import type { RoomOwnershipStore } from "./ownership.js";
 import { hashCommandPayload } from "./security.js";
 
 const tradeResponseWindowMs = 15_000;
 const roomCodeAlphabet = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 const generateRoomCode = customAlphabet(roomCodeAlphabet, 6);
+const defaultSessionTtlMs = 30 * 24 * 60 * 60 * 1000;
 
 export type RoomStatus = "LOBBY" | "IN_GAME" | "FINISHED" | "EXPIRED" | "ABANDONED";
+export type RoomPauseReason = "EMPTY_ROOM" | "STALLED_AUTOMATION";
 
 export interface RoomCleanupPolicy {
   maxActiveRooms: number;
   emptyLobbyTtlMs: number;
   emptyGameTtlMs: number;
   finishedRoomUnloadMs: number;
+  automationStallTickLimit: number;
+  maxAutomatedCommandsPerMinute: number;
+  botTradeCooldownTurns: number;
 }
 
 export const defaultRoomCleanupPolicy: RoomCleanupPolicy = {
@@ -46,6 +51,9 @@ export const defaultRoomCleanupPolicy: RoomCleanupPolicy = {
   emptyLobbyTtlMs: 10 * 60 * 1000,
   emptyGameTtlMs: 30 * 60 * 1000,
   finishedRoomUnloadMs: 5 * 60 * 1000,
+  automationStallTickLimit: 20,
+  maxAutomatedCommandsPerMinute: 90,
+  botTradeCooldownTurns: 2,
 };
 
 export class RoomCapacityError extends Error {
@@ -108,6 +116,7 @@ export interface Room {
   lastActivityAt: string;
   emptySince?: string;
   pausedAt?: string;
+  pauseReason?: RoomPauseReason;
   archivedAt?: string;
   cleanupReason?: string;
   game?: GameState;
@@ -122,6 +131,17 @@ export interface Room {
   };
   tradeResponseDeadlines: Map<string, number>;
 }
+
+export type RoomLivenessState = "ACTIVE" | "IDLE_LOBBY" | "PAUSED_EMPTY" | "STALLED" | "FINISHED_UNLOADED" | "CLOSED";
+
+type AutomationProgress = { key: string; repeats: number; seenAt: number };
+
+type RoomManagerOptions = Partial<RoomCleanupPolicy> & {
+  sessionTtlMs?: number;
+  ownerId?: string;
+  ownershipStore?: RoomOwnershipStore;
+  ownershipLeaseTtlMs?: number;
+};
 
 export type CommandResult = {
   ok: true;
@@ -141,28 +161,55 @@ export class RoomManager {
   readonly rooms = new Map<string, Room>();
   private readonly roomQueues = new Map<string, Promise<void>>();
   private readonly cleanupPolicy: RoomCleanupPolicy;
+  private readonly sessionTtlMs: number;
+  private readonly ownerId: string;
+  private readonly ownershipStore: RoomOwnershipStore | undefined;
+  private readonly ownershipLeaseTtlMs: number;
+  private readonly automationDueWork = new DueWorkIndex();
+  private readonly cleanupDueWork = new DueWorkIndex();
+  private readonly automationProgress = new Map<string, AutomationProgress>();
+  private readonly automationCommandTimes = new Map<string, number[]>();
+  private readonly botTradeCooldowns = new Map<string, number>();
 
-  constructor(private readonly eventStore: EventStore = new MemoryEventStore(), cleanupPolicy: Partial<RoomCleanupPolicy> = {}) {
+  constructor(private readonly eventStore: EventStore = new MemoryEventStore(), options: RoomManagerOptions = {}) {
+    const { sessionTtlMs, ownerId, ownershipStore, ownershipLeaseTtlMs, ...cleanupPolicy } = options;
     this.cleanupPolicy = { ...defaultRoomCleanupPolicy, ...cleanupPolicy };
+    this.sessionTtlMs = sessionTtlMs ?? defaultSessionTtlMs;
+    this.ownerId = ownerId ?? "local";
+    this.ownershipStore = ownershipStore;
+    this.ownershipLeaseTtlMs = ownershipLeaseTtlMs ?? 30_000;
   }
 
   async createSession(displayName: string): Promise<Session> {
     const userId = `u_${nanoid(8)}`;
-    const session: Session = { token: `s_${nanoid(24)}`, userId, displayName };
+    const session: Session = {
+      token: `s_${nanoid(24)}`,
+      userId,
+      displayName,
+      ...(this.sessionTtlMs > 0 ? { expiresAt: new Date(Date.now() + this.sessionTtlMs).toISOString() } : {}),
+    };
     this.sessions.set(session.token, session);
     await this.eventStore.persistSession(session);
     return session;
   }
 
   getSession(token: string | undefined): Session | undefined {
-    return token ? this.sessions.get(token) : undefined;
+    if (!token) return undefined;
+    const session = this.sessions.get(token);
+    if (!session) return undefined;
+    if (!this.sessionIsActive(session)) {
+      this.sessions.delete(token);
+      return undefined;
+    }
+    return session;
   }
 
   async resolveSession(token: string | undefined): Promise<Session | undefined> {
     const cached = this.getSession(token);
     if (cached || !token) return cached;
     const persisted = await this.eventStore.loadSessionByToken?.(token);
-    if (persisted) this.sessions.set(token, persisted);
+    if (!persisted || !this.sessionIsActive(persisted)) return undefined;
+    this.sessions.set(token, persisted);
     return persisted;
   }
 
@@ -191,6 +238,8 @@ export class RoomManager {
     room.seats[0] = { seatIndex: 0, userId: host.userId, ready: false, connected: false };
     this.rooms.set(room.id, room);
     await this.eventStore.persistRoom(room);
+    await this.claimRoom(room);
+    this.updateRoomDueWork(room);
     return room;
   }
 
@@ -210,6 +259,8 @@ export class RoomManager {
       createdAt: room.createdAt,
       lastActivityAt: room.lastActivityAt,
       pausedAt: room.pausedAt,
+      pauseReason: room.pauseReason,
+      liveness: this.livenessState(room),
       timer: room.timer,
     };
   }
@@ -232,14 +283,32 @@ export class RoomManager {
       this.eventStore.loadSessions(limit * 4),
       this.eventStore.loadRooms(limit),
     ]);
-    for (const session of sessions) this.sessions.set(session.token, session);
+    for (const session of sessions) {
+      if (this.sessionIsActive(session)) this.sessions.set(session.token, session);
+    }
     let hydrated = 0;
     for (const record of records) {
       const room = this.roomFromStoredRecord(record);
-      this.rooms.set(room.id, room);
-      hydrated += 1;
+      if (await this.claimRoom(room)) {
+        this.rooms.set(room.id, room);
+        this.updateRoomDueWork(room);
+        hydrated += 1;
+      }
     }
     return hydrated;
+  }
+
+  async ensureRoomLoadedByRef(roomRef: string): Promise<Room | undefined> {
+    const existing = this.roomForRef(roomRef);
+    if (existing) return existing;
+    const stored = await this.eventStore.loadRoomByRef?.(roomRef);
+    if (!stored) return undefined;
+    const room = this.roomFromStoredRecord(stored);
+    if (room.archivedAt || room.status === "EXPIRED" || room.status === "ABANDONED") return room;
+    if (!await this.claimRoom(room)) return room;
+    this.rooms.set(room.id, room);
+    this.updateRoomDueWork(room);
+    return room;
   }
 
   roomForRef(roomRef: string): Room | undefined {
@@ -247,11 +316,11 @@ export class RoomManager {
     return this.rooms.get(roomRef) ?? [...this.rooms.values()].find((room) => room.code === normalizedRef);
   }
 
-  async loadRoomStatusByRef(roomRef: string): Promise<{ status: RoomStatus; cleanupReason?: string } | undefined> {
+  async loadRoomStatusByRef(roomRef: string): Promise<{ status: RoomStatus; cleanupReason?: string; pauseReason?: RoomPauseReason } | undefined> {
     const room = this.roomForRef(roomRef);
-    if (room) return { status: room.status, ...(room.cleanupReason ? { cleanupReason: room.cleanupReason } : {}) };
+    if (room) return { status: room.status, ...(room.cleanupReason ? { cleanupReason: room.cleanupReason } : {}), ...(room.pauseReason ? { pauseReason: room.pauseReason } : {}) };
     const stored = await this.eventStore.loadRoomByRef?.(roomRef);
-    return stored ? { status: stored.status, ...(stored.cleanupReason ? { cleanupReason: stored.cleanupReason } : {}) } : undefined;
+    return stored ? { status: stored.status, ...(stored.cleanupReason ? { cleanupReason: stored.cleanupReason } : {}), ...(stored.pauseReason ? { pauseReason: stored.pauseReason } : {}) } : undefined;
   }
 
   async listMatchHistory(limit = 20): Promise<StoredMatchSummary[]> {
@@ -271,6 +340,8 @@ export class RoomManager {
       createdAt: room.createdAt,
       lastActivityAt: room.lastActivityAt,
       pausedAt: room.pausedAt,
+      pauseReason: room.pauseReason,
+      liveness: this.livenessState(room),
       cleanupReason: room.cleanupReason,
       events: serializeEventsForViewer(room.events, viewerId, room.game?.playerOrder),
       chat: room.chat,
@@ -280,22 +351,26 @@ export class RoomManager {
   }
 
   async joinRoom(roomId: string, session: Session, asSpectator = false): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
-    const room = this.roomForRef(roomId);
+    const room = await this.ensureRoomLoadedByRef(roomId);
     if (!room) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
     if (room.status === "EXPIRED") return { ok: false, code: "ROOM_EXPIRED", message: "Room expired because everyone left the lobby" };
     if (room.status === "ABANDONED") return { ok: false, code: "ROOM_ABANDONED", message: "Room was abandoned because all seated players disconnected" };
+    if (room.archivedAt) return { ok: false, code: "ROOM_CLOSED", message: "Room is closed" };
+    if (!await this.claimRoom(room)) return { ok: false, code: "ROOM_NOT_OWNED", message: "Room is owned by another server" };
     const existing = room.seats.find((seat) => seat.userId === session.userId);
     if (existing) {
       existing.connected = true;
       this.touchRoom(room);
       this.resumeRoomIfNeeded(room);
       await this.eventStore.persistRoom(room);
+      this.updateRoomDueWork(room);
       return { ok: true, room };
     }
     if (asSpectator || room.status !== "LOBBY") {
       room.spectators.add(session.userId);
       this.touchRoom(room);
       await this.eventStore.persistRoom(room);
+      this.updateRoomDueWork(room);
       return { ok: true, room };
     }
     const seat = room.seats.find((candidate) => !candidate.userId && !candidate.botId);
@@ -304,18 +379,23 @@ export class RoomManager {
     seat.connected = true;
     this.touchRoom(room);
     await this.eventStore.persistRoom(room);
+    this.updateRoomDueWork(room);
     return { ok: true, room };
   }
 
   async setReady(roomId: string, session: Session, ready: boolean): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
-    const targetRoom = this.roomForRef(roomId);
+    const targetRoom = await this.ensureRoomLoadedByRef(roomId);
     if (!targetRoom) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
+    if (targetRoom.status === "EXPIRED") return { ok: false, code: "ROOM_EXPIRED", message: "Room expired because everyone left the lobby" };
+    if (targetRoom.status === "ABANDONED") return { ok: false, code: "ROOM_ABANDONED", message: "Room was abandoned because all seated players disconnected" };
+    if (targetRoom.archivedAt) return { ok: false, code: "ROOM_CLOSED", message: "Room is closed" };
     return this.enqueueRoom(targetRoom.id, () => this.setReadyNow(targetRoom.id, session, ready));
   }
 
   private async setReadyNow(roomId: string, session: Session, ready: boolean): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
     const room = this.roomForRef(roomId);
     if (!room) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
+    if (!await this.claimRoom(room)) return { ok: false, code: "ROOM_NOT_OWNED", message: "Room is owned by another server" };
     if (room.status === "EXPIRED" || room.status === "ABANDONED") return { ok: false, code: "ROOM_CLOSED", message: "Room is closed" };
     if (room.status !== "LOBBY") return { ok: false, code: "ROOM_ALREADY_STARTED", message: "Room has already started" };
     const seat = room.seats.find((candidate) => candidate.userId === session.userId);
@@ -325,12 +405,14 @@ export class RoomManager {
     if (room.settings.botFill) this.fillBots(room);
     if (this.canStart(room)) await this.startRoom(room);
     else await this.eventStore.persistRoom(room);
+    this.updateRoomDueWork(room);
     return { ok: true, room };
   }
 
   async syncConnections(roomId: string, connectedUserIds: Set<PlayerId>, now = Date.now()): Promise<Room | undefined> {
     const room = this.roomForRef(roomId);
     if (!room) return undefined;
+    if (!await this.claimRoom(room)) return undefined;
     let changed = false;
     for (const seat of room.seats) {
       if (!seat.userId) continue;
@@ -349,6 +431,7 @@ export class RoomManager {
     if (this.connectedSeatedHumanCount(room) === 0) {
       if (room.status === "IN_GAME" && !room.pausedAt) {
         room.pausedAt = new Date(now).toISOString();
+        room.pauseReason = "EMPTY_ROOM";
         room.emptySince ??= room.pausedAt;
         changed = true;
       } else if ((room.status === "LOBBY" || room.status === "FINISHED") && !room.emptySince) {
@@ -364,14 +447,19 @@ export class RoomManager {
     if (changed) {
       this.touchRoom(room, now);
       await this.eventStore.persistRoom(room);
+      this.updateRoomDueWork(room, now);
     }
     return room;
   }
 
-  async cleanupRooms(now = Date.now()): Promise<Array<{ roomId: string; code: string; status: RoomStatus; cleanupReason?: string }>> {
+  async cleanupRooms(now = Date.now(), roomIds?: string[]): Promise<Array<{ roomId: string; code: string; status: RoomStatus; cleanupReason?: string }>> {
     const cleaned: Array<{ roomId: string; code: string; status: RoomStatus; cleanupReason?: string }> = [];
-    for (const room of [...this.rooms.values()]) {
+    const candidates = roomIds
+      ? roomIds.map((roomId) => this.rooms.get(roomId)).filter((room): room is Room => Boolean(room))
+      : [...this.rooms.values()];
+    for (const room of candidates) {
       if (room.archivedAt) continue;
+      if (!await this.claimRoom(room)) continue;
       const nowIso = new Date(now).toISOString();
       const connectedSeatedHumans = this.connectedSeatedHumanCount(room);
       const connectedUsers = this.connectedUserCount(room);
@@ -401,6 +489,7 @@ export class RoomManager {
           }
           if (!room.pausedAt) {
             room.pausedAt = nowIso;
+            room.pauseReason = "EMPTY_ROOM";
             changed = true;
           }
           if (now - Date.parse(room.emptySince) >= this.cleanupPolicy.emptyGameTtlMs) {
@@ -434,19 +523,69 @@ export class RoomManager {
       await this.eventStore.persistRoom(room);
       if (room.archivedAt || room.status === "EXPIRED" || room.status === "ABANDONED") {
         this.rooms.delete(room.id);
+        this.removeRoomDueWork(room.id);
+        await this.releaseRoom(room.id);
         cleaned.push({
           roomId: room.id,
           code: room.code,
           status: room.status,
           ...(room.cleanupReason ? { cleanupReason: room.cleanupReason } : {}),
         });
-      }
+      } else this.updateRoomDueWork(room, now);
     }
     return cleaned;
   }
 
   activeRoomCount(): number {
     return [...this.rooms.values()].filter((room) => this.isActiveRoom(room)).length;
+  }
+
+  livenessState(room: Room): RoomLivenessState {
+    if (room.archivedAt && room.cleanupReason === "FINISHED_UNLOADED") return "FINISHED_UNLOADED";
+    if (room.archivedAt || room.status === "EXPIRED" || room.status === "ABANDONED") return "CLOSED";
+    if (room.pauseReason === "STALLED_AUTOMATION") return "STALLED";
+    if (room.pausedAt) return "PAUSED_EMPTY";
+    if (room.status === "LOBBY" && this.connectedSeatedHumanCount(room) === 0) return "IDLE_LOBBY";
+    return "ACTIVE";
+  }
+
+  livenessCounts(): Record<RoomLivenessState, number> {
+    const counts: Record<RoomLivenessState, number> = {
+      ACTIVE: 0,
+      IDLE_LOBBY: 0,
+      PAUSED_EMPTY: 0,
+      STALLED: 0,
+      FINISHED_UNLOADED: 0,
+      CLOSED: 0,
+    };
+    for (const room of this.rooms.values()) counts[this.livenessState(room)] += 1;
+    return counts;
+  }
+
+  pauseReasonCounts(): Record<RoomPauseReason, number> {
+    const counts: Record<RoomPauseReason, number> = { EMPTY_ROOM: 0, STALLED_AUTOMATION: 0 };
+    for (const room of this.rooms.values()) {
+      if (room.pauseReason) counts[room.pauseReason] += 1;
+    }
+    return counts;
+  }
+
+  dueAutomationRoomIds(now = Date.now()): string[] {
+    return this.automationDueWork.claimDue(now);
+  }
+
+  nextAutomationDueAt(now = Date.now()): number | undefined {
+    void now;
+    return this.automationDueWork.nextDueAt();
+  }
+
+  dueCleanupRoomIds(now = Date.now()): string[] {
+    return this.cleanupDueWork.claimDue(now);
+  }
+
+  nextCleanupDueAt(now = Date.now()): number | undefined {
+    void now;
+    return this.cleanupDueWork.nextDueAt();
   }
 
   fillBots(room: Room): void {
@@ -523,9 +662,59 @@ export class RoomManager {
     return this.enqueueRoom(roomId, () => this.runDueBotAutomationNow(roomId, _now));
   }
 
+  private async commitAcceptedEvents(
+    room: Room,
+    previousState: GameState,
+    nextState: GameState,
+    events: GameEvent[],
+    commandResult?: StoredCommandResult,
+    now = Date.now(),
+  ): Promise<CommandResult> {
+    const nextStatus: RoomStatus = nextState.phase.type === "GAME_OVER" ? "FINISHED" : room.status;
+    const nextTradeResponseDeadlines = this.tradeResponseDeadlinesAfter(room, events, now);
+    const committedRoom: Room = {
+      ...room,
+      status: nextStatus,
+      game: nextState,
+      lastActivityAt: new Date(now).toISOString(),
+      processedClientCommands: new Map(room.processedClientCommands),
+      tradeResponseDeadlines: nextTradeResponseDeadlines,
+    };
+    try {
+      if (this.eventStore.commitEvents) {
+        await this.eventStore.commitEvents(committedRoom, events, commandResult);
+      } else {
+        await this.eventStore.appendEvents(room, events);
+        if (commandResult) await this.eventStore.persistCommandResult?.(commandResult);
+        if (nextState.phase.type === "GAME_OVER") await this.eventStore.markFinished(committedRoom, nextState.phase.winnerId);
+        else await this.eventStore.persistRoom(committedRoom);
+      }
+    } catch (error) {
+      if ((error as { code?: unknown }).code === "COMMAND_RESULT_CONFLICT" && commandResult) {
+        const persisted = await this.eventStore.loadCommandResult?.(room.id, commandResult.userId, commandResult.clientSeq);
+        if (persisted) {
+          room.processedClientCommands.set(`${room.id}:${commandResult.userId}:${commandResult.clientSeq}`, persisted);
+          return this.commandResultReplay(room, persisted, commandResult.commandHash);
+        }
+        return { ok: false, code: "CLIENT_SEQ_CONFLICT", message: "Client sequence was already used for a different command" };
+      }
+      return { ok: false, code: "EVENT_COMMIT_FAILED", message: error instanceof Error ? error.message : "Event commit failed" };
+    }
+
+    this.appendEvents(room, events, now);
+    room.game = nextState;
+    room.status = nextStatus;
+    this.touchRoom(room, now);
+    if (commandResult) room.processedClientCommands.set(`${room.id}:${commandResult.userId}:${commandResult.clientSeq}`, commandResult);
+    this.refreshTimer(room, previousState);
+    this.updateRoomDueWork(room, now);
+    return { ok: true, events, state: room.game };
+  }
+
   private async submitCommandNow(roomId: string, session: Session, clientSeq: number, command: GameCommand): Promise<CommandResult> {
     const room = this.roomForRef(roomId);
     if (!room?.game) return { ok: false, code: "ROOM_NOT_IN_GAME", message: "Room is not in game" };
+    if (!await this.claimRoom(room)) return { ok: false, code: "ROOM_NOT_OWNED", message: "Room is owned by another server" };
     if (room.pausedAt) return { ok: false, code: "ROOM_PAUSED", message: "Room is paused until a seated player reconnects" };
     if (!this.isMember(room, session.userId)) return { ok: false, code: "NOT_IN_ROOM", message: "You are not in this room" };
     if (command.playerId !== session.userId) return { ok: false, code: "COMMAND_PLAYER_MISMATCH", message: "Command player does not match session" };
@@ -536,21 +725,7 @@ export class RoomManager {
       ?? await this.eventStore.loadCommandResult?.(room.id, session.userId, clientSeq);
     if (duplicate) {
       room.processedClientCommands.set(idempotencyKey, duplicate);
-      if (duplicate.commandHash !== commandHash) {
-        return { ok: false, code: "CLIENT_SEQ_CONFLICT", message: "Client sequence was already used for a different command" };
-      }
-      if (!duplicate.ok) {
-        return { ok: false, code: duplicate.rejectionCode ?? "COMMAND_REJECTED", message: duplicate.rejectionMessage ?? "Command was rejected" };
-      }
-      const replayed: CommandResult = {
-        ok: true,
-        events: duplicate.events ?? [],
-        state: room.game,
-        replayed: true,
-      };
-      if (duplicate.seqStart !== undefined) replayed.seqStart = duplicate.seqStart;
-      if (duplicate.seqEnd !== undefined) replayed.seqEnd = duplicate.seqEnd;
-      return replayed;
+      return this.commandResultReplay(room, duplicate, commandHash);
     }
 
     const previousState = room.game;
@@ -567,23 +742,28 @@ export class RoomManager {
         rejectionMessage: result.error.message,
       };
       room.processedClientCommands.set(idempotencyKey, rejected);
-      await this.eventStore.persistCommandResult?.(rejected);
+      try {
+        await this.eventStore.persistCommandResult?.(rejected);
+      } catch (error) {
+        if ((error as { code?: unknown }).code === "COMMAND_RESULT_CONFLICT") {
+          const persisted = await this.eventStore.loadCommandResult?.(room.id, session.userId, clientSeq);
+          if (persisted) {
+            room.processedClientCommands.set(idempotencyKey, persisted);
+            return this.commandResultReplay(room, persisted, commandHash);
+          }
+          room.processedClientCommands.delete(idempotencyKey);
+          return { ok: false, code: "CLIENT_SEQ_CONFLICT", message: "Client sequence was already used for a different command" };
+        }
+        room.processedClientCommands.delete(idempotencyKey);
+        throw error;
+      }
       return { ok: false, code: result.error.code, message: result.error.message };
     }
 
-    try {
-      await this.eventStore.appendEvents(room, result.value.events);
-      this.appendEvents(room, result.value.events);
-    } catch (error) {
-      return { ok: false, code: "EVENT_APPEND_FAILED", message: error instanceof Error ? error.message : "Event append failed" };
-    }
-
-    room.game = result.value.nextState;
-    this.touchRoom(room);
     const allEvents = result.value.events;
     const storedResult: StoredCommandResult = {
       roomId: room.id,
-      matchId: room.game.config.matchId,
+      matchId: previousState.config.matchId,
       userId: session.userId,
       clientSeq,
       commandHash,
@@ -592,43 +772,59 @@ export class RoomManager {
     };
     if (allEvents[0]) storedResult.seqStart = allEvents[0].seq;
     if (allEvents.at(-1)) storedResult.seqEnd = allEvents.at(-1)!.seq;
-    room.processedClientCommands.set(idempotencyKey, storedResult);
-    await this.eventStore.persistCommandResult?.(storedResult);
-    if (room.game.phase.type === "GAME_OVER") {
-      room.status = "FINISHED";
-      await this.eventStore.markFinished(room, room.game.phase.winnerId);
-    } else {
-      await this.eventStore.persistRoom(room);
-    }
-    this.refreshTimer(room, previousState);
-    return { ok: true, events: allEvents, state: room.game };
+    return this.commitAcceptedEvents(room, previousState, result.value.nextState, allEvents, storedResult);
   }
 
-  appendEvents(room: Room, events: GameEvent[]): void {
+  private commandResultReplay(room: Room, result: StoredCommandResult, commandHash: string): CommandResult {
+    if (result.commandHash !== commandHash) {
+      return { ok: false, code: "CLIENT_SEQ_CONFLICT", message: "Client sequence was already used for a different command" };
+    }
+    if (!result.ok) {
+      return { ok: false, code: result.rejectionCode ?? "COMMAND_REJECTED", message: result.rejectionMessage ?? "Command was rejected" };
+    }
+    if (!room.game) return { ok: false, code: "ROOM_NOT_IN_GAME", message: "Room is not in game" };
+    const replayed: CommandResult = {
+      ok: true,
+      events: result.events ?? [],
+      state: room.game,
+      replayed: true,
+    };
+    if (result.seqStart !== undefined) replayed.seqStart = result.seqStart;
+    if (result.seqEnd !== undefined) replayed.seqEnd = result.seqEnd;
+    return replayed;
+  }
+
+  appendEvents(room: Room, events: GameEvent[], now = Date.now()): void {
     const expectedNext = room.events.length > 0 ? Math.max(...room.events.map((event) => event.seq)) + 1 : 1;
     if (events[0] && events[0].seq !== expectedNext) {
       throw new Error(`Expected event seq ${expectedNext}, got ${events[0].seq}`);
     }
     room.events.push(...events);
-    this.syncTradeResponseDeadlines(room, events);
+    this.syncTradeResponseDeadlines(room, events, now);
   }
 
-  private syncTradeResponseDeadlines(room: Room, events: readonly GameEvent[], now = Date.now()): void {
+  private tradeResponseDeadlinesAfter(room: Room, events: readonly GameEvent[], now = Date.now()): Map<string, number> {
+    const deadlines = new Map(room.tradeResponseDeadlines);
     for (const event of events) {
       switch (event.type) {
         case "TRADE_OFFERED":
-          if (event.trade.status === "COLLECTING_RESPONSES") room.tradeResponseDeadlines.set(event.trade.id, now + tradeResponseWindowMs);
+          if (event.trade.status === "COLLECTING_RESPONSES") deadlines.set(event.trade.id, now + tradeResponseWindowMs);
           break;
         case "TRADE_CANCELLED":
         case "TRADE_ACCEPTED":
         case "TRADE_EXPIRED":
         case "TRADE_CLOSED":
-          room.tradeResponseDeadlines.delete(event.tradeId);
+          deadlines.delete(event.tradeId);
           break;
         default:
           break;
       }
     }
+    return deadlines;
+  }
+
+  private syncTradeResponseDeadlines(room: Room, events: readonly GameEvent[], now = Date.now()): void {
+    room.tradeResponseDeadlines = this.tradeResponseDeadlinesAfter(room, events, now);
   }
 
   private rebuildTradeResponseDeadlines(room: Room, now = Date.now()): void {
@@ -644,6 +840,7 @@ export class RoomManager {
   private async expireTurnNow(roomId: string, now: number): Promise<CommandResult | undefined> {
     const room = this.roomForRef(roomId);
     if (!room?.game || !room.timer || room.timer.expiresAt > now || !("activePlayerId" in room.game.phase)) return undefined;
+    if (!await this.claimRoom(room)) return undefined;
     if (room.pausedAt) return undefined;
 
     const activePlayerId = room.game.phase.activePlayerId;
@@ -655,27 +852,13 @@ export class RoomManager {
       const ended = applyCommand(closed.value.nextState, { type: "END_TURN", playerId: activePlayerId });
       if (!ended.ok) return { ok: false, code: ended.error.code, message: ended.error.message };
       const allEvents = [...closed.value.events, ...ended.value.events];
-      try {
-        await this.eventStore.appendEvents(room, allEvents);
-        this.appendEvents(room, allEvents);
-      } catch (error) {
-        return { ok: false, code: "EVENT_APPEND_FAILED", message: error instanceof Error ? error.message : "Event append failed" };
-      }
-      room.game = ended.value.nextState;
-      this.touchRoom(room, now);
-      if (room.game.phase.type === "GAME_OVER") {
-        room.status = "FINISHED";
-        await this.eventStore.markFinished(room, room.game.phase.winnerId);
-      } else {
-        await this.eventStore.persistRoom(room);
-      }
-      this.refreshTimer(room, previousState);
-      return { ok: true, events: allEvents, state: room.game };
+      return this.commitAcceptedEvents(room, previousState, ended.value.nextState, allEvents, undefined, now);
     }
 
     const command = this.timeoutCommand(room.game, activePlayerId);
     if (!command) {
       this.refreshTimer(room);
+      this.updateRoomDueWork(room, now);
       return undefined;
     }
 
@@ -683,29 +866,14 @@ export class RoomManager {
     const result = applyCommand(previousState, command);
     if (!result.ok) return { ok: false, code: result.error.code, message: result.error.message };
 
-    try {
-      await this.eventStore.appendEvents(room, result.value.events);
-      this.appendEvents(room, result.value.events);
-    } catch (error) {
-      return { ok: false, code: "EVENT_APPEND_FAILED", message: error instanceof Error ? error.message : "Event append failed" };
-    }
-
-    room.game = result.value.nextState;
-    this.touchRoom(room, now);
     const allEvents = result.value.events;
-    if (room.game.phase.type === "GAME_OVER") {
-      room.status = "FINISHED";
-      await this.eventStore.markFinished(room, room.game.phase.winnerId);
-    } else {
-      await this.eventStore.persistRoom(room);
-    }
-    this.refreshTimer(room, previousState);
-    return { ok: true, events: allEvents, state: room.game };
+    return this.commitAcceptedEvents(room, previousState, result.value.nextState, allEvents, undefined, now);
   }
 
   async addChat(roomId: string, session: Session, message: string): Promise<ChatMessage | undefined> {
     const room = this.roomForRef(roomId);
     if (!room || !this.isMember(room, session.userId)) return undefined;
+    if (!await this.claimRoom(room)) return undefined;
     const chat: ChatMessage = { id: `chat_${nanoid(8)}`, userId: session.userId, message, createdAt: new Date().toISOString() };
     room.chat.push(chat);
     this.touchRoom(room);
@@ -716,6 +884,7 @@ export class RoomManager {
   async createReport(roomId: string, reporter: Session, reportedUserId: string, reason: string): Promise<Report | undefined> {
     const room = this.roomForRef(roomId);
     if (!room || !this.isMember(room, reporter.userId)) return undefined;
+    if (!await this.claimRoom(room)) return undefined;
     const report: Report = { id: `report_${nanoid(8)}`, reporterUserId: reporter.userId, reportedUserId, roomId: room.id, reason, status: "OPEN" };
     room.reports.push(report);
     this.touchRoom(room);
@@ -749,8 +918,8 @@ export class RoomManager {
     return log ? replay(log) : undefined;
   }
 
-  resync(roomId: string, session: Session, lastSeq: number): { snapshot?: ViewerState; events: GameEvent[] } | undefined {
-    const room = this.roomForRef(roomId);
+  async resync(roomId: string, session: Session, lastSeq: number): Promise<{ snapshot?: ViewerState; events: GameEvent[] } | undefined> {
+    const room = await this.ensureRoomLoadedByRef(roomId);
     if (!room?.game) return undefined;
     const viewerId = this.isMember(room, session.userId) ? session.userId : "spectator";
     const events = room.events.filter((event) => event.seq > lastSeq);
@@ -780,6 +949,12 @@ export class RoomManager {
     };
   }
 
+  refreshRoomDueWork(roomId: string, now = Date.now()): void {
+    const room = this.rooms.get(roomId);
+    if (room) this.updateRoomDueWork(room, now);
+    else this.removeRoomDueWork(roomId);
+  }
+
   private timerKey(state?: GameState): string | undefined {
     if (!state || !("activePlayerId" in state.phase)) return undefined;
     return `${state.config.matchId}:${state.turn}:${state.phase.type}:${state.phase.activePlayerId}`;
@@ -797,8 +972,62 @@ export class RoomManager {
     room.lastActivityAt = new Date(now).toISOString();
   }
 
+  private sessionIsActive(session: Session, now = Date.now()): boolean {
+    return !session.expiresAt || Date.parse(session.expiresAt) > now;
+  }
+
+  private async claimRoom(room: Room): Promise<boolean> {
+    return this.ownershipStore ? this.ownershipStore.acquire(room.id, this.ownerId, this.ownershipLeaseTtlMs) : true;
+  }
+
+  private async releaseRoom(roomId: string): Promise<void> {
+    await this.ownershipStore?.release(roomId, this.ownerId);
+  }
+
   private isActiveRoom(room: Room): boolean {
     return !room.archivedAt && room.status !== "EXPIRED" && room.status !== "ABANDONED";
+  }
+
+  private updateRoomDueWork(room: Room, now = Date.now()): void {
+    if (!this.isActiveRoom(room)) {
+      this.removeRoomDueWork(room.id);
+      return;
+    }
+    this.automationDueWork.set(room.id, this.automationDueAt(room, now));
+    this.cleanupDueWork.set(room.id, this.cleanupDueAt(room, now));
+  }
+
+  private removeRoomDueWork(roomId: string): void {
+    this.automationDueWork.delete(roomId);
+    this.cleanupDueWork.delete(roomId);
+  }
+
+  private automationDueAt(room: Room, now = Date.now()): number {
+    if (!room.game || room.status !== "IN_GAME" || room.game.phase.type === "GAME_OVER" || room.pausedAt) return Number.POSITIVE_INFINITY;
+    const tradeDue = Math.min(Number.POSITIVE_INFINITY, ...room.tradeResponseDeadlines.values());
+    if (tradeDue <= now) return tradeDue;
+    if (this.botTradeResponseCommand(room)) return now;
+    if (room.timer?.expiresAt && room.timer.expiresAt <= now) return room.timer.expiresAt;
+    if ("activePlayerId" in room.game.phase && this.botSeatIds(room).includes(room.game.phase.activePlayerId)) {
+      const lastAutomation = this.automationCommandTimes.get(room.id)?.at(-1);
+      return lastAutomation ? lastAutomation + 450 : now;
+    }
+    return room.timer?.expiresAt ?? Number.POSITIVE_INFINITY;
+  }
+
+  private cleanupDueAt(room: Room, now = Date.now()): number {
+    if (!this.isActiveRoom(room)) return Number.POSITIVE_INFINITY;
+    const connectedSeatedHumans = this.connectedSeatedHumanCount(room);
+    if (room.status === "LOBBY" && connectedSeatedHumans === 0) {
+      return room.emptySince ? Date.parse(room.emptySince) + this.cleanupPolicy.emptyLobbyTtlMs : now;
+    }
+    if (room.status === "IN_GAME" && connectedSeatedHumans === 0) {
+      return room.emptySince ? Date.parse(room.emptySince) + this.cleanupPolicy.emptyGameTtlMs : now;
+    }
+    if (room.status === "FINISHED" && this.connectedUserCount(room) === 0) {
+      return room.emptySince ? Date.parse(room.emptySince) + this.cleanupPolicy.finishedRoomUnloadMs : now;
+    }
+    return Number.POSITIVE_INFINITY;
   }
 
   private connectedSeatedHumanCount(room: Room): number {
@@ -815,6 +1044,7 @@ export class RoomManager {
   }
 
   private resumeRoomIfNeeded(room: Room, now = Date.now()): boolean {
+    if (room.pauseReason === "STALLED_AUTOMATION") return false;
     if (!room.pausedAt) {
       if (room.emptySince && this.connectedSeatedHumanCount(room) > 0) {
         delete room.emptySince;
@@ -829,6 +1059,7 @@ export class RoomManager {
       room.tradeResponseDeadlines.set(tradeId, deadline + pausedDuration);
     }
     delete room.pausedAt;
+    delete room.pauseReason;
     delete room.emptySince;
     return true;
   }
@@ -845,22 +1076,7 @@ export class RoomManager {
     const previousState = room.game;
     const result = applyCommand(previousState, command);
     if (!result.ok) return { ok: false, code: result.error.code, message: result.error.message };
-    try {
-      await this.eventStore.appendEvents(room, result.value.events);
-      this.appendEvents(room, result.value.events);
-    } catch (error) {
-      return { ok: false, code: "EVENT_APPEND_FAILED", message: error instanceof Error ? error.message : "Event append failed" };
-    }
-    room.game = result.value.nextState;
-    this.touchRoom(room);
-    if (room.game.phase.type === "GAME_OVER") {
-      room.status = "FINISHED";
-      await this.eventStore.markFinished(room, room.game.phase.winnerId);
-    } else {
-      await this.eventStore.persistRoom(room);
-    }
-    this.refreshTimer(room, previousState);
-    return { ok: true, events: result.value.events, state: room.game };
+    return this.commitAcceptedEvents(room, previousState, result.value.nextState, result.value.events);
   }
 
   private async enqueueRoom<T>(roomId: string, task: () => Promise<T>): Promise<T> {
@@ -910,16 +1126,22 @@ export class RoomManager {
       chat: [],
       reports: [],
       processedClientCommands: new Map(),
-      tradeResponseDeadlines: new Map(),
+      tradeResponseDeadlines: new Map(Object.entries(record.tradeResponseDeadlines ?? {})),
     };
     if (record.emptySince) room.emptySince = record.emptySince;
     if (record.pausedAt) room.pausedAt = record.pausedAt;
+    if (record.pauseReason) room.pauseReason = record.pauseReason;
     if (record.archivedAt) room.archivedAt = record.archivedAt;
     if (record.cleanupReason) room.cleanupReason = record.cleanupReason;
     if (game) room.game = game;
     if (record.match?.board) room.board = record.match.board;
     if (room.game) {
-      this.rebuildTradeResponseDeadlines(room);
+      if (!record.tradeResponseDeadlines) this.rebuildTradeResponseDeadlines(room);
+      else {
+        for (const [tradeId] of room.tradeResponseDeadlines) {
+          if (room.game.trades[tradeId]?.status !== "COLLECTING_RESPONSES") room.tradeResponseDeadlines.delete(tradeId);
+        }
+      }
       this.refreshTimer(room);
     }
     return room;
@@ -959,17 +1181,13 @@ export class RoomManager {
     if (!botIds.has(trade.fromPlayerId)) {
       return { type: "EXPIRE_TRADE", playerId: trade.fromPlayerId, tradeId: trade.id, reason: "RESPONSE_TIMEOUT" };
     }
-    const view = createBotView(room.game, trade.fromPlayerId, this.botFor(trade.fromPlayerId).profile, room.game.config.botDifficulty ?? "medium");
     const candidates = tradeRecipientIds(room.game, trade)
       .filter((playerId) => trade.responses?.[playerId]?.status === "WANTS_ACCEPT")
       .filter((playerId) =>
         hasResources(room.game!.players[trade.fromPlayerId]?.resources ?? emptyResources(), trade.offered)
         && hasResources(room.game!.players[playerId]?.resources ?? emptyResources(), trade.requested),
       )
-      .map((playerId) => {
-        const afterHand = addResources(subtractResources(view.ownResources, trade.offered), trade.requested);
-        return { playerId, score: evaluateState(view, afterHand) };
-      })
+      .map((playerId) => ({ playerId, score: scoreTradeResponder(room.game!, trade, playerId, this.botFor(trade.fromPlayerId).profile, room.game!.config.botDifficulty ?? "medium") }))
       .sort((left, right) => right.score - left.score || room.game!.playerOrder.indexOf(left.playerId) - room.game!.playerOrder.indexOf(right.playerId));
     const selected = candidates[0]?.playerId;
     return selected
@@ -987,16 +1205,60 @@ export class RoomManager {
     return undefined;
   }
 
+  private automationProgressKey(room: Room): string {
+    const state = room.game;
+    const active = state && "activePlayerId" in state.phase ? state.phase.activePlayerId : "none";
+    const stagedTrade = state
+      ? Object.values(state.trades).find((trade) => trade.status === "COLLECTING_RESPONSES")?.id ?? "none"
+      : "none";
+    return [
+      room.status,
+      room.pauseReason ?? "none",
+      state?.eventSeq ?? 0,
+      state?.turn ?? 0,
+      state?.phase.type ?? "NO_GAME",
+      active,
+      stagedTrade,
+    ].join(":");
+  }
+
+  private async guardAutomationProgress(room: Room, now: number): Promise<boolean> {
+    const key = this.automationProgressKey(room);
+    const previous = this.automationProgress.get(room.id);
+    const next: AutomationProgress = previous?.key === key
+      ? { key, repeats: previous.repeats + 1, seenAt: now }
+      : { key, repeats: 1, seenAt: now };
+    this.automationProgress.set(room.id, next);
+    if (next.repeats <= this.cleanupPolicy.automationStallTickLimit) return true;
+    room.pausedAt = new Date(now).toISOString();
+    room.pauseReason = "STALLED_AUTOMATION";
+    this.touchRoom(room, now);
+    await this.eventStore.persistRoom(room);
+    this.updateRoomDueWork(room, now);
+    return false;
+  }
+
+  private automationCommandAllowed(room: Room, now: number): boolean {
+    const timestamps = this.automationCommandTimes.get(room.id) ?? [];
+    while (timestamps[0] && timestamps[0] < now - 60_000) timestamps.shift();
+    if (timestamps.length >= this.cleanupPolicy.maxAutomatedCommandsPerMinute) return false;
+    timestamps.push(now);
+    this.automationCommandTimes.set(room.id, timestamps);
+    return true;
+  }
+
   private async runDueBotAutomationNow(roomId: string, now: number): Promise<CommandResult | undefined> {
     const room = this.rooms.get(roomId);
     if (!room?.game || room.status !== "IN_GAME" || room.game.phase.type === "GAME_OVER") return undefined;
+    if (!await this.claimRoom(room)) return undefined;
     if (room.pausedAt) return undefined;
+    if (!await this.guardAutomationProgress(room, now)) return undefined;
 
     const dueTrade = this.dueTradeResponseCommand(room, now);
-    if (dueTrade) return this.applyInternalCommand(room, dueTrade);
+    if (dueTrade) return this.automationCommandAllowed(room, now) ? this.applyInternalCommand(room, dueTrade) : this.pauseForAutomationBudget(room, now);
 
     const tradeResponse = this.botTradeResponseCommand(room);
-    if (tradeResponse) return this.applyInternalCommand(room, tradeResponse);
+    if (tradeResponse) return this.automationCommandAllowed(room, now) ? this.applyInternalCommand(room, tradeResponse) : this.pauseForAutomationBudget(room, now);
 
     if (!("activePlayerId" in room.game.phase) || !this.botSeatIds(room).includes(room.game.phase.activePlayerId)) return undefined;
     const active = room.game.phase.activePlayerId;
@@ -1008,11 +1270,29 @@ export class RoomManager {
     if (command.type === "OFFER_TRADE" && hasEquivalentBotTradeOffer(view, command)) {
       command = { type: "END_TURN", playerId: active };
     }
+    if (command.type === "OFFER_TRADE") {
+      const cooldownKey = `${active}:${tradeShapeKey(command)}`;
+      const cooldownUntil = this.botTradeCooldowns.get(cooldownKey) ?? -1;
+      if (cooldownUntil >= room.game.turn) {
+        command = { type: "END_TURN", playerId: active };
+      } else {
+        this.botTradeCooldowns.set(cooldownKey, room.game.turn + this.cleanupPolicy.botTradeCooldownTurns);
+      }
+    }
     if (command.type === "PLACE_SETUP") {
       const setupCommand = command;
       const edgeId = room.game.board.adjacency.vertexToEdges[setupCommand.vertexId]?.find((candidate) => canBuildRoad(room.game!, setupCommand.playerId, candidate, setupCommand.vertexId));
       if (edgeId) command = { ...setupCommand, edgeId };
     }
-    return this.applyInternalCommand(room, command);
+    return this.automationCommandAllowed(room, now) ? this.applyInternalCommand(room, command) : this.pauseForAutomationBudget(room, now);
+  }
+
+  private async pauseForAutomationBudget(room: Room, now: number): Promise<CommandResult | undefined> {
+    room.pausedAt = new Date(now).toISOString();
+    room.pauseReason = "STALLED_AUTOMATION";
+    this.touchRoom(room, now);
+    await this.eventStore.persistRoom(room);
+    this.updateRoomDueWork(room, now);
+    return undefined;
   }
 }

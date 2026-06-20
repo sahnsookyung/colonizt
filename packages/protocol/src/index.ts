@@ -128,6 +128,8 @@ export interface PublicRoomPayload {
   code?: string;
   inviteUrl?: string;
   status: string;
+  pauseReason?: "EMPTY_ROOM" | "STALLED_AUTOMATION";
+  liveness?: "ACTIVE" | "IDLE_LOBBY" | "PAUSED_EMPTY" | "STALLED" | "FINISHED_UNLOADED" | "CLOSED";
   settings?: {
     botDifficulty?: BotDifficulty;
     rules?: GameConfig["rules"];

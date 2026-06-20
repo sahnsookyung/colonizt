@@ -47,9 +47,13 @@ import {
   terrainLabels,
 } from "./components/game-ui.js";
 import { useLocalAutomation } from "./hooks/useLocalAutomation.js";
+import { useNetworkRoom } from "./hooks/useNetworkRoom.js";
+import { useReplayControls } from "./hooks/useReplayControls.js";
 import { useSyncedRef } from "./hooks/useSyncedRef.js";
+import { useTradeDraft } from "./hooks/useTradeDraft.js";
+import { useTurnTimer } from "./hooks/useTurnTimer.js";
 import { createNetworkClient, type MatchSummary } from "./network.js";
-import { createDemoReplayLog, replayAtIndex, type ReplayLogState } from "./replay-state.js";
+import { createDemoReplayLog, replayAtIndex } from "./replay-state.js";
 import { clearResumeState, readResumeState, writeResumeState } from "./resume.js";
 import { playSound, playSoundForEvent } from "./sounds.js";
 import { normalizeTradeDraft, type TradeDraft } from "./trade-draft.js";
@@ -204,44 +208,69 @@ interface PublicRoomPayload {
   game?: ViewerState;
 }
 
-interface NetworkRoomInfo {
-  id: string;
-  code?: string;
-  inviteUrl?: string;
-}
+const networkErrorMessage = (input: unknown): string => {
+  const code = typeof input === "object" && input && "code" in input ? String((input as { code?: unknown }).code) : "";
+  switch (code) {
+    case "ROOM_NOT_FOUND":
+      return "Room not found";
+    case "ROOM_EXPIRED":
+      return "Room expired";
+    case "ROOM_ABANDONED":
+      return "Room abandoned";
+    case "ROOM_CLOSED":
+      return "Room closed";
+    case "ROOM_FULL":
+      return "Room is full";
+    case "ROOM_PAUSED":
+      return "Room is paused";
+    case "RATE_LIMITED":
+      return "Too many attempts. Try again shortly.";
+    case "UNAUTHORIZED":
+      return "Session expired";
+    default:
+      return input instanceof Error ? input.message : code || "Online action failed";
+  }
+};
 
 export const App = () => {
   const [state, setState] = useState<GameState>(() => createDemoGame("web-local"));
   const [events, setEvents] = useState<GameEvent[]>([]);
   const [serverViewer, setServerViewer] = useState<ViewerState | null>(null);
-  const [replayLog, setReplayLog] = useState<ReplayLogState | null>(null);
+  const { replayLog, setReplayLog, replayIndex, setReplayIndex } = useReplayControls();
   const [matchMenuOpen, setMatchMenuOpen] = useState(true);
   const [selectedEdge, setSelectedEdge] = useState<EdgeId | null>(null);
   const [selectedVertex, setSelectedVertex] = useState<VertexId | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [replayIndex, setReplayIndex] = useState<number | null>(null);
   const [historyMatches, setHistoryMatches] = useState<MatchSummary[]>([]);
   const [historyStatus, setHistoryStatus] = useState("History idle");
-  const [tradeOffer, setTradeOffer] = useState<ResourceBundle>(() => emptyResources());
-  const [tradeRequest, setTradeRequest] = useState<ResourceBundle>(() => emptyResources());
-  const [tradeOpen, setTradeOpen] = useState(false);
+  const { tradeOffer, setTradeOffer, tradeRequest, setTradeRequest, tradeOpen, setTradeOpen, setTradeDraft, clearTradeDraft } = useTradeDraft();
   const [selectedTradeResponder, setSelectedTradeResponder] = useState<PlayerId | null>(null);
   const [localTradeDeadlines, setLocalTradeDeadlines] = useState<Record<string, number>>({});
   const [buildMode, setBuildMode] = useState<BuildMode>("road");
   const [matchOptions, setMatchOptions] = useState<MatchOptions>(defaultMatchOptions);
   const [pendingSetupVertex, setPendingSetupVertex] = useState<VertexId | null>(null);
   const [diceAnimating, setDiceAnimating] = useState(false);
-  const [turnDeadline, setTurnDeadline] = useState<{ key: string; dueAt: number; durationMs: number; mode: "roll" | "action" } | null>(null);
-  const [nowMs, setNowMs] = useState(() => Date.now());
-  const [networkStatus, setNetworkStatus] = useState("Local game");
-  const [networkSession, setNetworkSession] = useState<{ token: string; userId: PlayerId } | null>(null);
-  const [networkRoomId, setNetworkRoomId] = useState<string | null>(null);
-  const [networkRoomInfo, setNetworkRoomInfo] = useState<NetworkRoomInfo | null>(null);
-  const socketRef = useRef<WebSocket | null>(null);
-  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const shouldReconnectRef = useRef(true);
-  const clientSeqRef = useRef(1);
-  const lastServerSeqRef = useRef(0);
+  const {
+    networkStatus,
+    setNetworkStatus,
+    networkSession,
+    setNetworkSession,
+    networkRoomId,
+    setNetworkRoomId,
+    networkRoomInfo,
+    setNetworkRoomInfo,
+    reconnectRetryAt,
+    pendingCommandCount,
+    socketRef,
+    shouldReconnectRef,
+    clientSeqRef,
+    lastServerSeqRef,
+    resetReconnectState,
+    scheduleReconnect,
+    retryReconnectNow,
+    markCommandPending,
+    clearPendingCommands,
+  } = useNetworkRoom();
   const stateRef = useSyncedRef(state);
   const eventsRef = useSyncedRef(events);
   const soundCursorRef = useRef<{ matchId: string; seq: number; initialized: boolean }>({ matchId: state.config.matchId, seq: 0, initialized: false });
@@ -303,7 +332,6 @@ export const App = () => {
   const stagedTradeDeadline = activeStagedTrade
     ? (viewer.tradeResponseDeadlines?.[activeStagedTrade.id] ?? localTradeDeadlines[activeStagedTrade.id])
     : undefined;
-  const stagedTradeSeconds = stagedTradeDeadline ? Math.max(0, Math.ceil((stagedTradeDeadline - nowMs) / 1000)) : undefined;
   const stagedRecipientIds = activeStagedTrade
     ? state.playerOrder.filter((playerId) =>
       playerId !== activeStagedTrade.fromPlayerId
@@ -321,10 +349,6 @@ export const App = () => {
   const canUpgradeCity = legalCities.size > 0;
   const canBuildSettlement = (legal.find((action) => action.type === "BUILD_SETTLEMENT")?.vertices.length ?? 0) > 0;
   const canBuildRoadAction = actionRoadEdges.length > 0;
-  const turnSecondsRemaining = turnDeadline ? Math.max(0, Math.ceil((turnDeadline.dueAt - nowMs) / 1000)) : undefined;
-  const turnTimerLabel = turnDeadline && turnSecondsRemaining !== undefined
-    ? `${turnDeadline.mode === "roll" ? "Roll" : "Action"} ${formatTimer(turnSecondsRemaining)}`
-    : undefined;
   const isWaitingForHumanTurn = state.phase.type !== "GAME_OVER" && !isHumanActive;
   const endTurnButtonLabel = isWaitingForHumanTurn ? "Waiting" : "End Turn";
   const setupSettlementActive = state.phase.type === "SETUP_PLACEMENT" && isHumanActive && !pendingSetupVertex;
@@ -348,13 +372,6 @@ export const App = () => {
     const player = targetState.players[humanPlayerId];
     return normalizeTradeDraft({ offer, request }, player?.resources ?? emptyResources(), bankRatiosForState(targetState, humanPlayerId));
   };
-
-  const setTradeDraft = (draft: TradeDraft) => {
-    setTradeOffer(draft.offer);
-    setTradeRequest(draft.request);
-  };
-
-  const clearTradeDraft = () => setTradeDraft({ offer: emptyResources(), request: emptyResources() });
 
   const setBotDifficulty = (botDifficulty: BotDifficulty) => {
     setMatchOptions((current) => ({ ...current, botDifficulty }));
@@ -413,6 +430,7 @@ export const App = () => {
     const started = performance.now();
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN && networkRoomId) {
       createNetworkClient().sendCommand(socketRef.current, networkRoomId, clientSeqRef.current, command);
+      markCommandPending();
       clientSeqRef.current += 1;
       if (networkSession) writeResumeState({ token: networkSession.token, userId: networkSession.userId, roomId: networkRoomId, clientSeq: clientSeqRef.current, lastSeq: lastServerSeqRef.current });
       if (command.type === "MARITIME_TRADE" || command.type === "OFFER_TRADE") {
@@ -426,6 +444,39 @@ export const App = () => {
     if (result.error) return;
     track("command_applied", { mode: "local", platform: platform(), command: command.type, latencyMs: performance.now() - started });
   };
+
+  const { nowMs, turnDeadline } = useTurnTimer({
+    state,
+    activePlayer,
+    paused: matchMenuOpen || replayIndex !== null,
+    networkRoomId,
+    rollDeadlineMs,
+    actionDeadlineMs,
+    onLocalTimeout: (key) => {
+      const current = stateRef.current;
+      const currentActive = "activePlayerId" in current.phase ? current.phase.activePlayerId : undefined;
+      const currentKey = current.phase.type !== "GAME_OVER" && currentActive
+        ? `${current.config.matchId}:${current.turn}:${current.phase.type}:${currentActive}`
+        : null;
+      if (currentKey !== key || currentActive !== humanPlayerId) return;
+      if (current.phase.type === "WAITING_FOR_ROLL") {
+        commit({ type: "ROLL_DICE", playerId: humanPlayerId });
+      } else if (current.phase.type === "ACTION_PHASE") {
+        const modalTrade = Object.values(current.trades).find((trade) => trade.status === "COLLECTING_RESPONSES" && trade.fromPlayerId === humanPlayerId);
+        if (modalTrade) {
+          const closed = applyLocalCommand({ type: "EXPIRE_TRADE", playerId: humanPlayerId, tradeId: modalTrade.id, reason: "RESPONSE_TIMEOUT" });
+          if (!closed.error) applyLocalCommand({ type: "END_TURN", playerId: humanPlayerId });
+        } else {
+          commit({ type: "END_TURN", playerId: humanPlayerId });
+        }
+      }
+    },
+  });
+  const stagedTradeSeconds = stagedTradeDeadline ? Math.max(0, Math.ceil((stagedTradeDeadline - nowMs) / 1000)) : undefined;
+  const turnSecondsRemaining = turnDeadline ? Math.max(0, Math.ceil((turnDeadline.dueAt - nowMs) / 1000)) : undefined;
+  const turnTimerLabel = turnDeadline && turnSecondsRemaining !== undefined
+    ? `${turnDeadline.mode === "roll" ? "Roll" : "Action"} ${formatTimer(turnSecondsRemaining)}`
+    : undefined;
 
   const cancelPendingSetupPlacement = () => {
     setPendingSetupVertex(null);
@@ -477,10 +528,8 @@ export const App = () => {
 
   const resetNetworkSession = () => {
     shouldReconnectRef.current = false;
-    if (reconnectTimerRef.current) {
-      clearTimeout(reconnectTimerRef.current);
-      reconnectTimerRef.current = null;
-    }
+    resetReconnectState();
+    clearPendingCommands();
     socketRef.current?.close();
     socketRef.current = null;
     setNetworkSession(null);
@@ -694,6 +743,7 @@ export const App = () => {
     const client = createNetworkClient();
     void client.connect(session.token, {
       onOpen: (openSocket) => {
+        resetReconnectState();
         socketRef.current = openSocket;
         openSocket.send(JSON.stringify({ type: "JOIN_ROOM", roomId }));
         if (ready) openSocket.send(JSON.stringify({ type: "READY", roomId, ready: true }));
@@ -701,6 +751,7 @@ export const App = () => {
       },
       onEvents: (incomingEvents, snapshot) => {
         setReplayLog(null);
+        clearPendingCommands();
         if (incomingEvents.length > 0) {
           const expectedSeq = lastServerSeqRef.current + 1;
           if (incomingEvents[0]!.seq !== expectedSeq && socketRef.current?.readyState === WebSocket.OPEN) {
@@ -750,28 +801,30 @@ export const App = () => {
         setNetworkStatus(`Online ${publicRoom.code ?? publicRoom.id} · ${publicRoom.status}`);
       },
       onError: (incomingError) => {
+        clearPendingCommands();
         const code = typeof incomingError === "object" && incomingError && "code" in incomingError ? String((incomingError as { code?: unknown }).code) : "";
         if (code === "ROOM_EXPIRED" || code === "ROOM_ABANDONED" || code === "ROOM_CLOSED") {
           resetNetworkSession();
           setNetworkStatus("Room closed");
         }
-        setError(JSON.stringify(incomingError));
+        setError(networkErrorMessage(incomingError));
       },
+      onAck: clearPendingCommands,
       onClose: () => {
         setNetworkStatus("Online connection closed");
-        if (!shouldReconnectRef.current) return;
-        if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = setTimeout(() => {
-          setNetworkStatus("Reconnecting...");
-          connectOnlineSession(session, roomId, false);
-        }, 750);
+        scheduleReconnect(() => connectOnlineSession(session, roomId, false));
       },
     }).then((socket) => {
       socketRef.current = socket;
     }).catch((connectError) => {
       setNetworkStatus("Online unavailable");
-      setError(connectError instanceof Error ? connectError.message : "Online connection failed");
+      setError(networkErrorMessage(connectError));
     });
+  };
+
+  const retryOnlineNow = () => {
+    if (!networkSession || !networkRoomId) return;
+    retryReconnectNow(() => connectOnlineSession(networkSession, networkRoomId, false));
   };
 
   const startOnlineRoom = async () => {
@@ -803,7 +856,7 @@ export const App = () => {
       track("room_creation_completed", { mode: "network", platform: platform(), taps: 1 });
     } catch (onlineError) {
       setNetworkStatus("Online unavailable");
-      setError(onlineError instanceof Error ? onlineError.message : "Online room failed");
+      setError(networkErrorMessage(onlineError));
     }
   };
 
@@ -814,26 +867,34 @@ export const App = () => {
   const joinOnlineRoom = async (roomId: string) => {
     try {
       setMatchMenuOpen(false);
-      setNetworkStatus("Joining online room...");
       const client = createNetworkClient();
+      setNetworkStatus("Looking up room...");
+      const lookup = await client.getRoom(roomId);
+      if (!lookup.ok) {
+        resetNetworkSession();
+        setNetworkStatus(networkErrorMessage(lookup));
+        setError(networkErrorMessage(lookup));
+        return;
+      }
+      setNetworkStatus("Joining online room...");
       const session = await client.createSession("Browser Player");
       setNetworkSession({ token: session.token, userId: session.userId });
-      setNetworkRoomId(roomId);
-      setNetworkRoomInfo({ id: roomId });
+      setNetworkRoomId(lookup.room.id);
+      setNetworkRoomInfo({ id: lookup.room.id, ...(lookup.room.code ? { code: lookup.room.code } : {}), ...(lookup.room.inviteUrl ? { inviteUrl: lookup.room.inviteUrl } : {}) });
       clientSeqRef.current = 1;
       lastServerSeqRef.current = 0;
-      writeResumeState({ token: session.token, userId: session.userId, roomId, clientSeq: clientSeqRef.current, lastSeq: lastServerSeqRef.current });
-      connectOnlineSession({ token: session.token, userId: session.userId }, roomId, false);
-      track("room_join_started", { mode: "network", platform: platform(), roomId });
+      writeResumeState({ token: session.token, userId: session.userId, roomId: lookup.room.id, clientSeq: clientSeqRef.current, lastSeq: lastServerSeqRef.current });
+      connectOnlineSession({ token: session.token, userId: session.userId }, lookup.room.id, false);
+      track("room_join_started", { mode: "network", platform: platform(), roomId: lookup.room.id });
     } catch (joinError) {
       setNetworkStatus("Online unavailable");
-      setError(joinError instanceof Error ? joinError.message : "Online join failed");
+      setError(networkErrorMessage(joinError));
     }
   };
 
   const cleanupOnlineSession = () => {
     shouldReconnectRef.current = false;
-    if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+    resetReconnectState();
     socketRef.current?.close();
   };
 
@@ -900,51 +961,6 @@ export const App = () => {
     if (!selectedTradeResponder || selectedResponderCanFinalize) return;
     setSelectedTradeResponder(null);
   }, [selectedResponderCanFinalize, selectedTradeResponder]);
-
-  useEffect(() => {
-    const phaseMode = state.phase.type === "WAITING_FOR_ROLL"
-      ? "roll"
-      : state.phase.type === "ACTION_PHASE"
-        ? "action"
-        : null;
-    if (!phaseMode || !activePlayer || matchMenuOpen || replayIndex !== null || state.phase.type === "GAME_OVER") {
-      setTurnDeadline(null);
-      return undefined;
-    }
-
-    const durationMs = phaseMode === "roll" ? rollDeadlineMs : actionDeadlineMs;
-    const key = `${state.config.matchId}:${state.turn}:${state.phase.type}:${activePlayer}`;
-    const dueAt = Date.now() + durationMs;
-    setNowMs(Date.now());
-    setTurnDeadline((current) => current?.key === key ? current : { key, dueAt, durationMs, mode: phaseMode });
-
-    const interval = setInterval(() => setNowMs(Date.now()), 1000);
-    const timeout = setTimeout(() => {
-      if (networkRoomId) return;
-      const current = stateRef.current;
-      const currentActive = "activePlayerId" in current.phase ? current.phase.activePlayerId : undefined;
-      const currentKey = current.phase.type !== "GAME_OVER" && currentActive
-        ? `${current.config.matchId}:${current.turn}:${current.phase.type}:${currentActive}`
-        : null;
-      if (currentKey !== key || currentActive !== humanPlayerId) return;
-      if (current.phase.type === "WAITING_FOR_ROLL") {
-        commit({ type: "ROLL_DICE", playerId: humanPlayerId });
-      } else if (current.phase.type === "ACTION_PHASE") {
-        const modalTrade = Object.values(current.trades).find((trade) => trade.status === "COLLECTING_RESPONSES" && trade.fromPlayerId === humanPlayerId);
-        if (modalTrade) {
-          const closed = applyLocalCommand({ type: "EXPIRE_TRADE", playerId: humanPlayerId, tradeId: modalTrade.id, reason: "RESPONSE_TIMEOUT" });
-          if (!closed.error) applyLocalCommand({ type: "END_TURN", playerId: humanPlayerId });
-        } else {
-          commit({ type: "END_TURN", playerId: humanPlayerId });
-        }
-      }
-    }, durationMs);
-
-    return () => {
-      clearInterval(interval);
-      clearTimeout(timeout);
-    };
-  }, [activePlayer, humanPlayerId, matchMenuOpen, networkRoomId, replayIndex, state.config.matchId, state.phase.type, state.turn]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1594,7 +1610,11 @@ export const App = () => {
                 <div className="room-share">
                   <span>Room Code</span>
                   <strong>{networkRoomInfo.code ?? networkRoomInfo.id}</strong>
+                  {pendingCommandCount > 0 ? <small>{pendingCommandCount} pending</small> : null}
+                  {reconnectRetryAt ? <small>Retry {Math.max(0, Math.ceil((reconnectRetryAt - nowMs) / 1000))}s</small> : null}
                   <button type="button" onClick={copyInvite}>Copy Invite</button>
+                  <button type="button" onClick={retryOnlineNow}>Retry</button>
+                  <button type="button" onClick={resetNetworkSession}>Leave</button>
                 </div>
               ) : null}
               <strong>{activeName ? `Active: ${activeName}` : "Game over"}</strong>

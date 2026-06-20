@@ -67,6 +67,23 @@ describe("REST routes", () => {
     expect(records).toEqual(expect.arrayContaining([expect.objectContaining({ event: "http.request", route: "/health", statusCode: 200 })]));
   });
 
+  it("gates metrics and admin leaderboard when an admin token is configured", async () => {
+    const app = await buildServer({ manager: new RoomManager(), adminToken: "secret-admin" });
+
+    const publicMetrics = await app.inject({ method: "GET", url: "/metrics" });
+    const authorizedMetrics = await app.inject({ method: "GET", url: "/metrics", headers: { "x-admin-token": "secret-admin" } });
+    const publicLeaderboard = await app.inject({ method: "GET", url: "/leaderboard" });
+    const authorizedLeaderboard = await app.inject({ method: "GET", url: "/leaderboard", headers: { authorization: "Bearer secret-admin" } });
+    await app.close();
+
+    expect(publicMetrics.statusCode).toBe(403);
+    expect(authorizedMetrics.statusCode).toBe(200);
+    expect(authorizedMetrics.body).toContain("colonizt_active_rooms");
+    expect(publicLeaderboard.statusCode).toBe(403);
+    expect(authorizedLeaderboard.statusCode).toBe(200);
+    expect(authorizedLeaderboard.json()).toMatchObject({ rankedPublicQueue: "deferred" });
+  });
+
   it("only records request DB failures for database-shaped errors", async () => {
     const metrics = new MetricsRegistry("route-test", "single");
     const app = await buildServer({ manager: new RoomManager(), metrics });
@@ -157,6 +174,30 @@ describe("REST routes", () => {
     expect(response.json()).toMatchObject({ reporterUserId: session.userId, reportedUserId: "bot_2", status: "OPEN" });
   });
 
+  it("rejects invalid moderation report payloads", async () => {
+    const manager = new RoomManager();
+    const session = await manager.createSession("Reporter");
+    const room = await manager.createRoom(session, { mode: "CLASSIC", botFill: true, ranked: false });
+    const app = await buildServer({ manager });
+
+    const blank = await app.inject({
+      method: "POST",
+      url: `/rooms/${room.id}/reports`,
+      headers: { "x-session-token": session.token },
+      payload: { reportedUserId: "bot_2", reason: "   " },
+    });
+    const long = await app.inject({
+      method: "POST",
+      url: `/rooms/${room.id}/reports`,
+      headers: { "x-session-token": session.token },
+      payload: { reportedUserId: "bot_2", reason: "x".repeat(501) },
+    });
+    await app.close();
+
+    expect(blank.statusCode).toBe(400);
+    expect(long.statusCode).toBe(400);
+  });
+
   it("issues websocket tickets only for authenticated sessions", async () => {
     const manager = new RoomManager();
     const session = await manager.createSession("Ticketed");
@@ -186,6 +227,30 @@ describe("REST routes", () => {
     expect(restartedManager.getSession(session.token)?.userId).toBe(session.userId);
   });
 
+  it("rejects websocket tickets for expired sessions", async () => {
+    const manager = new RoomManager();
+    const session = await manager.createSession("Expired");
+    session.expiresAt = new Date(Date.now() - 1).toISOString();
+    const app = await buildServer({ manager });
+
+    const response = await app.inject({ method: "POST", url: "/ws-tickets", headers: { "x-session-token": session.token } });
+    await app.close();
+
+    expect(response.statusCode).toBe(401);
+  });
+
+  it("rate limits repeated session creation by client address", async () => {
+    const app = await buildServer({ manager: new RoomManager() });
+    const responses = [];
+    for (let index = 0; index < 21; index += 1) {
+      responses.push(await app.inject({ method: "POST", url: "/sessions", payload: { displayName: `Guest ${index}` } }));
+    }
+    await app.close();
+
+    expect(responses.slice(0, 20).every((response) => response.statusCode === 200)).toBe(true);
+    expect(responses[20]?.statusCode).toBe(429);
+  });
+
   it("returns short room codes and resolves rooms by code", async () => {
     const manager = new RoomManager();
     const session = await manager.createSession("Host");
@@ -206,6 +271,22 @@ describe("REST routes", () => {
     expect(createdBody.inviteUrl).toBe(`https://colonizt.example/?room=${createdBody.code}`);
     expect(byCode.statusCode).toBe(200);
     expect(byCode.json()).toMatchObject({ id: createdBody.id, code: createdBody.code });
+  });
+
+  it("preflights persisted active room invite codes after a manager restart", async () => {
+    const store = new MemoryEventStore();
+    const originalManager = new RoomManager(store);
+    const session = await originalManager.createSession("Host");
+    const room = await originalManager.createRoom(session, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 4 });
+    const restartedManager = new RoomManager(store);
+    const app = await buildServer({ manager: restartedManager, publicWebUrl: "https://colonizt.example" });
+
+    const response = await app.inject({ method: "GET", url: `/rooms/${room.code}` });
+    await app.close();
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ id: room.id, code: room.code });
+    expect(restartedManager.roomForRef(room.id)?.id).toBe(room.id);
   });
 
   it("returns gone for archived room invite codes", async () => {

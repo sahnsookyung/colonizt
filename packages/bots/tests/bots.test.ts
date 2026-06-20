@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { completeSetup, createDemoGame, withResources } from "@colonizt/demo-state";
 import { applyCommand, emptyResources } from "@colonizt/game-core";
-import { chooseBotCommand, createBotView, evaluateTrade, greedyBot, hasEquivalentBotTradeOffer } from "../src/index.js";
+import { chooseBotCommand, createBotView, evaluateTrade, greedyBot, hasEquivalentBotTradeOffer, scoreTradeResponder } from "../src/index.js";
 
 describe("bot policies", () => {
   it("does not change decisions when opponent hidden hands change", () => {
@@ -31,6 +31,39 @@ describe("bot policies", () => {
     const baseline = evaluateTrade(view, trade, greedyBot.profile, "hard");
     expect(evaluateTrade(view, trade, greedyBot.profile, "hard")).toBe(baseline);
     expect(evaluateTrade(view, { ...trade, id: "stable-copy" }, greedyBot.profile, "hard")).toBe(baseline);
+  });
+
+  it("shares trade responder scoring for server and local automation", () => {
+    let state = completeSetup(createDemoGame("shared-trade-score", { botDifficulty: "hard" })).state;
+    state = { ...state, phase: { type: "ACTION_PHASE", activePlayerId: "p1" } };
+    state = withResources(state, "p1", { timber: 1 });
+    state = withResources(state, "p2", { ore: 1 });
+    const result = applyCommand(state, {
+      type: "OFFER_TRADE",
+      playerId: "p1",
+      tradeId: "shared-score",
+      offered: { ...emptyResources(), timber: 1 },
+      requested: { ...emptyResources(), ore: 1 },
+      recipients: "ANY",
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("Expected trade offer to open");
+
+    const trade = result.value.nextState.trades["shared-score"]!;
+    const score = scoreTradeResponder(result.value.nextState, trade, "p2", greedyBot.profile, "hard");
+    expect(Number.isFinite(score)).toBe(true);
+    expect(scoreTradeResponder(result.value.nextState, trade, "p2", greedyBot.profile, "hard")).toBe(score);
+  });
+
+  it("only chooses commands accepted by the engine preview path", () => {
+    for (let index = 0; index < 40; index += 1) {
+      let state = completeSetup(createDemoGame(`legal-preview-${index}`, { botDifficulty: "medium" })).state;
+      state = { ...state, phase: { type: "ACTION_PHASE", activePlayerId: "p2" } };
+      state = withResources(state, "p2", { timber: 2, brick: 2, grain: 2, fiber: 2, ore: 2 });
+      const command = chooseBotCommand(createBotView(state, "p2", greedyBot.profile), greedyBot.profile, () => `preview-trade-${index}`);
+      if (!command) continue;
+      expect(applyCommand(state, command).ok).toBe(true);
+    }
   });
 
   it("does not repeat an equivalent bot trade after it has been cancelled", () => {

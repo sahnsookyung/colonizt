@@ -13,61 +13,94 @@ export interface RoomAutomationSchedulerOptions {
 }
 
 export class RoomAutomationScheduler {
-  private automationInterval: ReturnType<typeof setInterval> | undefined;
-  private cleanupInterval: ReturnType<typeof setInterval> | undefined;
+  private automationTimer: ReturnType<typeof setTimeout> | undefined;
+  private cleanupTimer: ReturnType<typeof setTimeout> | undefined;
+  private running = false;
 
   constructor(private readonly options: RoomAutomationSchedulerOptions) {}
 
   start(): void {
-    if (this.automationInterval || this.cleanupInterval) return;
+    if (this.running) return;
+    this.running = true;
     this.options.logger.info("scheduler.started", {
-      automationIntervalMs: this.options.automationIntervalMs ?? 1000,
+      automationIntervalMs: this.options.automationIntervalMs ?? "due-work",
       cleanupIntervalMs: this.options.cleanupIntervalMs,
       cleanupPolicy: this.options.cleanupPolicy,
     });
-    this.automationInterval = setInterval(() => {
-      void this.tickAutomation().catch((error) => this.recordFailure("automation", error));
-    }, this.options.automationIntervalMs ?? 1000);
-    this.automationInterval.unref?.();
+    this.scheduleAutomation(0);
+    this.scheduleCleanup(this.options.cleanupIntervalMs ?? 30_000);
+  }
 
-    this.cleanupInterval = setInterval(() => {
+  private scheduleAutomation(delayMs: number): void {
+    if (!this.running) return;
+    this.automationTimer = setTimeout(() => {
+      void this.tickAutomation().catch((error) => this.recordFailure("automation", error));
+    }, delayMs);
+    this.automationTimer.unref?.();
+  }
+
+  private scheduleCleanup(delayMs: number): void {
+    if (!this.running) return;
+    this.cleanupTimer = setTimeout(() => {
       void this.tickCleanup().catch((error) => this.recordFailure("cleanup", error));
-    }, this.options.cleanupIntervalMs ?? 30_000);
-    this.cleanupInterval.unref?.();
+    }, delayMs);
+    this.cleanupTimer.unref?.();
   }
 
   stop(): void {
-    if (this.automationInterval) clearInterval(this.automationInterval);
-    if (this.cleanupInterval) clearInterval(this.cleanupInterval);
-    this.automationInterval = undefined;
-    this.cleanupInterval = undefined;
+    this.running = false;
+    if (this.automationTimer) clearTimeout(this.automationTimer);
+    if (this.cleanupTimer) clearTimeout(this.cleanupTimer);
+    this.automationTimer = undefined;
+    this.cleanupTimer = undefined;
     this.options.logger.info("scheduler.stopped");
   }
 
   async tickAutomation(): Promise<void> {
     this.options.metrics.recordScheduler("automation_tick");
-    for (const room of this.options.manager.rooms.values()) {
-      const expired = await this.options.manager.expireTurn(room.id);
-      if (expired?.ok && expired.events.length > 0) {
-        this.options.metrics.recordScheduler("turn_expired");
-        this.options.onEvents(room.id, expired);
-      }
-      const bot = await this.options.manager.runDueBotAutomation(room.id);
-      if (bot?.ok && bot.events.length > 0) {
-        this.options.metrics.recordScheduler("bot_automation");
-        this.options.onEvents(room.id, bot);
+    const now = Date.now();
+    for (const roomId of this.options.manager.dueAutomationRoomIds(now)) {
+      try {
+        const expired = await this.options.manager.expireTurn(roomId, now);
+        if (expired?.ok && expired.events.length > 0) {
+          this.options.metrics.recordScheduler("turn_expired");
+          if (expired.events.some((event) => event.type === "TURN_ENDED")) this.options.metrics.recordScheduler("forced_end_turn");
+          if (expired.events.some((event) => event.type === "TRADE_CLOSED" && event.reason === "RESPONSE_TIMEOUT")) this.options.metrics.recordScheduler("trade_timeout");
+          this.options.onEvents(roomId, expired);
+        }
+        const bot = await this.options.manager.runDueBotAutomation(roomId, now);
+        if (bot?.ok && bot.events.length > 0) {
+          this.options.metrics.recordScheduler("bot_automation");
+          if (bot.events.some((event) => event.type === "TURN_ENDED")) this.options.metrics.recordScheduler("forced_end_turn");
+          if (bot.events.some((event) => event.type === "TRADE_CLOSED" && event.reason === "RESPONSE_TIMEOUT")) this.options.metrics.recordScheduler("trade_timeout");
+          this.options.onEvents(roomId, bot);
+        }
+        if (this.options.manager.rooms.get(roomId)?.pauseReason === "STALLED_AUTOMATION") {
+          this.options.metrics.recordScheduler("stalled_automation");
+        }
+      } finally {
+        this.options.manager.refreshRoomDueWork(roomId, Date.now());
       }
     }
+    const nextDue = this.options.manager.nextAutomationDueAt(Date.now());
+    const fallback = this.options.automationIntervalMs ?? 1000;
+    this.scheduleAutomation(nextDue ? Math.max(0, Math.min(nextDue - Date.now(), fallback)) : fallback);
   }
 
   async tickCleanup(): Promise<void> {
     this.options.metrics.recordScheduler("cleanup_tick");
-    const closedRooms = await this.options.manager.cleanupRooms();
+    const now = Date.now();
+    const dueRoomIds = this.options.manager.dueCleanupRoomIds(now);
+    const closedRooms = await this.options.manager.cleanupRooms(now, dueRoomIds);
     for (const closed of closedRooms) {
-      this.options.metrics.recordRoomCleanup(closed.status);
+      this.options.metrics.recordRoomCleanup(closed.status, closed.cleanupReason ?? "none");
       this.options.logger.info("room.cleaned", closed);
       this.options.onRoomClosed(closed);
     }
+    for (const roomId of dueRoomIds) this.options.manager.refreshRoomDueWork(roomId, Date.now());
+    const nextDue = this.options.manager.nextCleanupDueAt(Date.now());
+    const fallback = this.options.cleanupIntervalMs ?? 30_000;
+    this.scheduleCleanup(nextDue ? Math.max(0, Math.min(nextDue - Date.now(), fallback)) : fallback);
   }
 
   private recordFailure(operation: string, error: unknown): void {

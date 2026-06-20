@@ -3,14 +3,14 @@
 ## REST
 
 - `GET /health` returns service health and active presence adapter (`memory` or `redis`).
-- `GET /metrics` returns Prometheus-style operational metrics for the active single-node server.
+- `GET /metrics` returns Prometheus-style operational metrics for the active single-node server. When `ADMIN_TOKEN` is set, callers must send it as `Authorization: Bearer ...` or `x-admin-token`.
 - `GET /config` returns browser runtime configuration, protocol version, WebSocket auth mode, node ID, and instance mode.
 - `GET /rooms` lists lobby rooms.
 - `POST /rooms` creates a private room.
 - `GET /matches?limit=20` lists persisted match summaries.
 - `GET /matches/:id` returns a persisted match summary by match ID or room ID.
 - `GET /matches/:id/replay` returns full replay config and events by match ID or room ID for seated players with a valid session token.
-- `GET /leaderboard` returns simulated/admin-only ranking data.
+- `GET /leaderboard` returns simulated/admin-only ranking data and uses the same optional `ADMIN_TOKEN` gate as metrics.
 - `POST /sessions` creates a guest session token.
 - `POST /rooms/:roomId/reports` creates a moderation report for a seated user.
 
@@ -42,4 +42,4 @@ Server messages:
 
 ## Operations Metrics
 
-`GET /metrics` is intended for operators and reverse-proxy-controlled access. It includes active rooms, connected sockets, command outcomes and latency, replay load outcomes, room cleanup counts, scheduler actions, WebSocket lifecycle events, and DB failure counters. Deployment config should expose it only to trusted monitoring paths.
+`GET /metrics` is intended for operators and reverse-proxy-controlled access. It includes active rooms, connected sockets, command outcomes and latency, replay load outcomes, room cleanup counts with reasons, scheduler actions, WebSocket lifecycle events, and DB failure counters. Deployment config should expose it only to trusted monitoring paths or set `ADMIN_TOKEN`.

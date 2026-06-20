@@ -16,4 +16,15 @@ describe("PresenceStore", () => {
     expect(await store.roomUserCount("room_1")).toBe(1);
     expect(await store.roomUserIds("room_1")).toEqual(new Set(["u_1"]));
   });
+
+  it("refreshes existing socket presence without dropping room membership", async () => {
+    const store = new MemoryPresenceStore();
+    const session: Session = { token: "s_1", userId: "u_1", displayName: "Soo" };
+    await store.connect(session, "socket-a");
+    await store.joinRoom(session, "socket-a", "room_1");
+
+    await store.refresh(session, "socket-a");
+
+    expect(await store.roomUserIds("room_1")).toEqual(new Set(["u_1"]));
+  });
 });

@@ -42,11 +42,12 @@ See `docs/deployment.md` for environment variables, health checks, migrations, a
 - `packages/web`: React client, board renderer, mobile layout, local and network play.
 - `packages/db`: migrations and persistence helpers.
 - `packages/test-utils`: bots, simulations, fixture helpers.
-- `docs`: architecture, MVP rules, API, replay format, testing, and interview notes.
+- `docs`: architecture, MVP rules, API, replay format, testing, next improvements, and interview notes.
 - Bot trade decisions and optional rule toggles are documented in `docs/bot-trade-and-rules.md`.
 
 ## What I Would Improve Next
 
+- See `docs/next-improvements.md` for the current prioritized deep dive across liveness, room recovery, durability, UX, scalability, and security.
 - Move from the MVP no-op seven rule to a full robber/discard flow.
 - Add ports and a map editor after the replay and reconnect gates are stable.
 - Replace the local/admin ranked simulation with a public ranked queue only after moderation, mobile, and replay workflows are strong.

@@ -1,15 +1,13 @@
 import { useCallback, useEffect, useRef, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
 import {
-  addResources,
   emptyResources,
   hasResources,
-  subtractResources,
   type GameCommand,
   type GameEvent,
   type GameState,
   type PlayerId,
 } from "@colonizt/game-core";
-import { createBotTradeId, createBotView, evaluateState, evaluateTrade, greedyBot, randomLegalBot } from "@colonizt/bots";
+import { createBotTradeId, createBotView, evaluateTrade, greedyBot, randomLegalBot, scoreTradeResponder } from "@colonizt/bots";
 import { isLocalBotPlayer, localBotAutomationKey, localBotIds, nextLocalTradeDeadlines } from "../local-automation.js";
 
 const botById = {
@@ -163,7 +161,6 @@ export const useLocalAutomation = ({
           return;
         }
         const controller = botById[currentTrade.fromPlayerId as keyof typeof botById] ?? greedyBot;
-        const view = createBotView(current, currentTrade.fromPlayerId, controller.profile);
         const candidates = current.playerOrder
           .filter((playerId) => playerId !== currentTrade.fromPlayerId)
           .filter((playerId) => currentTrade.recipients === "ANY" || currentTrade.recipients.includes(playerId))
@@ -172,10 +169,7 @@ export const useLocalAutomation = ({
             hasResources(current.players[currentTrade.fromPlayerId]?.resources ?? emptyResources(), currentTrade.offered)
             && hasResources(current.players[playerId]?.resources ?? emptyResources(), currentTrade.requested),
           )
-          .map((playerId) => ({
-            playerId,
-            score: evaluateState(view, addResources(subtractResources(view.ownResources, currentTrade.offered), currentTrade.requested)) - (current.players[playerId]?.score ?? 0) * 0.03,
-          }))
+          .map((playerId) => ({ playerId, score: scoreTradeResponder(current, currentTrade, playerId, controller.profile, current.config.botDifficulty ?? "medium") }))
           .sort((left, right) => right.score - left.score || current.playerOrder.indexOf(left.playerId) - current.playerOrder.indexOf(right.playerId));
         const selected = candidates[0]?.playerId;
         applyLocalCommandRef.current(selected

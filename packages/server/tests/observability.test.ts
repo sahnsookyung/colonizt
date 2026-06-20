@@ -10,7 +10,7 @@ describe("observability", () => {
     metrics.recordCommand("rejected", "BUILD_ROAD", 2);
     metrics.recordReplay("loaded");
     metrics.recordDbFailure("append_events");
-    metrics.recordRoomCleanup("EXPIRED");
+    metrics.recordRoomCleanup("EXPIRED", "EMPTY_LOBBY_TTL");
     metrics.recordWebSocket("connected");
 
     const rendered = metrics.render(manager, 1, "memory");
@@ -18,7 +18,7 @@ describe("observability", () => {
     expect(rendered).toContain('colonizt_commands_total{node_id="node-a",instance_mode="single",outcome="rejected",command="BUILD_ROAD"} 1');
     expect(rendered).toContain('colonizt_replay_loads_total{node_id="node-a",instance_mode="single",outcome="loaded"} 1');
     expect(rendered).toContain('colonizt_db_failures_total{node_id="node-a",instance_mode="single",operation="append_events"} 1');
-    expect(rendered).toContain('colonizt_room_cleanup_total{node_id="node-a",instance_mode="single",status="EXPIRED"} 1');
+    expect(rendered).toContain('colonizt_room_cleanup_total{node_id="node-a",instance_mode="single",status="EXPIRED",reason="EMPTY_LOBBY_TTL"} 1');
     expect(rendered).toContain('colonizt_websocket_events_total{node_id="node-a",instance_mode="single",event="connected",reason="none"} 1');
   });
 

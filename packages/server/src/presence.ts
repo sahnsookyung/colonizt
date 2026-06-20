@@ -7,6 +7,7 @@ export interface PresenceStore {
   kind: "memory" | "redis";
   connect(session: Session, socketId: string): Promise<void>;
   joinRoom(session: Session, socketId: string, roomId: string): Promise<void>;
+  refresh(session: Session, socketId: string, roomId?: string): Promise<void>;
   disconnect(session: Session, socketId: string, roomId?: string): Promise<void>;
   roomUserCount(roomId: string): Promise<number>;
   roomUserIds(roomId: string): Promise<Set<string>>;
@@ -23,6 +24,12 @@ export class MemoryPresenceStore implements PresenceStore {
 
   async joinRoom(session: Session, socketId: string, roomId: string): Promise<void> {
     this.sockets.set(socketId, { userId: session.userId, roomId });
+  }
+
+  async refresh(session: Session, socketId: string, roomId?: string): Promise<void> {
+    const current = this.sockets.get(socketId);
+    const nextRoomId = roomId ?? current?.roomId;
+    this.sockets.set(socketId, nextRoomId ? { userId: session.userId, roomId: nextRoomId } : { userId: session.userId });
   }
 
   async disconnect(_session: Session, socketId: string, _roomId?: string): Promise<void> {
@@ -59,8 +66,20 @@ export class RedisPresenceStore implements PresenceStore {
 
   async joinRoom(session: Session, socketId: string, roomId: string): Promise<void> {
     await this.client.hSet(this.socketKey(socketId), { roomId });
+    await this.refresh(session, socketId, roomId);
     await this.client.sAdd(this.roomKey(roomId), socketId);
     await this.client.expire(this.roomKey(roomId), 3600);
+  }
+
+  async refresh(session: Session, socketId: string, roomId?: string): Promise<void> {
+    await this.client.hSet(this.socketKey(socketId), {
+      userId: session.userId,
+      displayName: session.displayName,
+      lastSeenAt: new Date().toISOString(),
+      ...(roomId ? { roomId } : {}),
+    });
+    await this.client.expire(this.socketKey(socketId), 90);
+    if (roomId) await this.client.expire(this.roomKey(roomId), 3600);
   }
 
   async disconnect(_session: Session, socketId: string, roomId?: string): Promise<void> {

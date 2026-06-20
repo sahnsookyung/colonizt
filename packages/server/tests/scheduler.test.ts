@@ -36,6 +36,7 @@ describe("RoomAutomationScheduler", () => {
     await manager.setReady(room.id, session, true);
     if (!room.timer) throw new Error("missing room timer");
     room.timer.expiresAt = Date.now() - 1;
+    manager.refreshRoomDueWork(room.id);
     const events: Array<{ roomId: string; result: Extract<CommandResult, { ok: true }> }> = [];
     const scheduler = new RoomAutomationScheduler({
       manager,
@@ -50,6 +51,23 @@ describe("RoomAutomationScheduler", () => {
 
     expect(events[0]?.roomId).toBe(room.id);
     expect(events[0]?.result.events.length).toBeGreaterThan(0);
+  });
+
+  it("uses due room work instead of scanning every active room", async () => {
+    const manager = new RoomManager();
+    const session = await manager.createSession("Host");
+    const dueRoom = await manager.createRoom(session, { mode: "CLASSIC", botFill: true, ranked: false });
+    await manager.setReady(dueRoom.id, session, true);
+    await manager.syncConnections(dueRoom.id, new Set([session.userId]));
+    if (!dueRoom.timer) throw new Error("missing due timer");
+    dueRoom.timer.expiresAt = Date.now() - 1;
+    manager.refreshRoomDueWork(dueRoom.id);
+
+    const idleSession = await manager.createSession("Idle");
+    const idleRoom = await manager.createRoom(idleSession, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 4 });
+
+    expect(manager.dueAutomationRoomIds()).toContain(dueRoom.id);
+    expect(manager.dueAutomationRoomIds()).not.toContain(idleRoom.id);
   });
 
   it("reports cleaned rooms through the close callback", async () => {

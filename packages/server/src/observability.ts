@@ -89,8 +89,8 @@ export class MetricsRegistry {
     this.increment("db_failures_total", { operation });
   }
 
-  recordRoomCleanup(status: string): void {
-    this.increment("room_cleanup_total", { status });
+  recordRoomCleanup(status: string, reason = "none"): void {
+    this.increment("room_cleanup_total", { status, reason });
   }
 
   recordScheduler(event: string): void {
@@ -109,6 +109,12 @@ export class MetricsRegistry {
       "# HELP colonizt_presence_adapter Presence adapter kind.",
       "# TYPE colonizt_presence_adapter gauge",
       metricLine("colonizt_presence_adapter", { ...labels, kind: presenceKind }, 1),
+      "# HELP colonizt_room_liveness Active room liveness states.",
+      "# TYPE colonizt_room_liveness gauge",
+      ...Object.entries(manager.livenessCounts()).map(([state, count]) => metricLine("colonizt_room_liveness", { ...labels, state }, count)),
+      "# HELP colonizt_room_pause_reasons Active room pause reasons.",
+      "# TYPE colonizt_room_pause_reasons gauge",
+      ...Object.entries(manager.pauseReasonCounts()).map(([reason, count]) => metricLine("colonizt_room_pause_reasons", { ...labels, reason }, count)),
       "# HELP colonizt_command_latency_ms Average accepted/replayed command latency.",
       "# TYPE colonizt_command_latency_ms gauge",
       metricLine("colonizt_command_latency_ms", labels, this.commandLatencyCount > 0 ? this.commandLatencyTotalMs / this.commandLatencyCount : 0),

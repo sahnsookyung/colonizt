@@ -2,6 +2,7 @@ import type pg from "pg";
 import type { BoardGraph, GameConfig, GameEvent, GameState } from "@colonizt/game-core";
 import {
   appendMatchEvents,
+  commitMatchEvents,
   findPersistedRoomByRef,
   findCommandResult,
   findPersistedSessionByTokenHash,
@@ -42,6 +43,8 @@ export interface StoredRoomRecord {
   lastActivityAt?: string;
   emptySince?: string;
   pausedAt?: string;
+  pauseReason?: Room["pauseReason"];
+  tradeResponseDeadlines?: Record<string, number>;
   archivedAt?: string;
   cleanupReason?: string;
   seats: Room["seats"];
@@ -61,6 +64,7 @@ export interface EventStore {
   persistRoom(room: Room): Promise<void>;
   persistMatchStart(room: Room, state: GameState): Promise<void>;
   appendEvents(room: Room, events: GameEvent[]): Promise<void>;
+  commitEvents?(room: Room, events: GameEvent[], result?: StoredCommandResult): Promise<void>;
   markFinished(room: Room, winnerId: string): Promise<void>;
   persistChat(room: Room, chat: ChatMessage): Promise<void>;
   persistReport(room: Room, report: Report): Promise<void>;
@@ -181,6 +185,8 @@ export class MemoryEventStore implements EventStore {
     };
     if (room.emptySince) record.emptySince = room.emptySince;
     if (room.pausedAt) record.pausedAt = room.pausedAt;
+    if (room.pauseReason) record.pauseReason = room.pauseReason;
+    if (room.tradeResponseDeadlines.size > 0) record.tradeResponseDeadlines = Object.fromEntries(room.tradeResponseDeadlines);
     if (room.archivedAt) record.archivedAt = room.archivedAt;
     if (room.cleanupReason) record.cleanupReason = room.cleanupReason;
     if (room.game) {
@@ -199,11 +205,42 @@ export class MemoryEventStore implements EventStore {
   }
 
   async persistCommandResult(result: StoredCommandResult): Promise<void> {
-    this.commandResults.set(`${result.roomId}:${result.userId}:${result.clientSeq}`, result);
+    const key = `${result.roomId}:${result.userId}:${result.clientSeq}`;
+    if (this.commandResults.has(key)) {
+      throw Object.assign(new Error(`Command result already exists for ${key}`), { code: "COMMAND_RESULT_CONFLICT" });
+    }
+    this.commandResults.set(key, result);
   }
 
   async loadCommandResult(roomId: string, userId: string, clientSeq: number): Promise<StoredCommandResult | undefined> {
     return this.commandResults.get(`${roomId}:${userId}:${clientSeq}`);
+  }
+
+  async commitEvents(room: Room, events: GameEvent[], result?: StoredCommandResult): Promise<void> {
+    const matchId = room.game?.config.matchId;
+    const previousLog = matchId ? this.replayLogs.get(matchId) : undefined;
+    const previousLogCopy = previousLog ? { ...previousLog, events: [...previousLog.events] } : undefined;
+    const commandKey = result ? `${result.roomId}:${result.userId}:${result.clientSeq}` : undefined;
+    const previousCommandResult = commandKey ? this.commandResults.get(commandKey) : undefined;
+    const previousRoom = this.rooms.get(room.id);
+    try {
+      await this.appendEvents(room, events);
+      if (result) await this.persistCommandResult(result);
+      if (room.game?.phase.type === "GAME_OVER") await this.markFinished(room, room.game.phase.winnerId);
+      await this.persistRoom(room);
+    } catch (error) {
+      if (matchId) {
+        if (previousLogCopy) this.replayLogs.set(matchId, previousLogCopy);
+        else this.replayLogs.delete(matchId);
+      }
+      if (commandKey) {
+        if (previousCommandResult) this.commandResults.set(commandKey, previousCommandResult);
+        else this.commandResults.delete(commandKey);
+      }
+      if (previousRoom) this.rooms.set(room.id, previousRoom);
+      else this.rooms.delete(room.id);
+      throw error;
+    }
   }
 }
 
@@ -243,6 +280,8 @@ export class PostgresEventStore implements EventStore {
       lastActivityAt: room.lastActivityAt,
       ...(room.emptySince ? { emptySince: room.emptySince } : {}),
       ...(room.pausedAt ? { pausedAt: room.pausedAt } : {}),
+      ...(room.pauseReason ? { pauseReason: room.pauseReason } : {}),
+      ...(room.tradeResponseDeadlines.size > 0 ? { tradeResponseDeadlines: Object.fromEntries(room.tradeResponseDeadlines) } : {}),
       ...(room.archivedAt ? { archivedAt: room.archivedAt } : {}),
       ...(room.cleanupReason ? { cleanupReason: room.cleanupReason } : {}),
     });
@@ -268,6 +307,46 @@ export class PostgresEventStore implements EventStore {
   async appendEvents(room: Room, events: GameEvent[]): Promise<void> {
     if (!room.game) throw new Error("Cannot append events before game start");
     await appendMatchEvents(this.pool, room.game.config.matchId, events.map((event) => ({ seq: event.seq, type: event.type, payload: event })));
+  }
+
+  async commitEvents(room: Room, events: GameEvent[], result?: StoredCommandResult): Promise<void> {
+    if (!room.game) throw new Error("Cannot commit events before game start");
+    const persistedRoom = {
+      id: room.id,
+      mode: room.settings.mode,
+      status: room.status,
+      hostUserId: room.hostUserId,
+      settings: room.settings,
+      seats: room.seats,
+      code: room.code,
+      lastActivityAt: room.lastActivityAt,
+      ...(room.emptySince ? { emptySince: room.emptySince } : {}),
+      ...(room.pausedAt ? { pausedAt: room.pausedAt } : {}),
+      ...(room.pauseReason ? { pauseReason: room.pauseReason } : {}),
+      ...(room.tradeResponseDeadlines.size > 0 ? { tradeResponseDeadlines: Object.fromEntries(room.tradeResponseDeadlines) } : {}),
+      ...(room.archivedAt ? { archivedAt: room.archivedAt } : {}),
+      ...(room.cleanupReason ? { cleanupReason: room.cleanupReason } : {}),
+    };
+    const persistedResult = result ? {
+      roomId: result.roomId,
+      userId: result.userId,
+      clientSeq: result.clientSeq,
+      commandHash: result.commandHash,
+      ok: result.ok,
+      ...(result.matchId ? { matchId: result.matchId } : {}),
+      ...(result.seqStart !== undefined ? { seqStart: result.seqStart } : {}),
+      ...(result.seqEnd !== undefined ? { seqEnd: result.seqEnd } : {}),
+      ...(result.events ? { events: result.events } : {}),
+      ...(result.rejectionCode ? { rejectionCode: result.rejectionCode } : {}),
+      ...(result.rejectionMessage ? { rejectionMessage: result.rejectionMessage } : {}),
+    } : undefined;
+    await commitMatchEvents(this.pool, {
+      room: persistedRoom,
+      matchId: room.game.config.matchId,
+      events: events.map((event) => ({ seq: event.seq, type: event.type, payload: event })),
+      ...(persistedResult ? { commandResult: persistedResult } : {}),
+      ...(room.game.phase.type === "GAME_OVER" ? { winnerUserId: room.game.phase.winnerId } : {}),
+    });
   }
 
   async markFinished(room: Room, winnerId: string): Promise<void> {
@@ -337,6 +416,8 @@ export class PostgresEventStore implements EventStore {
         ...(record.lastActivityAt ? { lastActivityAt: record.lastActivityAt } : {}),
         ...(record.emptySince ? { emptySince: record.emptySince } : {}),
         ...(record.pausedAt ? { pausedAt: record.pausedAt } : {}),
+        ...(record.pauseReason ? { pauseReason: record.pauseReason as Room["pauseReason"] } : {}),
+        ...(record.tradeResponseDeadlines ? { tradeResponseDeadlines: record.tradeResponseDeadlines } : {}),
         ...(record.archivedAt ? { archivedAt: record.archivedAt } : {}),
         ...(record.cleanupReason ? { cleanupReason: record.cleanupReason } : {}),
         seats: record.seats,
@@ -368,6 +449,8 @@ export class PostgresEventStore implements EventStore {
       ...(record.lastActivityAt ? { lastActivityAt: record.lastActivityAt } : {}),
       ...(record.emptySince ? { emptySince: record.emptySince } : {}),
       ...(record.pausedAt ? { pausedAt: record.pausedAt } : {}),
+      ...(record.pauseReason ? { pauseReason: record.pauseReason as Room["pauseReason"] } : {}),
+      ...(record.tradeResponseDeadlines ? { tradeResponseDeadlines: record.tradeResponseDeadlines } : {}),
       ...(record.archivedAt ? { archivedAt: record.archivedAt } : {}),
       ...(record.cleanupReason ? { cleanupReason: record.cleanupReason } : {}),
       seats: record.seats,

@@ -17,6 +17,7 @@ This starts PostgreSQL, the Fastify server on `http://127.0.0.1:8787`, and the s
 - `SERVER_HOST`: bind host, usually `0.0.0.0` in containers.
 - `SERVER_PORT`: server port, default `8787`.
 - `WEB_ORIGIN`: allowed browser origin for CORS.
+- `ADMIN_TOKEN`: optional bearer or `x-admin-token` secret required for `/metrics` and `/leaderboard` when set.
 - `VITE_API_BASE_URL`: optional legacy web build-time API fallback for local or custom builds. Leave unset for portable production images; browsers should discover the public API through `GET /config`.
 - `MAX_ACTIVE_ROOMS`: cap for active in-memory rooms, default `200`.
 - `ROOM_CLEANUP_INTERVAL_MS`: abandoned-room cleanup cadence, default `30000`.
@@ -29,12 +30,12 @@ This starts PostgreSQL, the Fastify server on `http://127.0.0.1:8787`, and the s
 - Run migrations with `npm --workspace @colonizt/db run migrate`.
 - `GET /health` is the server health check.
 - `GET /config` is the canonical browser runtime configuration source. Reverse proxies should route it to the server so the same web image can move between environments.
-- `GET /metrics` returns Prometheus-style operational metrics. Expose it only through trusted monitoring or admin proxy rules.
+- `GET /metrics` returns Prometheus-style operational metrics. Set `ADMIN_TOKEN` or expose it only through trusted monitoring or admin proxy rules.
 - The server handles `SIGTERM` and `SIGINT` by closing Fastify, draining WebSockets through Fastify shutdown, and closing the PostgreSQL pool.
 - On startup with `DATABASE_URL`, the server runs migrations and hydrates recent rooms from PostgreSQL event logs.
 - Rooms have short share codes and invite URLs. Empty lobbies expire, empty in-progress games pause immediately and are abandoned after the configured TTL, and finished games unload from active memory while replay history stays in PostgreSQL.
 - Sticky sessions or a room router are needed before horizontal scaling active rooms. The current supported mode is explicitly single-node authority; PostgreSQL remains replay truth, while Redis should only coordinate ephemeral presence.
-- The web container serves static assets with security headers, long-lived immutable caching for hashed assets, and no-store HTML fallback. Caddy remains responsible for public TLS, compression, and routing `/config`, `/ws`, and API paths to the server. Scrape `/metrics` through an internal or admin-only monitoring path, not the public site route.
+- The web container serves static assets with security headers, long-lived immutable caching for hashed assets, and no-store HTML fallback. Caddy remains responsible for public TLS, compression, and routing `/config`, `/ws`, and API paths to the server. Scrape `/metrics` through an internal or admin-only monitoring path, not the public site route; when it is routed through the app, configure `ADMIN_TOKEN`.
 
 ## OCI Colocated Deploy
 

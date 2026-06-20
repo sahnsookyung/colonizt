@@ -19,6 +19,7 @@ export const migrationFiles = [
   "003_command_results_and_room_metadata.sql",
   "004_session_column_backfill.sql",
   "005_room_lifecycle_and_invites.sql",
+  "006_liveness_and_room_leases.sql",
 ];
 
 export const readMigration = async (name: string): Promise<string> => readFile(join(migrationsDir, name), "utf8");
@@ -78,6 +79,8 @@ export interface PersistRoomInput {
   lastActivityAt?: string;
   emptySince?: string;
   pausedAt?: string;
+  pauseReason?: string;
+  tradeResponseDeadlines?: Record<string, number>;
   archivedAt?: string;
   cleanupReason?: string;
 }
@@ -164,16 +167,13 @@ export const findPersistedSessionByTokenHash = async (pool: pg.Pool, tokenHash: 
   } : undefined;
 };
 
-export const upsertRoom = async (pool: pg.Pool, room: PersistRoomInput): Promise<void> => {
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    await client.query(
+const upsertRoomWithClient = async (client: pg.PoolClient, room: PersistRoomInput): Promise<void> => {
+  await client.query(
       `INSERT INTO rooms(
          id, mode, status, host_user_id, settings_json, room_code,
-         last_activity_at, empty_since, paused_at, archived_at, cleanup_reason
+         last_activity_at, empty_since, paused_at, pause_reason, trade_deadlines_json, archived_at, cleanup_reason
        )
-       VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::timestamptz, now()), $8, $9, $10, $11)
+       VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::timestamptz, now()), $8, $9, $10, $11, $12, $13)
        ON CONFLICT (id) DO UPDATE
        SET mode = EXCLUDED.mode,
            status = EXCLUDED.status,
@@ -182,6 +182,8 @@ export const upsertRoom = async (pool: pg.Pool, room: PersistRoomInput): Promise
            last_activity_at = EXCLUDED.last_activity_at,
            empty_since = EXCLUDED.empty_since,
            paused_at = EXCLUDED.paused_at,
+           pause_reason = EXCLUDED.pause_reason,
+           trade_deadlines_json = EXCLUDED.trade_deadlines_json,
            archived_at = EXCLUDED.archived_at,
            cleanup_reason = EXCLUDED.cleanup_reason,
            updated_at = now()`,
@@ -195,12 +197,14 @@ export const upsertRoom = async (pool: pg.Pool, room: PersistRoomInput): Promise
         room.lastActivityAt ?? null,
         room.emptySince ?? null,
         room.pausedAt ?? null,
+        room.pauseReason ?? null,
+        room.tradeResponseDeadlines ? JSON.stringify(room.tradeResponseDeadlines) : null,
         room.archivedAt ?? null,
         room.cleanupReason ?? null,
       ],
     );
-    for (const seat of room.seats) {
-      await client.query(
+  for (const seat of room.seats) {
+    await client.query(
         `INSERT INTO room_seats(room_id, seat_index, user_id, bot_id, ready, connected)
          VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (room_id, seat_index) DO UPDATE
@@ -210,7 +214,14 @@ export const upsertRoom = async (pool: pg.Pool, room: PersistRoomInput): Promise
              connected = EXCLUDED.connected`,
         [room.id, seat.seatIndex, seat.userId ?? null, seat.botId ?? null, seat.ready, seat.connected],
       );
-    }
+  }
+};
+
+export const upsertRoom = async (pool: pg.Pool, room: PersistRoomInput): Promise<void> => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await upsertRoomWithClient(client, room);
     await client.query("COMMIT");
   } catch (error) {
     await client.query("ROLLBACK");
@@ -301,28 +312,83 @@ export interface PersistCommandResultInput {
   rejectionMessage?: string;
 }
 
+const commandResultValues = (result: PersistCommandResultInput): unknown[] => [
+  result.roomId,
+  result.matchId ?? null,
+  result.userId,
+  result.clientSeq,
+  result.commandHash,
+  result.ok,
+  result.seqStart ?? null,
+  result.seqEnd ?? null,
+  result.events ? JSON.stringify(result.events) : null,
+  result.rejectionCode ?? null,
+  result.rejectionMessage ?? null,
+];
+
+const commandResultConflict = (result: PersistCommandResultInput): Error =>
+  Object.assign(new Error(`Command result already exists for ${result.roomId}:${result.userId}:${result.clientSeq}`), {
+    code: "COMMAND_RESULT_CONFLICT",
+  });
+
 export const upsertCommandResult = async (pool: pg.Pool, result: PersistCommandResultInput): Promise<void> => {
-  await pool.query(
+  const inserted = await pool.query(
     `INSERT INTO command_results(
        room_id, match_id, user_id, client_seq, command_hash, ok,
        seq_start, seq_end, events_json, rejection_code, rejection_message
      )
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-     ON CONFLICT (room_id, user_id, client_seq) DO NOTHING`,
-    [
-      result.roomId,
-      result.matchId ?? null,
-      result.userId,
-      result.clientSeq,
-      result.commandHash,
-      result.ok,
-      result.seqStart ?? null,
-      result.seqEnd ?? null,
-      result.events ? JSON.stringify(result.events) : null,
-      result.rejectionCode ?? null,
-      result.rejectionMessage ?? null,
-    ],
+     ON CONFLICT (room_id, user_id, client_seq) DO NOTHING
+     RETURNING command_hash`,
+    commandResultValues(result),
   );
+  if ((inserted.rowCount ?? 0) === 0) throw commandResultConflict(result);
+};
+
+const upsertCommandResultWithClient = async (client: pg.PoolClient, result: PersistCommandResultInput): Promise<void> => {
+  const inserted = await client.query(
+    `INSERT INTO command_results(
+       room_id, match_id, user_id, client_seq, command_hash, ok,
+       seq_start, seq_end, events_json, rejection_code, rejection_message
+     )
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+     ON CONFLICT (room_id, user_id, client_seq) DO NOTHING
+     RETURNING command_hash`,
+    commandResultValues(result),
+  );
+  if ((inserted.rowCount ?? 0) === 0) throw commandResultConflict(result);
+};
+
+export interface CommitMatchEventsInput {
+  room: PersistRoomInput;
+  matchId: string;
+  events: Array<{ seq: number; type: string; payload: unknown }>;
+  commandResult?: PersistCommandResultInput;
+  winnerUserId?: string;
+}
+
+export const commitMatchEvents = async (pool: pg.Pool, input: CommitMatchEventsInput): Promise<void> => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const event of input.events) {
+      await client.query(
+        "INSERT INTO match_events(match_id, seq, event_type, payload_json) VALUES ($1, $2, $3, $4)",
+        [input.matchId, event.seq, event.type, event.payload],
+      );
+    }
+    if (input.commandResult) await upsertCommandResultWithClient(client, input.commandResult);
+    if (input.winnerUserId) {
+      await client.query("UPDATE matches SET ended_at = now(), winner_user_id = $2 WHERE id = $1", [input.matchId, input.winnerUserId]);
+    }
+    await upsertRoomWithClient(client, input.room);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 };
 
 export interface PersistedCommandResultRecord {
@@ -444,6 +510,8 @@ export interface PersistedRoomRecord {
   lastActivityAt?: string;
   emptySince?: string;
   pausedAt?: string;
+  pauseReason?: string;
+  tradeResponseDeadlines?: Record<string, number>;
   archivedAt?: string;
   cleanupReason?: string;
   seats: Array<{ seatIndex: number; userId?: string; botId?: string; ready: boolean; connected: boolean }>;
@@ -509,6 +577,13 @@ const hydratePersistedRoomRecords = async (pool: pg.Pool, rows: pg.QueryResultRo
     const archivedAt = dateString(row.archived_at);
     if (archivedAt) record.archivedAt = archivedAt;
     if (row.cleanup_reason) record.cleanupReason = row.cleanup_reason;
+    if (row.pause_reason) record.pauseReason = row.pause_reason;
+    if (row.trade_deadlines_json && typeof row.trade_deadlines_json === "object") {
+      record.tradeResponseDeadlines = Object.fromEntries(
+        Object.entries(row.trade_deadlines_json as Record<string, unknown>)
+          .filter((entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1])),
+      );
+    }
     if (matchRow) {
       record.match = {
         id: matchRow.id,
@@ -529,7 +604,7 @@ export const listPersistedRooms = async (pool: pg.Pool, limit = 50): Promise<Per
   const rooms = await pool.query(
     `SELECT
        id, room_code, mode, status, host_user_id, settings_json, created_at,
-       last_activity_at, empty_since, paused_at, archived_at, cleanup_reason
+       last_activity_at, empty_since, paused_at, pause_reason, trade_deadlines_json, archived_at, cleanup_reason
      FROM rooms
      WHERE archived_at IS NULL
        AND status NOT IN ('EXPIRED', 'ABANDONED')
@@ -545,7 +620,7 @@ export const findPersistedRoomByRef = async (pool: pg.Pool, roomRef: string): Pr
   const rooms = await pool.query(
     `SELECT
        id, room_code, mode, status, host_user_id, settings_json, created_at,
-       last_activity_at, empty_since, paused_at, archived_at, cleanup_reason
+       last_activity_at, empty_since, paused_at, pause_reason, trade_deadlines_json, archived_at, cleanup_reason
      FROM rooms
      WHERE id = $1 OR room_code = $2
      ORDER BY created_at DESC
@@ -554,4 +629,35 @@ export const findPersistedRoomByRef = async (pool: pg.Pool, roomRef: string): Pr
   );
   const [record] = await hydratePersistedRoomRecords(pool, rooms.rows);
   return record;
+};
+
+export interface RoomLeaseRecord {
+  roomId: string;
+  ownerId: string;
+  expiresAt: string;
+}
+
+export const acquireRoomLease = async (pool: pg.Pool, roomId: string, ownerId: string, ttlMs: number): Promise<RoomLeaseRecord | undefined> => {
+  const result = await pool.query(
+    `INSERT INTO room_leases(room_id, owner_id, expires_at)
+     VALUES ($1, $2, now() + ($3::text || ' milliseconds')::interval)
+     ON CONFLICT (room_id) DO UPDATE
+     SET owner_id = EXCLUDED.owner_id,
+         expires_at = EXCLUDED.expires_at,
+         updated_at = now()
+     WHERE room_leases.owner_id = $2 OR room_leases.expires_at < now()
+     RETURNING room_id, owner_id, expires_at`,
+    [roomId, ownerId, ttlMs],
+  );
+  const row = result.rows[0];
+  return row ? {
+    roomId: row.room_id,
+    ownerId: row.owner_id,
+    expiresAt: row.expires_at instanceof Date ? row.expires_at.toISOString() : String(row.expires_at),
+  } : undefined;
+};
+
+export const releaseRoomLease = async (pool: pg.Pool, roomId: string, ownerId: string): Promise<boolean> => {
+  const result = await pool.query("DELETE FROM room_leases WHERE room_id = $1 AND owner_id = $2", [roomId, ownerId]);
+  return (result.rowCount ?? 0) > 0;
 };

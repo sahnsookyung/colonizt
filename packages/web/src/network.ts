@@ -1,11 +1,15 @@
 import type { BotDifficulty, GameCommand, GameConfig, GameEvent, ViewerState } from "@colonizt/game-core";
-import type { CreateRoomResponse, CreateSessionResponse, MatchSummaryPayload, ReplayLogPayload, RuntimeNetworkConfig, WsTicketResponse } from "@colonizt/protocol";
+import type { CreateRoomResponse, CreateSessionResponse, MatchSummaryPayload, PublicRoomPayload, ReplayLogPayload, RuntimeNetworkConfig, WsTicketResponse } from "@colonizt/protocol";
 
 export type MatchSummary = MatchSummaryPayload;
+export type RoomLookupResult =
+  | { ok: true; room: PublicRoomPayload }
+  | { ok: false; code: string; status?: string; cleanupReason?: string };
 
 export interface NetworkClient {
   createSession(displayName: string): Promise<CreateSessionResponse>;
   createRoom(token: string, options?: { mode?: "CLASSIC" | "DUEL" | "RUSH"; botFill?: boolean; ranked?: boolean; minPlayers?: number; botDifficulty?: BotDifficulty; rules?: GameConfig["rules"] }): Promise<CreateRoomResponse>;
+  getRoom(roomRef: string): Promise<RoomLookupResult>;
   listMatches(limit?: number): Promise<MatchSummary[]>;
   loadReplay(replayId: string, token?: string): Promise<ReplayLogPayload>;
   createWebSocketTicket(token: string): Promise<WsTicketResponse>;
@@ -15,6 +19,7 @@ export interface NetworkClient {
     onError: (error: unknown) => void;
     onOpen?: (socket: WebSocket) => void;
     onClose?: () => void;
+    onAck?: () => void;
   }): Promise<WebSocket>;
   sendCommand(socket: WebSocket, roomId: string, clientSeq: number, command: GameCommand): void;
 }
@@ -116,6 +121,20 @@ export const createNetworkClient = (baseUrl = configuredBaseUrl): NetworkClient 
     if (!response.ok) throw new Error("Room creation failed");
     return response.json() as Promise<CreateRoomResponse>;
   },
+  async getRoom(roomRef) {
+    const config = await resolveRuntimeConfig(baseUrl);
+    const response = await fetch(`${config.apiBaseUrl}/rooms/${encodeURIComponent(roomRef)}`);
+    const payload = await response.json().catch(() => ({})) as { code?: string; status?: string; cleanupReason?: string };
+    if (!response.ok) {
+      return {
+        ok: false,
+        code: payload.code ?? (response.status === 404 ? "ROOM_NOT_FOUND" : "ROOM_LOOKUP_FAILED"),
+        ...(payload.status ? { status: payload.status } : {}),
+        ...(payload.cleanupReason ? { cleanupReason: payload.cleanupReason } : {}),
+      };
+    }
+    return { ok: true, room: payload as PublicRoomPayload };
+  },
   async listMatches(limit = 12) {
     const config = await resolveRuntimeConfig(baseUrl);
     const response = await fetch(`${config.apiBaseUrl}/matches?limit=${limit}`);
@@ -163,6 +182,7 @@ export const createNetworkClient = (baseUrl = configuredBaseUrl): NetworkClient 
       if (message.type === "EVENTS") handlers.onEvents(message.events ?? [], message.snapshot);
       else if (message.type === "RESYNC") handlers.onEvents(message.events ?? [], message.snapshot);
       else if (message.type === "ROOM_STATE") handlers.onRoom(message.room);
+      else if (message.type === "COMMAND_ACK") handlers.onAck?.();
       else if (message.type === "ERROR" || message.type === "COMMAND_REJECTED") handlers.onError(message);
     });
     return socket;

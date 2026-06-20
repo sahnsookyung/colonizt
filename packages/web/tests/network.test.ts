@@ -101,4 +101,33 @@ describe("network client", () => {
     expect(FakeWebSocket.urls).toEqual(["wss://socket-ws.example/ws?ticket=ticket_1"]);
     socket.close();
   });
+
+  it("returns typed room preflight results", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://lookup-bootstrap.example/config") {
+        return new Response(JSON.stringify({
+          apiBaseUrl: "https://lookup-api.example",
+          wsBaseUrl: "wss://lookup-socket.example",
+        }), { status: 200 });
+      }
+      if (url === "https://lookup-api.example/rooms/ABC123") {
+        return new Response(JSON.stringify({ id: "room_1", code: "ABC123", status: "LOBBY" }), { status: 200 });
+      }
+      if (url === "https://lookup-api.example/rooms/CLOSED") {
+        return new Response(JSON.stringify({ code: "ROOM_EXPIRED", status: "EXPIRED", cleanupReason: "EMPTY_LOBBY_TTL" }), { status: 410 });
+      }
+      return new Response("not found", { status: 404 });
+    }));
+
+    const client = createNetworkClient("https://lookup-bootstrap.example");
+
+    await expect(client.getRoom("ABC123")).resolves.toMatchObject({ ok: true, room: { id: "room_1", code: "ABC123" } });
+    await expect(client.getRoom("CLOSED")).resolves.toEqual({
+      ok: false,
+      code: "ROOM_EXPIRED",
+      status: "EXPIRED",
+      cleanupReason: "EMPTY_LOBBY_TTL",
+    });
+  });
 });

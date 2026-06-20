@@ -1,6 +1,6 @@
 import {
   addResources,
-  applyEvents,
+  applyCommand,
   canBuildRoad,
   cityCost,
   emptyResources,
@@ -220,33 +220,11 @@ const marginalValue = (view: BotView, resource: Resource): number =>
   evaluateState(view, addResources(view.ownResources, { [resource]: 1 }));
 
 const commandAfterUtility = (view: BotView, command: GameCommand): number => {
-  const result = applyEvents(view.state, []);
-  const cloned = structuredClone(result) as GameState;
-  const player = cloned.players[view.botId];
-  if (!player) return Number.NEGATIVE_INFINITY;
-  switch (command.type) {
-    case "BUILD_ROAD":
-      player.resources = subtractResources(player.resources, roadCost());
-      cloned.roads[command.edgeId] = view.botId;
-      return evaluateState(createBotView(cloned, view.botId, view.profile), player.resources) + 0.05;
-    case "BUILD_SETTLEMENT":
-      player.resources = subtractResources(player.resources, settlementCost());
-      cloned.settlements[command.vertexId] = view.botId;
-      cloned.buildings[command.vertexId] = { owner: view.botId, type: "settlement" };
-      player.score += 1;
-      return evaluateState(createBotView(cloned, view.botId, view.profile), player.resources);
-    case "UPGRADE_CITY":
-      player.resources = subtractResources(player.resources, cityCost());
-      cloned.buildings[command.vertexId] = { owner: view.botId, type: "city" };
-      player.score += 1;
-      return evaluateState(createBotView(cloned, view.botId, view.profile), player.resources);
-    case "BUY_SPECIAL_CARD":
-      player.resources = subtractResources(player.resources, specialCardCost(cloned.config.rules));
-      player.specialCards += 1;
-      return evaluateState(createBotView(cloned, view.botId, view.profile), player.resources) + 0.06;
-    default:
-      return evaluateState(view);
-  }
+  const preview = applyCommand(structuredClone(view.state) as GameState, command);
+  if (!preview.ok) return Number.NEGATIVE_INFINITY;
+  const nextView = createBotView(preview.value.nextState, view.botId, view.profile, view.difficulty);
+  const actionNudge = command.type === "BUILD_ROAD" ? 0.05 : command.type === "BUY_SPECIAL_CARD" ? 0.06 : 0;
+  return evaluateState(nextView) + actionNudge;
 };
 
 const tradeDifficulty = (difficulty: BotDifficulty = "medium") => {
@@ -271,7 +249,7 @@ const tradeBundleKey = (bundle: ResourceBundle): string =>
 const tradeRecipientsKey = (recipients: TradeOffer["recipients"] | OfferTradeCommand["recipients"]): string =>
   recipients === "ANY" ? "ANY" : [...recipients].sort().join(",");
 
-const tradeShapeKey = (trade: Pick<TradeOffer | OfferTradeCommand, "offered" | "requested" | "recipients">): string =>
+export const tradeShapeKey = (trade: Pick<TradeOffer | OfferTradeCommand, "offered" | "requested" | "recipients">): string =>
   `${tradeBundleKey(trade.offered)}>${tradeBundleKey(trade.requested)}@${tradeRecipientsKey(trade.recipients)}`;
 
 export const hasEquivalentBotTradeOffer = (view: BotView, command: OfferTradeCommand): boolean =>
@@ -279,6 +257,18 @@ export const hasEquivalentBotTradeOffer = (view: BotView, command: OfferTradeCom
     trade.fromPlayerId === view.botId
     && tradeShapeKey(trade) === tradeShapeKey(command),
   );
+
+export const scoreTradeResponder = (
+  state: GameState,
+  trade: TradeOffer,
+  responderId: PlayerId,
+  profile: BotProfile = "greedy",
+  difficulty: BotDifficulty = state.config.botDifficulty ?? "medium",
+): number => {
+  const offererView = createBotView(state, trade.fromPlayerId, profile, difficulty);
+  const afterHand = addResources(subtractResources(offererView.ownResources, trade.offered), trade.requested);
+  return evaluateState(offererView, afterHand) - (state.players[responderId]?.score ?? 0) * 0.03;
+};
 
 const strategicTradeBonus = (view: BotView, beforeHand: ResourceBundle, afterHand: ResourceBundle, gained: ResourceBundle, paid: ResourceBundle): number => {
   const production = productionResources(view.state, view.botId);

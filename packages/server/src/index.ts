@@ -7,6 +7,7 @@ import { analyticsEventSchema, createRoomSchema, defaultWebSocketTicketTtlMs, pr
 import { createPool, runMigrations } from "@colonizt/db";
 import { PostgresEventStore } from "./event-store.js";
 import { createStructuredLogger, MetricsRegistry, resolveInstanceMode, type StructuredLogger } from "./observability.js";
+import { MemoryRoomOwnershipStore, PostgresRoomOwnershipStore, type RoomOwnershipStore } from "./ownership.js";
 import { createPresenceStore, type PresenceStore } from "./presence.js";
 import { defaultRoomCleanupPolicy, RoomCapacityError, RoomManager, type Room, type RoomCleanupPolicy, type Session } from "./room-manager.js";
 import { RoomAutomationScheduler } from "./scheduler.js";
@@ -16,6 +17,7 @@ export { MemoryEventStore, PostgresEventStore } from "./event-store.js";
 export { MemoryPresenceStore, RedisPresenceStore } from "./presence.js";
 export { MetricsRegistry, createStructuredLogger, resolveInstanceMode } from "./observability.js";
 export { RoomAutomationScheduler } from "./scheduler.js";
+export { MemoryRoomOwnershipStore, PostgresRoomOwnershipStore, type RoomOwnershipStore } from "./ownership.js";
 
 export interface BuildServerOptions {
   manager?: RoomManager;
@@ -27,6 +29,10 @@ export interface BuildServerOptions {
   wsTicketTtlMs?: number;
   roomCleanupPolicy?: Partial<RoomCleanupPolicy>;
   roomCleanupIntervalMs?: number;
+  sessionTtlMs?: number;
+  roomOwnershipStore?: RoomOwnershipStore;
+  roomOwnershipLeaseTtlMs?: number;
+  adminToken?: string | null;
   logger?: StructuredLogger;
   metrics?: MetricsRegistry;
   nodeId?: string;
@@ -46,6 +52,11 @@ const tokenFromHeader = (authorization: unknown, xSessionToken: unknown): string
   if (typeof xSessionToken === "string") return xSessionToken;
   if (typeof authorization === "string" && authorization.startsWith("Bearer ")) return authorization.slice("Bearer ".length);
   return undefined;
+};
+
+const configuredSecret = (value: string | null | undefined): string | undefined => {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
 };
 
 const requireSession = async (manager: RoomManager, request: { headers: Record<string, unknown> }): Promise<Session> => {
@@ -83,9 +94,15 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     emptyLobbyTtlMs: positiveInt(process.env.EMPTY_LOBBY_TTL_MS, defaultRoomCleanupPolicy.emptyLobbyTtlMs),
     emptyGameTtlMs: positiveInt(process.env.EMPTY_GAME_TTL_MS, defaultRoomCleanupPolicy.emptyGameTtlMs),
     finishedRoomUnloadMs: positiveInt(process.env.FINISHED_ROOM_UNLOAD_MS, defaultRoomCleanupPolicy.finishedRoomUnloadMs),
+    automationStallTickLimit: positiveInt(process.env.AUTOMATION_STALL_TICK_LIMIT, defaultRoomCleanupPolicy.automationStallTickLimit),
+    maxAutomatedCommandsPerMinute: positiveInt(process.env.MAX_AUTOMATED_COMMANDS_PER_MINUTE, defaultRoomCleanupPolicy.maxAutomatedCommandsPerMinute),
+    botTradeCooldownTurns: positiveInt(process.env.BOT_TRADE_COOLDOWN_TURNS, defaultRoomCleanupPolicy.botTradeCooldownTurns),
     ...options.roomCleanupPolicy,
   };
+  const sessionTtlMs = options.sessionTtlMs ?? positiveInt(process.env.SESSION_TTL_MS, 30 * 24 * 60 * 60 * 1000);
+  const adminToken = configuredSecret(options.adminToken === undefined ? process.env.ADMIN_TOKEN : options.adminToken);
   let manager = options.manager;
+  let ownershipStore = options.roomOwnershipStore;
   let pool: ReturnType<typeof createPool> | undefined;
   if (!manager && process.env.DATABASE_URL) {
     pool = createPool({ connectionString: process.env.DATABASE_URL });
@@ -96,18 +113,34 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
       logger.error("db.migrations_failed", { message: error instanceof Error ? error.message : String(error) });
       throw error;
     }
-    manager = new RoomManager(new PostgresEventStore(pool), cleanupPolicy);
+    ownershipStore ??= new PostgresRoomOwnershipStore(pool);
+    manager = new RoomManager(new PostgresEventStore(pool), {
+      ...cleanupPolicy,
+      sessionTtlMs,
+      ownerId: nodeId,
+      ownershipStore,
+      ...(options.roomOwnershipLeaseTtlMs !== undefined ? { ownershipLeaseTtlMs: options.roomOwnershipLeaseTtlMs } : {}),
+    });
     await manager.hydrateFromStore();
   }
-  manager ??= new RoomManager(undefined, cleanupPolicy);
+  ownershipStore ??= new MemoryRoomOwnershipStore();
+  manager ??= new RoomManager(undefined, {
+    ...cleanupPolicy,
+    sessionTtlMs,
+    ownerId: nodeId,
+    ownershipStore,
+    ...(options.roomOwnershipLeaseTtlMs !== undefined ? { ownershipLeaseTtlMs: options.roomOwnershipLeaseTtlMs } : {}),
+  });
   const presence: PresenceStore = await createPresenceStore(process.env.REDIS_URL);
   const allowedOrigins = options.allowedOrigins ?? [process.env.WEB_ORIGIN ?? "http://127.0.0.1:5173"];
   const allowLegacySessionToken = options.allowLegacySessionToken ?? false;
   const wsTicketTtlMs = options.wsTicketTtlMs ?? defaultWebSocketTicketTtlMs;
   const app = Fastify({ logger: false, bodyLimit: 32_000 });
   const clients = new Set<SocketClient>();
+  const clientsByRoom = new Map<string, Set<SocketClient>>();
   const wsTickets = new Map<string, WsTicket>();
   const requestStartedAt = new WeakMap<object, number>();
+  const rateLimitBuckets = new Map<string, number[]>();
 
   const externalBaseUrl = (request: { headers: Record<string, unknown>; protocol?: string; hostname?: string }, configured?: string): string => {
     if (configured) return configured.replace(/\/$/, "");
@@ -149,6 +182,26 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     return true;
   };
 
+  const clientIp = (request: { ip?: string; headers: Record<string, unknown> }): string => {
+    const forwarded = request.headers["x-forwarded-for"];
+    return typeof forwarded === "string" ? forwarded.split(",")[0]!.trim() : request.ip ?? "unknown";
+  };
+
+  const withinNamedLimit = (key: string, limit: number, windowMs: number): boolean => {
+    const timestamps = rateLimitBuckets.get(key) ?? [];
+    const ok = withinLimit(timestamps, limit, windowMs);
+    rateLimitBuckets.set(key, timestamps);
+    return ok;
+  };
+
+  const requireAdminToken = (request: { headers: Record<string, unknown> }, reply: { status(code: number): { send(payload: unknown): unknown } }): boolean => {
+    if (!adminToken) return true;
+    const token = tokenFromHeader(request.headers.authorization, request.headers["x-admin-token"]);
+    if (token === adminToken) return true;
+    reply.status(403).send({ code: "FORBIDDEN", message: "Admin token required" });
+    return false;
+  };
+
   const send = (client: SocketClient, payload: unknown): void => {
     client.socket.send(JSON.stringify(payload));
   };
@@ -162,9 +215,15 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
   };
 
   const broadcastRoom = (roomId: string, payloadFor: (client: SocketClient) => unknown): void => {
-    for (const client of clients) {
-      if (client.roomId === roomId) send(client, payloadFor(client));
-    }
+    for (const client of clientsByRoom.get(roomId) ?? []) send(client, payloadFor(client));
+  };
+
+  const attachClientToRoom = (client: SocketClient, roomId: string): void => {
+    if (client.roomId && client.roomId !== roomId) clientsByRoom.get(client.roomId)?.delete(client);
+    client.roomId = roomId;
+    const roomClients = clientsByRoom.get(roomId) ?? new Set<SocketClient>();
+    roomClients.add(client);
+    clientsByRoom.set(roomId, roomClients);
   };
 
   const roomInviteUrl = (request: { headers: Record<string, unknown>; protocol?: string; hostname?: string } | undefined, room: Room): string => {
@@ -186,8 +245,7 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
   };
 
   const closeRoomClients = (roomId: string, code: string, message: string): void => {
-    for (const client of [...clients]) {
-      if (client.roomId !== roomId) continue;
+    for (const client of [...(clientsByRoom.get(roomId) ?? [])]) {
       send(client, { type: "ERROR", code, message });
       client.socket.close(1000, message);
     }
@@ -251,9 +309,10 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
 
   app.get("/health", async () => ({ ok: true, service: "colonizt-server", presence: presence.kind, nodeId, instanceMode }));
 
-  app.get("/metrics", async (_request, reply) =>
-    reply.header("content-type", "text/plain; version=0.0.4; charset=utf-8").send(metrics.render(manager, clients.size, presence.kind)),
-  );
+  app.get("/metrics", async (request, reply) => {
+    if (!requireAdminToken(request, reply)) return;
+    return reply.header("content-type", "text/plain; version=0.0.4; charset=utf-8").send(metrics.render(manager, clients.size, presence.kind));
+  });
 
   app.get("/config", async (request) => {
     const apiBaseUrl = externalBaseUrl(request, options.publicApiBaseUrl ?? process.env.PUBLIC_API_URL);
@@ -270,17 +329,24 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     };
   });
 
-  app.post<{ Body: { displayName?: string } }>("/sessions", async (request) => {
+  app.post<{ Body: { displayName?: string } }>("/sessions", async (request, reply) => {
+    if (!withinNamedLimit(`ip:${clientIp(request)}:sessions`, 20, 60_000)) {
+      return reply.status(429).send({ code: "RATE_LIMITED", message: "Too many sessions" });
+    }
     return manager.createSession(request.body.displayName ?? "Guest");
   });
 
   app.post("/ws-tickets", async (request, reply) => {
     const session = await requireSession(manager, request);
+    if (!withinNamedLimit(`session:${session.userId}:ws-tickets`, 60, 60_000) || !withinNamedLimit(`ip:${clientIp(request)}:ws-tickets`, 120, 60_000)) {
+      return reply.status(429).send({ code: "RATE_LIMITED", message: "Too many WebSocket tickets" });
+    }
     const ticket = issueWsTicket(session);
     return reply.status(201).send({ ticket: ticket.token, expiresAt: new Date(ticket.expiresAt).toISOString(), ttlMs: wsTicketTtlMs });
   });
 
   app.post("/analytics", async (request, reply) => {
+    if (!withinNamedLimit(`ip:${clientIp(request)}:analytics`, 120, 60_000)) return reply.status(429).send({ code: "RATE_LIMITED" });
     const parsed = analyticsEventSchema.safeParse(request.body ?? {});
     if (!parsed.success) return reply.status(400).send({ code: "BAD_REQUEST", issues: parsed.error.issues });
     const token = tokenFromHeader(request.headers.authorization, request.headers["x-session-token"]);
@@ -295,11 +361,15 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     return reply.status(202).send({ ok: true });
   });
 
-  app.get("/rooms", async () => manager.listRooms());
+  app.get("/rooms", async (request, reply) => {
+    if (!withinNamedLimit(`ip:${clientIp(request)}:room-list`, 120, 60_000)) return reply.status(429).send({ code: "RATE_LIMITED" });
+    return manager.listRooms();
+  });
 
   app.get<{ Params: { roomRef: string } }>("/rooms/:roomRef", async (request, reply) => {
-    const room = manager.roomForRef(request.params.roomRef);
-    if (room) return publicRoomWithInvite(request, room);
+    if (!withinNamedLimit(`ip:${clientIp(request)}:room-lookup`, 90, 60_000)) return reply.status(429).send({ code: "RATE_LIMITED" });
+    const room = await manager.ensureRoomLoadedByRef(request.params.roomRef);
+    if (room && !room.archivedAt && room.status !== "EXPIRED" && room.status !== "ABANDONED") return publicRoomWithInvite(request, room);
     const stored = await manager.loadRoomStatusByRef(request.params.roomRef);
     if (!stored) return reply.status(404).send({ code: "ROOM_NOT_FOUND" });
     const code = stored.status === "EXPIRED" ? "ROOM_EXPIRED" : stored.status === "ABANDONED" ? "ROOM_ABANDONED" : "ROOM_CLOSED";
@@ -319,6 +389,9 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
 
   app.post("/rooms", async (request, reply) => {
     const session = await requireSession(manager, request);
+    if (!withinNamedLimit(`session:${session.userId}:room-create`, 12, 60_000) || !withinNamedLimit(`ip:${clientIp(request)}:room-create`, 30, 60_000)) {
+      return reply.status(429).send({ code: "RATE_LIMITED", message: "Too many room creation attempts" });
+    }
     const parsed = createRoomSchema.safeParse(request.body ?? {});
     if (!parsed.success) return reply.status(400).send({ code: "BAD_REQUEST", issues: parsed.error.issues });
     const settings = parsed.data.minPlayers === undefined
@@ -348,19 +421,27 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     return storedReplay;
   });
 
-  app.get("/leaderboard", async () => ({
-    mode: "CLASSIC",
-    seasonId: "local-admin",
-    rankedPublicQueue: "deferred",
-    rows: [...manager.rooms.values()].flatMap((room) =>
-      Object.values(room.game?.players ?? {}).map((player) => ({ userId: player.id, score: player.score, rating: 1000 + player.score * 25 })),
-    ),
-  }));
+  app.get("/leaderboard", async (request, reply) => {
+    if (!requireAdminToken(request, reply)) return;
+    return {
+      mode: "CLASSIC",
+      seasonId: "local-admin",
+      rankedPublicQueue: "deferred",
+      rows: [...manager.rooms.values()].flatMap((room) =>
+        Object.values(room.game?.players ?? {}).map((player) => ({ userId: player.id, score: player.score, rating: 1000 + player.score * 25 })),
+      ),
+    };
+  });
 
   app.post<{ Params: { roomId: string }; Body: { reportedUserId?: string; reason?: string } }>("/rooms/:roomId/reports", async (request, reply) => {
     const session = await requireSession(manager, request);
-    if (!request.body.reportedUserId || !request.body.reason) return reply.status(400).send({ code: "BAD_REQUEST" });
-    const report = await manager.createReport(request.params.roomId, session, request.body.reportedUserId, request.body.reason);
+    if (!withinNamedLimit(`session:${session.userId}:reports`, 10, 60_000) || !withinNamedLimit(`ip:${clientIp(request)}:reports`, 30, 60_000)) {
+      return reply.status(429).send({ code: "RATE_LIMITED" });
+    }
+    const reportedUserId = typeof request.body.reportedUserId === "string" ? request.body.reportedUserId.trim() : "";
+    const reason = typeof request.body.reason === "string" ? request.body.reason.trim() : "";
+    if (!reportedUserId || reportedUserId.length > 120 || !reason || reason.length > 500) return reply.status(400).send({ code: "BAD_REQUEST" });
+    const report = await manager.createReport(request.params.roomId, session, reportedUserId, reason);
     if (!report) return reply.status(404).send({ code: "REPORT_REJECTED" });
     return report;
   });
@@ -393,6 +474,7 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     socket.on("close", () => {
       clients.delete(client);
       const roomId = client.roomId;
+      if (roomId) clientsByRoom.get(roomId)?.delete(client);
       metrics.recordWebSocket("closed");
       logger.info("websocket.closed", { socketId, userId: session.userId, roomId });
       void (async () => {
@@ -424,16 +506,21 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
 
       const message = parsed.data;
       if (message.type === "PING") {
+        void presence.refresh(session, socketId, client.roomId).catch(() => undefined);
         socket.send(JSON.stringify({ type: "PONG", nonce: message.nonce }));
         return;
       }
       if (message.type === "JOIN_ROOM") {
+        if (!withinNamedLimit(`session:${session.userId}:join-room`, 30, 60_000)) {
+          send(client, { type: "ERROR", code: "RATE_LIMITED", message: "Too many join attempts" });
+          return;
+        }
         void manager.joinRoom(message.roomId, session, message.asSpectator ?? false).then((joined) => {
           if (!joined.ok) {
             send(client, { type: "ERROR", code: joined.code, message: joined.message });
             return;
           }
-          client.roomId = joined.room.id;
+          attachClientToRoom(client, joined.room.id);
           client.asSpectator = joined.room.spectators.has(session.userId) && !manager.isMember(joined.room, session.userId);
           void presence.joinRoom(session, socketId, joined.room.id).then(async () => {
             const synced = await manager.syncConnections(joined.room.id, await presence.roomUserIds(joined.room.id));
@@ -511,8 +598,9 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
       }
       if (message.type === "RESYNC") {
         const canonicalRoomId = manager.roomForRef(message.roomId)?.id ?? message.roomId;
-        const resync = manager.resync(message.roomId, session, message.lastSeq);
-        send(client, resync ? { type: "RESYNC", roomId: canonicalRoomId, ...resync } : { type: "ERROR", code: "RESYNC_FAILED" });
+        void manager.resync(message.roomId, session, message.lastSeq).then((resync) => {
+          send(client, resync ? { type: "RESYNC", roomId: canonicalRoomId, ...resync } : { type: "ERROR", code: "RESYNC_FAILED" });
+        }).catch((error) => send(client, { type: "ERROR", code: "RESYNC_FAILED", message: error instanceof Error ? error.message : "Resync failed" }));
       }
     });
   });
