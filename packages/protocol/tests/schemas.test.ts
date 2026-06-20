@@ -3,7 +3,7 @@ import { createRoomSchema, protocolVersion, wsClientMessageSchema, websocketAuth
 
 describe("protocol schemas", () => {
   it("keeps protocol constants explicit", () => {
-    expect(protocolVersion).toBe(2);
+    expect(protocolVersion).toBe(3);
     expect(websocketAuthMode).toBe("ticket");
   });
 
@@ -14,6 +14,8 @@ describe("protocol schemas", () => {
   it("accepts valid ping and command messages", () => {
     expect(wsClientMessageSchema.safeParse({ type: "PING", nonce: "n" }).success).toBe(true);
     expect(wsClientMessageSchema.safeParse({ type: "COMMAND", roomId: "r", clientSeq: 1, command: { type: "ROLL_DICE", playerId: "p1" } }).success).toBe(true);
+    expect(wsClientMessageSchema.safeParse({ type: "COMMAND", roomId: "r", clientSeq: 2, command: { type: "MOVE_THIEF", playerId: "p1", hexId: "h1" } }).success).toBe(true);
+    expect(wsClientMessageSchema.safeParse({ type: "COMMAND", roomId: "r", clientSeq: 3, command: { type: "PLAY_YEAR_OF_PLENTY", playerId: "p1", cardId: "c1", resources: ["grain", "ore"] } }).success).toBe(true);
   });
 
   it("accepts bot difficulty and optional rule room settings", () => {
@@ -23,13 +25,13 @@ describe("protocol schemas", () => {
       ranked: false,
       minPlayers: 4,
       botDifficulty: "hard",
-      rules: { diceDoubles: true, plight: true, plightTurn: 20 },
+      rules: { diceDoubles: true, plight: true, plightTurn: 20, maxTurns: 100, maxTurnAdjudication: "leader" },
     });
     expect(parsed.success).toBe(true);
     if (parsed.success) {
       expect(parsed.data.botDifficulty).toBe("hard");
       expect(parsed.data.minPlayers).toBe(4);
-      expect(parsed.data.rules).toMatchObject({ diceDoubles: true, plight: true, plightTurn: 20 });
+      expect(parsed.data.rules).toMatchObject({ diceDoubles: true, plight: true, plightTurn: 20, maxTurns: 100, maxTurnAdjudication: "leader" });
     }
   });
 

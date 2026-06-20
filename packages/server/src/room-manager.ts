@@ -6,11 +6,14 @@ import {
   createFixedBoard,
   createGame,
   createSeededBoard,
+  deterministicDiscard,
   emptyResources,
+  eligibleStealTargets,
   getLegalActions,
   hasResources,
   normalizeImportedState,
   replay,
+  resourceCount,
   serializeEventsForViewer,
   serializeForViewer,
   tradeRecipientIds,
@@ -20,6 +23,7 @@ import {
   type GameEvent,
   type GameState,
   type PlayerId,
+  type HexId,
   type ViewerState,
 } from "@colonizt/game-core";
 import { createBotTradeId, createBotView, evaluateTrade, greedyBot, hasEquivalentBotTradeOffer, plannerBot, randomLegalBot, scoreTradeResponder, tradeShapeKey, type BotController } from "@colonizt/bots";
@@ -343,7 +347,7 @@ export class RoomManager {
       pauseReason: room.pauseReason,
       liveness: this.livenessState(room),
       cleanupReason: room.cleanupReason,
-      events: serializeEventsForViewer(room.events, viewerId, room.game?.playerOrder),
+      events: serializeEventsForViewer(room.events, viewerId, room.game?.playerOrder, room.game?.phase.type === "GAME_OVER"),
       chat: room.chat,
       timer: room.timer,
       game,
@@ -924,7 +928,7 @@ export class RoomManager {
     const viewerId = this.isMember(room, session.userId) ? session.userId : "spectator";
     const events = room.events.filter((event) => event.seq > lastSeq);
     if (events.length === 0 || events[0]!.seq === lastSeq + 1) {
-      return { snapshot: this.viewerState(room, room.game, viewerId), events: serializeEventsForViewer(events, viewerId, room.game.playerOrder) };
+      return { snapshot: this.viewerState(room, room.game, viewerId), events: serializeEventsForViewer(events, viewerId, room.game.playerOrder, room.game.phase.type === "GAME_OVER") };
     }
     return { snapshot: this.viewerState(room, room.game, viewerId), events: [] };
   }
@@ -1097,6 +1101,30 @@ export class RoomManager {
   }
 
   private timeoutCommand(state: GameState, playerId: PlayerId): GameCommand | undefined {
+    if (state.phase.type === "DISCARDING") {
+      const count = state.phase.pending[playerId] ?? 0;
+      return count > 0 ? { type: "DISCARD_RESOURCES", playerId, resources: deterministicDiscard(state, playerId, count) } : undefined;
+    }
+    if (state.phase.type === "MOVING_THIEF") {
+      const move = getLegalActions(state, playerId).find((action) => action.type === "MOVE_THIEF");
+      if (move?.type !== "MOVE_THIEF") return undefined;
+      const ranked = move.hexes
+        .map((hexId) => {
+          const targets = eligibleStealTargets(state, playerId, hexId as HexId);
+          const pressure = targets.reduce((sum, targetId) => sum + resourceCount(state.players[targetId]?.resources ?? emptyResources()) + (state.players[targetId]?.score ?? 0) * 2, 0);
+          return { hexId: hexId as HexId, targets, score: pressure };
+        })
+        .sort((left, right) => right.score - left.score || left.hexId.localeCompare(right.hexId));
+      const selected = ranked[0];
+      if (!selected) return undefined;
+      const stealFromPlayerId = selected.targets
+        .sort((left, right) =>
+          (state.players[right]?.score ?? 0) - (state.players[left]?.score ?? 0)
+          || resourceCount(state.players[right]?.resources ?? emptyResources()) - resourceCount(state.players[left]?.resources ?? emptyResources())
+          || state.playerOrder.indexOf(left) - state.playerOrder.indexOf(right),
+        )[0];
+      return { type: "MOVE_THIEF", playerId, hexId: selected.hexId, ...(stealFromPlayerId ? { stealFromPlayerId } : {}) };
+    }
     if (state.phase.type === "SETUP_PLACEMENT") {
       const setup = getLegalActions(state, playerId).find((action) => action.type === "PLACE_SETUP");
       const vertexId = setup?.vertices[0];

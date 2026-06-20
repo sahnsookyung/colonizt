@@ -23,13 +23,29 @@ describe("REST routes", () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({
-      schemaVersion: 2,
-      protocolVersion: 2,
+      schemaVersion: 3,
+      protocolVersion: 3,
       apiBaseUrl: "https://api.play.example",
       wsBaseUrl: "wss://api.play.example",
       webOrigin: "https://play.example",
       auth: { webSocket: "ticket" },
     });
+  });
+
+  it("rejects turn-limit adjudication rules unless test rules are enabled", async () => {
+    const manager = new RoomManager();
+    const session = await manager.createSession("Host");
+    const app = await buildServer({ manager });
+    const response = await app.inject({
+      method: "POST",
+      url: "/rooms",
+      headers: { "x-session-token": session.token },
+      payload: { mode: "CLASSIC", botFill: true, ranked: false, rules: { maxTurns: 20, maxTurnAdjudication: "leader" } },
+    });
+    await app.close();
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ code: "TEST_RULES_DISABLED" });
   });
 
   it("reports health and accepts product analytics", async () => {

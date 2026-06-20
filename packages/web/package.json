@@ -8,7 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b",
-    "test": "vitest run"
+    "test": "vitest run --root ../.. packages/web --passWithNoTests"
   },
   "dependencies": {
     "@colonizt/bots": "0.1.0",

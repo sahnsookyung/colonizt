@@ -30,6 +30,7 @@ import {
   type GameEvent,
   type GameCommand,
   type GameState,
+  type HexId,
   type PlayerId,
   type ResourceBundle,
   type VertexId,
@@ -688,7 +689,7 @@ describe("serialization and replay", () => {
     };
 
     const normalized = normalizeImportedState(state);
-    expect(normalized.schemaVersion).toBe(2);
+    expect(normalized.schemaVersion).toBe(3);
     expect(normalized.trades.legacy).toMatchObject({ status: "CLOSED", closedReason: "MIGRATED" });
     expect(normalized.trades.legacy?.responses).toBeUndefined();
   });
@@ -706,6 +707,175 @@ describe("serialization and replay", () => {
     const edgeId = state.board.adjacency.vertexToEdges[vertexId]![0] as EdgeId;
     const event = { schemaVersion: 1 as const, seq: 1, type: "SETUP_PLACED" as const, playerId: "p1", vertexId, edgeId, startingResources: emptyResources() };
     expect(applyEvent(state, event)).toEqual(applyEvent(state, event));
+  });
+});
+
+describe("development cards, thief, and adjudication", () => {
+  it("keeps bought VP cards hidden but counts them for game over", () => {
+    let state = applyOrThrow(completeSetup(createDemoGame("vp-card-win")).state, { type: "ROLL_DICE", playerId: "p1" }).state;
+    state.config.victoryPoints = state.players.p1!.score + 1;
+    state.developmentDeck = ["VICTORY_POINT"];
+    state.developmentDeckCursor = 0;
+    state = withResources(state, "p1", specialCardCost(state.config.rules));
+
+    const result = applyCommand(state, { type: "BUY_SPECIAL_CARD", playerId: "p1" });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.nextState.phase).toMatchObject({ type: "GAME_OVER", winnerId: "p1" });
+    expect(result.value.events.at(-1)).toMatchObject({ type: "GAME_OVER", reason: "VICTORY_POINTS" });
+    expect(serializeForViewer(result.value.nextState, "p2").players.find((player) => player.id === "p1")?.developmentCards?.[0]?.type).toBe("VICTORY_POINT");
+  });
+
+  it("forces discard after a 7 before moving the thief", () => {
+    let state = completeSetup(createDemoGame("discard-seven")).state;
+    const sevenIndex = Array.from({ length: 200 }, (_, index) => index).find((index) => {
+      const rolled = rollSeededDice(state.rng.seed, index);
+      return rolled.dice[0] + rolled.dice[1] === 7;
+    });
+    expect(sevenIndex).toBeDefined();
+    state.rng.index = sevenIndex!;
+    state = withResources(state, "p2", { timber: 8 });
+
+    const rolled = applyOrThrow(state, { type: "ROLL_DICE", playerId: "p1" });
+    expect(rolled.state.phase).toMatchObject({ type: "DISCARDING" });
+    expect(rolled.events.map((event) => event.type)).toContain("DISCARD_REQUIRED");
+
+    const required = rolled.state.phase.type === "DISCARDING" ? rolled.state.phase.pending.p2 ?? 0 : 0;
+    const discarded = applyOrThrow(rolled.state, { type: "DISCARD_RESOURCES", playerId: "p2", resources: { ...emptyResources(), timber: required } });
+    expect(discarded.state.players.p2!.resources.timber).toBe(state.players.p2!.resources.timber - required);
+    expect(discarded.state.phase).toMatchObject({ type: "MOVING_THIEF", activePlayerId: "p1" });
+
+    const hexId = Object.keys(discarded.state.board.hexes).find((candidate) => candidate !== discarded.state.thiefHexId) as string;
+    const moved = applyOrThrow(discarded.state, { type: "MOVE_THIEF", playerId: "p1", hexId });
+    expect(moved.state.thiefHexId).toBe(hexId);
+    expect(moved.state.phase).toMatchObject({ type: "ACTION_PHASE", activePlayerId: "p1" });
+  });
+
+  it("blocks production on the thief hex", () => {
+    const state = completeSetup(createDemoGame("thief-block")).state;
+    const buildingVertex = Object.keys(state.settlements).find((vertexId) => state.settlements[vertexId] === "p1") as VertexId;
+    const producingHex = state.board.vertices[buildingVertex]!.adjacentHexes.map((hexId) => state.board.hexes[hexId]!).find((hex) => hex.resource !== "desert" && hex.token);
+    expect(producingHex).toBeDefined();
+    state.thiefHexId = producingHex!.id;
+    const index = Array.from({ length: 300 }, (_, candidate) => {
+      const rolled = rollSeededDice(state.rng.seed, candidate);
+      return { candidate, sum: rolled.dice[0] + rolled.dice[1] };
+    }).find((entry) => entry.sum === producingHex!.token)?.candidate;
+    expect(index).toBeDefined();
+    state.rng.index = index!;
+
+    const result = applyOrThrow(state, { type: "ROLL_DICE", playerId: "p1" });
+    const produced = result.events.find((event) => event.type === "RESOURCES_PRODUCED");
+    expect(produced?.type === "RESOURCES_PRODUCED" ? produced.gains.p1?.[producingHex!.resource as keyof ResourceBundle] ?? 0 : 0).toBe(0);
+  });
+
+  it("plays development card effects through legal engine commands", () => {
+    let state = applyOrThrow(completeSetup(createDemoGame("card-effects")).state, { type: "ROLL_DICE", playerId: "p1" }).state;
+    state.developmentDeck = ["YEAR_OF_PLENTY", "MONOPOLY"];
+    state.developmentDeckCursor = 0;
+    state = withResources(state, "p1", { grain: 2, fiber: 2, ore: 2 });
+    state = applyOrThrow(state, { type: "BUY_SPECIAL_CARD", playerId: "p1" }).state;
+    state = applyOrThrow(state, { type: "BUY_SPECIAL_CARD", playerId: "p1" }).state;
+    for (const card of state.players.p1!.developmentCards) card.boughtTurn = state.turn - 1;
+    state = withResources(state, "p2", { ore: 3 });
+
+    const plenty = state.players.p1!.developmentCards.find((card) => card.type === "YEAR_OF_PLENTY")!;
+    const afterPlenty = applyOrThrow(state, { type: "PLAY_YEAR_OF_PLENTY", playerId: "p1", cardId: plenty.id, resources: ["timber", "brick"] }).state;
+    expect(afterPlenty.players.p1!.resources.timber).toBeGreaterThanOrEqual(1);
+    expect(expectReject(afterPlenty, { type: "PLAY_MONOPOLY", playerId: "p1", cardId: state.players.p1!.developmentCards.find((card) => card.type === "MONOPOLY")!.id, resource: "ore" }, "CARD_NOT_PLAYABLE")).toBeUndefined();
+  });
+
+  it("requires Road Building to build two roads when a second road is available", () => {
+    const state = applyOrThrow(completeSetup(createDemoGame("road-building-two")).state, { type: "ROLL_DICE", playerId: "p1" }).state;
+    state.players.p1!.developmentCards = [{ id: "road-card", type: "ROAD_BUILDING", ownerId: "p1", boughtTurn: state.turn - 1 }];
+    state.players.p1!.specialCards = 1;
+    const action = getLegalActions(state, "p1").find((candidate) => candidate.type === "PLAY_ROAD_BUILDING");
+    expect(action?.type).toBe("PLAY_ROAD_BUILDING");
+    if (action?.type !== "PLAY_ROAD_BUILDING") return;
+    expect(action.requiredRoadCount).toBe(2);
+    const option = action.options.find((candidate) => candidate.length === 2);
+    const first = option?.[0];
+    expect(first).toBeDefined();
+    const second = option?.[1];
+    expect(second).toBeDefined();
+    if (!first || !second) return;
+
+    expectReject(state, { type: "PLAY_ROAD_BUILDING", playerId: "p1", cardId: "road-card", edgeIds: [first] }, "CARD_NOT_PLAYABLE");
+    const built = applyOrThrow(state, { type: "PLAY_ROAD_BUILDING", playerId: "p1", cardId: "road-card", edgeIds: [first, second] });
+    expect(built.events.some((event) => event.type === "ROAD_BUILDING_PLAYED")).toBe(true);
+    expect(built.state.roads[first]).toBe("p1");
+    expect(built.state.roads[second]).toBe("p1");
+  });
+
+  it("serializes public config without exposing seed but includes deck remaining", () => {
+    const state = applyOrThrow(completeSetup(createDemoGame("public-config", { botDifficulty: "hard", rules: { mapRandomized: true, maxTurns: 30, maxTurnAdjudication: "leader" } })).state, { type: "ROLL_DICE", playerId: "p1" }).state;
+    const viewer = serializeForViewer(state, "p1");
+
+    expect(viewer.config).toMatchObject({
+      victoryPoints: state.config.victoryPoints,
+      maxPlayers: state.config.maxPlayers,
+      turnSeconds: state.config.turnSeconds,
+      botDifficulty: "hard",
+    });
+    expect("seed" in viewer.config).toBe(false);
+    expect("matchId" in viewer.config).toBe(false);
+    expect(viewer.developmentDeckRemaining).toBe(state.developmentDeck.length - state.developmentDeckCursor);
+  });
+
+  it("allows Year of Plenty to take duplicate resources", () => {
+    const state = applyOrThrow(completeSetup(createDemoGame("plenty-duplicates")).state, { type: "ROLL_DICE", playerId: "p1" }).state;
+    state.players.p1!.developmentCards = [{ id: "plenty-card", type: "YEAR_OF_PLENTY", ownerId: "p1", boughtTurn: state.turn - 1 }];
+    state.players.p1!.specialCards = 1;
+    const before = state.players.p1!.resources.ore;
+
+    const played = applyOrThrow(state, { type: "PLAY_YEAR_OF_PLENTY", playerId: "p1", cardId: "plenty-card", resources: ["ore", "ore"] });
+    expect(played.state.players.p1!.resources.ore).toBe(before + 2);
+  });
+
+  it("rejects exhausted decks and cards bought on the current turn", () => {
+    let state = applyOrThrow(completeSetup(createDemoGame("deck-guards")).state, { type: "ROLL_DICE", playerId: "p1" }).state;
+    state = withResources(state, "p1", specialCardCost(state.config.rules));
+    state.developmentDeck = [];
+    state.developmentDeckCursor = 0;
+    expectReject(state, { type: "BUY_SPECIAL_CARD", playerId: "p1" }, "DECK_EMPTY");
+
+    state.developmentDeck = ["KNIGHT"];
+    state.developmentDeckCursor = 0;
+    const bought = applyOrThrow(state, { type: "BUY_SPECIAL_CARD", playerId: "p1" }).state;
+    const cardId = bought.players.p1!.developmentCards[0]!.id;
+    const hexId = Object.keys(bought.board.hexes).find((candidate) => candidate !== bought.thiefHexId) as HexId;
+    expectReject(bought, { type: "PLAY_KNIGHT", playerId: "p1", cardId, hexId }, "CARD_NOT_PLAYABLE");
+  });
+
+  it("redacts stolen thief resources from uninvolved viewers", () => {
+    let state = applyOrThrow(completeSetup(createDemoGame("steal-redaction")).state, { type: "ROLL_DICE", playerId: "p1" }).state;
+    state.players.p1!.developmentCards = [{ id: "knight-card", type: "KNIGHT", ownerId: "p1", boughtTurn: state.turn - 1 }];
+    state.players.p1!.specialCards = 1;
+    state = withResources(state, "p2", { timber: 1 });
+    const action = getLegalActions(state, "p1").find((candidate) => candidate.type === "PLAY_KNIGHT");
+    expect(action?.type).toBe("PLAY_KNIGHT");
+    if (action?.type !== "PLAY_KNIGHT") return;
+    const target = action.hexes
+      .map((hexId) => ({ hexId, targets: state.board.adjacency.hexToVertices[hexId]?.map((vertexId) => state.settlements[vertexId]).filter(Boolean) ?? [] }))
+      .find((candidate) => candidate.targets.includes("p2"));
+    expect(target).toBeDefined();
+    if (!target) return;
+
+    const played = applyOrThrow(state, { type: "PLAY_KNIGHT", playerId: "p1", cardId: "knight-card", hexId: target.hexId as HexId, stealFromPlayerId: "p2" });
+    const thief = played.events.find((event) => event.type === "THIEF_MOVED");
+    expect(thief?.type === "THIEF_MOVED" ? thief.stolenResource : undefined).toBe("timber");
+    const redacted = serializeEventsForViewer(played.events, "p3").find((event) => event.type === "THIEF_MOVED");
+    expect(redacted?.type === "THIEF_MOVED" ? redacted.stolenResource : undefined).toBeUndefined();
+  });
+
+  it("uses test-only turn-limit adjudication without requiring public VP threshold", () => {
+    const state = applyOrThrow(completeSetup(createDemoGame("turn-limit", { rules: { maxTurns: 1, maxTurnAdjudication: "leader" } })).state, { type: "ROLL_DICE", playerId: "p1" }).state;
+    state.players.p1!.score = 4;
+    state.players.p2!.score = 1;
+    state.players.p3!.score = 2;
+    state.players.p4!.score = 2;
+    const ended = applyOrThrow(state, { type: "END_TURN", playerId: "p1" });
+    expect(ended.state.phase).toMatchObject({ type: "GAME_OVER", winnerId: "p1", reason: "TURN_LIMIT" });
   });
 });
 

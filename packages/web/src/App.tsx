@@ -3,19 +3,24 @@ import {
   applyCommand,
   applyEvents,
   canBuildRoad,
+  classicDevelopmentDeck,
+  deterministicDiscard,
   emptyResources,
+  eligibleStealTargets,
   getLegalActions,
   hasResources,
   cityCost,
   maritimeTradeRatio,
   resourceCount,
   roadCost,
+  schemaVersion,
   serializeForViewer,
   settlementCost,
   specialCardCost,
   resources,
   type EdgeId,
   type BotDifficulty,
+  type DevelopmentCard,
   type GameConfig,
   type GameCommand,
   type GameEvent,
@@ -25,6 +30,7 @@ import {
   type ResourceBundle,
   type ViewerState,
   type VertexId,
+  type HexId,
 } from "@colonizt/game-core";
 import { completeSetup, createDemoGame } from "@colonizt/demo-state";
 import { platform, track } from "./analytics.js";
@@ -86,6 +92,22 @@ const defaultMatchOptions: MatchOptions = {
   },
 };
 
+const developmentCardLabels: Record<DevelopmentCard["type"], string> = {
+  KNIGHT: "Knight",
+  ROAD_BUILDING: "Road Building",
+  MONOPOLY: "Monopoly",
+  YEAR_OF_PLENTY: "Year of Plenty",
+  VICTORY_POINT: "Victory Point",
+};
+
+const firstStealTarget = (state: GameState, playerId: PlayerId, hexId: HexId): PlayerId | undefined =>
+  eligibleStealTargets(state, playerId, hexId)
+    .sort((left, right) =>
+      (state.players[right]?.score ?? 0) - (state.players[left]?.score ?? 0)
+      || resourceCount(state.players[right]?.resources ?? emptyResources()) - resourceCount(state.players[left]?.resources ?? emptyResources())
+      || state.playerOrder.indexOf(left) - state.playerOrder.indexOf(right),
+    )[0];
+
 const boardBounds = (state: GameState) => {
   const vertices = Object.values(state.board.vertices);
   const xs = vertices.map((vertex) => vertex.x);
@@ -107,20 +129,22 @@ const issueCommand = (state: GameState, command: GameCommand): { state: GameStat
 };
 
 const viewerToGameState = (viewer: ViewerState, seed: string, configOverrides: Partial<Pick<GameConfig, "botDifficulty" | "rules">> = {}): GameState => {
+  const deckRemaining = Math.max(0, Math.min(classicDevelopmentDeck.length, viewer.developmentDeckRemaining ?? classicDevelopmentDeck.length));
   const state: GameState = {
-    schemaVersion: 2,
+    schemaVersion,
     config: {
       matchId: `client-${seed}`,
       seed,
-      victoryPoints: 10,
-      maxPlayers: viewer.playerOrder.length,
-      turnSeconds: 45,
-      playerOrder: viewer.playerOrder,
-      playerNames: Object.fromEntries(viewer.players.map((player) => [player.id, player.name])),
-      playerColors: Object.fromEntries(viewer.players.map((player) => [player.id, player.color])),
-      botDifficulty: configOverrides.botDifficulty ?? defaultMatchOptions.botDifficulty,
+      victoryPoints: viewer.config.victoryPoints,
+      maxPlayers: viewer.config.maxPlayers,
+      turnSeconds: viewer.config.turnSeconds,
+      playerOrder: viewer.config.playerOrder,
+      playerNames: viewer.config.playerNames,
+      playerColors: viewer.config.playerColors,
+      botDifficulty: configOverrides.botDifficulty ?? viewer.config.botDifficulty ?? defaultMatchOptions.botDifficulty,
       rules: {
         ...defaultMatchOptions.rules,
+        ...viewer.config.rules,
         ...configOverrides.rules,
       },
     },
@@ -134,8 +158,12 @@ const viewerToGameState = (viewer: ViewerState, seed: string, configOverrides: P
         score: player.score,
         resources: player.resources ?? emptyResources(),
         specialCards: player.specialCards,
+        developmentCards: player.developmentCards ?? [],
         longestRoadLength: player.longestRoadLength,
         hasLongestRoad: player.hasLongestRoad,
+        playedKnights: player.playedKnights,
+        hasLargestArmy: player.hasLargestArmy,
+        ...(player.playedDevelopmentCardTurn !== undefined ? { playedDevelopmentCardTurn: player.playedDevelopmentCardTurn } : {}),
       },
     ])),
     playerOrder: viewer.playerOrder,
@@ -144,12 +172,17 @@ const viewerToGameState = (viewer: ViewerState, seed: string, configOverrides: P
     roads: viewer.roads,
     settlements: viewer.settlements,
     buildings: viewer.buildings,
+    developmentDeck: [...classicDevelopmentDeck],
+    developmentDeckCursor: classicDevelopmentDeck.length - deckRemaining,
+    playedKnightCounts: Object.fromEntries(viewer.players.map((player) => [player.id, player.playedKnights])),
     trades: Object.fromEntries(viewer.trades.map((trade) => [trade.id, trade])),
     eventSeq: viewer.eventSeq,
     rng: { seed, index: 0, policy: "SEEDED_DETERMINISTIC" },
   };
   if (viewer.lastRoll) state.lastRoll = viewer.lastRoll;
   if (viewer.longestRoadOwner) state.longestRoadOwner = viewer.longestRoadOwner;
+  if (viewer.largestArmyOwner) state.largestArmyOwner = viewer.largestArmyOwner;
+  if (viewer.thiefHexId) state.thiefHexId = viewer.thiefHexId;
   return state;
 };
 
@@ -163,6 +196,18 @@ const updateHiddenResourceCount = (count: number, event: GameEvent, playerId: Pl
       return event.playerId === playerId ? Math.max(0, count - resourceCount(event.cost)) : count;
     case "SPECIAL_CARD_BOUGHT":
       return event.playerId === playerId ? Math.max(0, count - resourceCount(event.cost)) : count;
+    case "RESOURCES_DISCARDED":
+      return event.playerId === playerId ? Math.max(0, count - resourceCount(event.resources)) : count;
+    case "THIEF_MOVED":
+      if (!event.stolenResource) return count;
+      if (event.playerId === playerId) return count + 1;
+      if (event.stealFromPlayerId === playerId) return Math.max(0, count - 1);
+      return count;
+    case "MONOPOLY_PLAYED":
+      if (event.playerId === playerId) return count + Object.values(event.collected).reduce((sum, value) => sum + value, 0);
+      return Math.max(0, count - (event.collected[playerId] ?? 0));
+    case "YEAR_OF_PLENTY_PLAYED":
+      return event.playerId === playerId ? count + 2 : count;
     case "MARITIME_TRADED":
       return event.playerId === playerId ? Math.max(0, count - event.ratio + 1) : count;
     case "RESOURCES_PRODUCED":
@@ -247,6 +292,9 @@ export const App = () => {
   const [selectedTradeResponder, setSelectedTradeResponder] = useState<PlayerId | null>(null);
   const [localTradeDeadlines, setLocalTradeDeadlines] = useState<Record<string, number>>({});
   const [buildMode, setBuildMode] = useState<BuildMode>("road");
+  const [discardDraft, setDiscardDraft] = useState<ResourceBundle>(() => emptyResources());
+  const [roadBuildingDraft, setRoadBuildingDraft] = useState<{ cardId: string; edgeIds: EdgeId[] }>(() => ({ cardId: "", edgeIds: [] }));
+  const [yearOfPlentyDraft, setYearOfPlentyDraft] = useState<[Resource, Resource]>(["grain", "ore"]);
   const [matchOptions, setMatchOptions] = useState<MatchOptions>(defaultMatchOptions);
   const [pendingSetupVertex, setPendingSetupVertex] = useState<VertexId | null>(null);
   const [diceAnimating, setDiceAnimating] = useState(false);
@@ -316,6 +364,21 @@ export const App = () => {
   const canOfferTrade = legal.some((action) => action.type === "OFFER_TRADE");
   const specialCost = specialCardCost(state.config.rules);
   const canBuySpecialCard = legal.some((action) => action.type === "BUY_SPECIAL_CARD");
+  const discardAction = legal.find((action) => action.type === "DISCARD_RESOURCES");
+  const moveThiefAction = legal.find((action) => action.type === "MOVE_THIEF");
+  const playKnightAction = legal.find((action) => action.type === "PLAY_KNIGHT");
+  const playRoadBuildingAction = legal.find((action) => action.type === "PLAY_ROAD_BUILDING");
+  const playMonopolyAction = legal.find((action) => action.type === "PLAY_MONOPOLY");
+  const playYearOfPlentyAction = legal.find((action) => action.type === "PLAY_YEAR_OF_PLENTY");
+  const roadBuildingOptions = playRoadBuildingAction?.type === "PLAY_ROAD_BUILDING" ? playRoadBuildingAction.options : [];
+  const roadBuildingRequiredCount = playRoadBuildingAction?.type === "PLAY_ROAD_BUILDING" ? playRoadBuildingAction.requiredRoadCount : 0;
+  const legalThiefHexes = new Set([
+    ...(moveThiefAction?.type === "MOVE_THIEF" ? moveThiefAction.hexes : []),
+  ]);
+  const ownDevelopmentCards = humanPlayer?.developmentCards ?? [];
+  const canSubmitDiscard = discardAction?.type === "DISCARD_RESOURCES"
+    && resourceCount(discardDraft) === discardAction.count
+    && Boolean(humanPlayer && hasResources(humanPlayer.resources, discardDraft));
   const hasTradeOverlap = resources.some((resource) => tradeOffer[resource] > 0 && tradeRequest[resource] > 0);
   const canSubmitOfferTrade = canOfferTrade && resourceCount(tradeOffer) > 0 && resourceCount(tradeRequest) > 0 && !hasTradeOverlap && Boolean(humanPlayer && hasResources(humanPlayer.resources, tradeOffer));
   const keyboardShortcutsEnabled = platform() === "desktop";
@@ -355,6 +418,8 @@ export const App = () => {
   const setupRoadActive = state.phase.type === "SETUP_PLACEMENT" && isHumanActive && Boolean(pendingSetupVertex);
   const actionHint = (() => {
     if (state.phase.type === "GAME_OVER") return { title: "Game over", detail: `${state.players[state.phase.winnerId]?.name ?? state.phase.winnerId} reached the victory target.` };
+    if (state.phase.type === "DISCARDING") return { title: "Discard", detail: `Choose ${discardAction?.type === "DISCARD_RESOURCES" ? discardAction.count : 0} resources.` };
+    if (state.phase.type === "MOVING_THIEF") return { title: "Move thief", detail: "Choose a destination and steal target if available." };
     if (!isHumanActive) return { title: "Waiting", detail: `${activeName ?? "Opponent"} is taking a turn.` };
     if (activeStagedTrade?.fromPlayerId === humanPlayerId) return { title: "Choose trade partner", detail: "Pick a player who wants to accept, or cancel the offer." };
     if (activeStagedTrade) return { title: "Answer trade", detail: "Mark whether you want to accept before the offer expires." };
@@ -402,6 +467,7 @@ export const App = () => {
     setReplayLog(null);
     setError(null);
     setReplayIndex(null);
+    if (command.type === "DISCARD_RESOURCES") setDiscardDraft(emptyResources());
     if (command.type === "MARITIME_TRADE" || command.type === "OFFER_TRADE") {
       clearTradeDraft();
       setTradeOpen(false);
@@ -433,6 +499,7 @@ export const App = () => {
       markCommandPending();
       clientSeqRef.current += 1;
       if (networkSession) writeResumeState({ token: networkSession.token, userId: networkSession.userId, roomId: networkRoomId, clientSeq: clientSeqRef.current, lastSeq: lastServerSeqRef.current });
+      if (command.type === "DISCARD_RESOURCES") setDiscardDraft(emptyResources());
       if (command.type === "MARITIME_TRADE" || command.type === "OFFER_TRADE") {
         clearTradeDraft();
         setTradeOpen(false);
@@ -459,7 +526,16 @@ export const App = () => {
         ? `${current.config.matchId}:${current.turn}:${current.phase.type}:${currentActive}`
         : null;
       if (currentKey !== key || currentActive !== humanPlayerId) return;
-      if (current.phase.type === "WAITING_FOR_ROLL") {
+      if (current.phase.type === "DISCARDING") {
+        const count = current.phase.pending[humanPlayerId] ?? 0;
+        if (count > 0) commit({ type: "DISCARD_RESOURCES", playerId: humanPlayerId, resources: deterministicDiscard(current, humanPlayerId, count) });
+      } else if (current.phase.type === "MOVING_THIEF") {
+        const hexId = getLegalActions(current, humanPlayerId).find((action) => action.type === "MOVE_THIEF")?.hexes[0] as HexId | undefined;
+        if (hexId) {
+          const stealFromPlayerId = firstStealTarget(current, humanPlayerId, hexId);
+          commit({ type: "MOVE_THIEF", playerId: humanPlayerId, hexId, ...(stealFromPlayerId ? { stealFromPlayerId } : {}) });
+        }
+      } else if (current.phase.type === "WAITING_FOR_ROLL") {
         commit({ type: "ROLL_DICE", playerId: humanPlayerId });
       } else if (current.phase.type === "ACTION_PHASE") {
         const modalTrade = Object.values(current.trades).find((trade) => trade.status === "COLLECTING_RESPONSES" && trade.fromPlayerId === humanPlayerId);
@@ -475,7 +551,7 @@ export const App = () => {
   const stagedTradeSeconds = stagedTradeDeadline ? Math.max(0, Math.ceil((stagedTradeDeadline - nowMs) / 1000)) : undefined;
   const turnSecondsRemaining = turnDeadline ? Math.max(0, Math.ceil((turnDeadline.dueAt - nowMs) / 1000)) : undefined;
   const turnTimerLabel = turnDeadline && turnSecondsRemaining !== undefined
-    ? `${turnDeadline.mode === "roll" ? "Roll" : "Action"} ${formatTimer(turnSecondsRemaining)}`
+    ? `${turnDeadline.mode === "roll" ? "Roll" : turnDeadline.mode === "discard" ? "Discard" : turnDeadline.mode === "thief" ? "Thief" : "Action"} ${formatTimer(turnSecondsRemaining)}`
     : undefined;
 
   const cancelPendingSetupPlacement = () => {
@@ -602,6 +678,78 @@ export const App = () => {
     playSound("select");
     commit({ type: "BUY_SPECIAL_CARD", playerId: humanPlayerId });
   };
+  const roadBuildingCandidateEdges = (selected: EdgeId[]): EdgeId[] => {
+    if (selected.length === 0) return [...new Set(roadBuildingOptions.map((option) => option[0]))];
+    if (selected.length >= roadBuildingRequiredCount) return [];
+    return [...new Set(roadBuildingOptions
+      .filter((option) => option[0] === selected[0])
+      .map((option) => option[1])
+      .filter((edgeId): edgeId is EdgeId => Boolean(edgeId)))];
+  };
+  const toggleRoadBuildingEdge = (cardId: string, edgeId: EdgeId) => {
+    playSound("select");
+    setRoadBuildingDraft((current) => {
+      const activeEdges = current.cardId === cardId ? current.edgeIds : [];
+      if (activeEdges.includes(edgeId)) return { cardId, edgeIds: activeEdges.filter((candidate) => candidate !== edgeId) };
+      if (activeEdges.length >= roadBuildingRequiredCount) return { cardId, edgeIds: [edgeId] };
+      return { cardId, edgeIds: [...activeEdges, edgeId] };
+    });
+  };
+  const clearRoadBuildingDraft = (cardId: string) => {
+    playSound("select");
+    setRoadBuildingDraft({ cardId, edgeIds: [] });
+  };
+  const incrementDiscard = (resource: Resource) => {
+    if (!humanPlayer || humanPlayer.resources[resource] <= discardDraft[resource]) return;
+    if (discardAction?.type === "DISCARD_RESOURCES" && resourceCount(discardDraft) >= discardAction.count) return;
+    playSound("select");
+    setDiscardDraft((current) => ({ ...current, [resource]: current[resource] + 1 }));
+  };
+  const decrementDiscard = (resource: Resource) => {
+    if (discardDraft[resource] <= 0) return;
+    playSound("select");
+    setDiscardDraft((current) => ({ ...current, [resource]: Math.max(0, current[resource] - 1) }));
+  };
+  const submitDiscard = () => {
+    if (!canSubmitDiscard) return;
+    playSound("select");
+    commit({ type: "DISCARD_RESOURCES", playerId: humanPlayerId, resources: discardDraft });
+  };
+  const moveThief = (hexId: HexId, stealFromPlayerId?: PlayerId) => {
+    playSound("select");
+    commit({ type: "MOVE_THIEF", playerId: humanPlayerId, hexId, ...(stealFromPlayerId ? { stealFromPlayerId } : {}) });
+  };
+  const playKnight = (cardId: string, hexId: HexId, stealFromPlayerId?: PlayerId) => {
+    playSound("select");
+    commit({ type: "PLAY_KNIGHT", playerId: humanPlayerId, cardId, hexId, ...(stealFromPlayerId ? { stealFromPlayerId } : {}) });
+  };
+  const playRoadBuilding = (cardId: string) => {
+    const selected = roadBuildingDraft.cardId === cardId ? roadBuildingDraft.edgeIds : [];
+    if (selected.length !== roadBuildingRequiredCount || !selected[0]) return;
+    const legalSequence = roadBuildingOptions.some((option) =>
+      option.length === selected.length && option.every((edgeId, index) => edgeId === selected[index]),
+    );
+    if (!legalSequence) return;
+    const edgeIds = selected[1] ? [selected[0], selected[1]] as [EdgeId, EdgeId] : [selected[0]] as [EdgeId];
+    playSound("select");
+    commit({ type: "PLAY_ROAD_BUILDING", playerId: humanPlayerId, cardId, edgeIds });
+    setRoadBuildingDraft({ cardId: "", edgeIds: [] });
+  };
+  const playMonopoly = (cardId: string, resource: Resource) => {
+    playSound("select");
+    commit({ type: "PLAY_MONOPOLY", playerId: humanPlayerId, cardId, resource });
+  };
+  const playYearOfPlenty = (cardId: string, picked: [Resource, Resource]) => {
+    playSound("select");
+    commit({ type: "PLAY_YEAR_OF_PLENTY", playerId: humanPlayerId, cardId, resources: picked });
+  };
+  const setYearOfPlentyResource = (index: 0 | 1, resource: Resource) => {
+    setYearOfPlentyDraft((current) => index === 0 ? [resource, current[1]] : [current[0], resource]);
+  };
+  const handleHex = (hexId: HexId) => {
+    if (!legalThiefHexes.has(hexId)) return;
+    moveThief(hexId, firstStealTarget(state, humanPlayerId, hexId));
+  };
   const openTradePanel = () => {
     if (!canOfferTrade && !activeStagedTrade) return;
     playSound("select");
@@ -654,10 +802,11 @@ export const App = () => {
     },
   ];
   const openTradeFromResource = (resource: Resource) => {
+    if (!canOfferTrade) return;
     setTradeOpen(true);
     playSound("select");
     const owned = humanPlayer?.resources[resource] ?? 0;
-    if (!canOfferTrade || owned <= tradeOffer[resource]) return;
+    if (owned <= tradeOffer[resource]) return;
     const nextOffer = { ...tradeOffer, [resource]: tradeOffer[resource] + 1 };
     const nextRequest = { ...tradeRequest, [resource]: 0 };
     setTradeDraft(normalizeDraftForState(state, nextOffer, nextRequest));
@@ -1234,8 +1383,28 @@ export const App = () => {
                   const vertex = state.board.vertices[vertexId]!;
                   return { x: acc.x + vertex.x / 6, y: acc.y + vertex.y / 6 };
                 }, { x: 0, y: 0 });
+                const thiefHere = state.thiefHexId === hex.id;
+                const legalThiefDestination = legalThiefHexes.has(hex.id);
                 return (
-                  <g key={hex.id} filter="url(#softShadow)">
+                  <g
+                    key={hex.id}
+                    className={`${thiefHere ? "thief-hex" : ""} ${legalThiefDestination ? "legal-thief-hex" : ""}`}
+                    filter="url(#softShadow)"
+                    role={legalThiefDestination ? "button" : undefined}
+                    tabIndex={legalThiefDestination ? 0 : -1}
+                    aria-label={legalThiefDestination ? `Move thief to ${terrainLabels[hex.resource]} hex` : undefined}
+                    onClick={(event) => {
+                      if (!legalThiefDestination) return;
+                      event.stopPropagation();
+                      handleHex(hex.id);
+                    }}
+                    onKeyDown={(event) => {
+                      if (!legalThiefDestination || (event.key !== "Enter" && event.key !== " ")) return;
+                      event.preventDefault();
+                      event.stopPropagation();
+                      handleHex(hex.id);
+                    }}
+                  >
                     <polygon className="hex-bed" points={points} />
                     <polygon className={`hex hex-${hex.resource}`} points={points}>
                       <title>{terrainLabels[hex.resource]}</title>
@@ -1251,6 +1420,12 @@ export const App = () => {
                     ) : (
                       <text className="dead-tile-label" x={center.x} y={center.y + 0.36}>No yield</text>
                     )}
+                    {thiefHere ? (
+                      <g className="thief-marker" transform={`translate(${center.x} ${center.y - 0.02})`} aria-label="Thief">
+                        <circle r="0.2" />
+                        <path d="M-0.08 -0.02h0.16M-0.12 0.08h0.24M-0.05 -0.02v0.1M0.05 -0.02v0.1" />
+                      </g>
+                    ) : null}
                   </g>
                 );
               })}
@@ -1594,6 +1769,138 @@ export const App = () => {
           </div>
 
           <aside className="side-panel" aria-label="Players and controls">
+            {discardAction?.type === "DISCARD_RESOURCES" ? (
+              <div className="phase-card modal-control-card" aria-label="Discard resources">
+                <div className="panel-title">
+                  <strong>Discard</strong>
+                  <span>{resourceCount(discardDraft)}/{discardAction.count}</span>
+                </div>
+                <div className="discard-grid">
+                  {resources.map((resource) => (
+                    <div key={resource} className="discard-row">
+                      <ResourceCard resource={resource} count={humanPlayer?.resources[resource] ?? 0} compact />
+                      <button type="button" onClick={() => decrementDiscard(resource)} disabled={discardDraft[resource] <= 0}>-</button>
+                      <strong>{discardDraft[resource]}</strong>
+                      <button
+                        type="button"
+                        onClick={() => incrementDiscard(resource)}
+                        disabled={!humanPlayer || humanPlayer.resources[resource] <= discardDraft[resource] || resourceCount(discardDraft) >= discardAction.count}
+                      >
+                        +
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                <button type="button" className="primary-wide" onClick={submitDiscard} disabled={!canSubmitDiscard}>Discard</button>
+              </div>
+            ) : null}
+
+            {moveThiefAction?.type === "MOVE_THIEF" ? (
+              <div className="phase-card modal-control-card" aria-label="Move thief">
+                <div className="panel-title">
+                  <strong>Move Thief</strong>
+                  <span>{moveThiefAction.hexes.length} hexes</span>
+                </div>
+                <div className="thief-target-list">
+                  {moveThiefAction.hexes.map((hexId) => {
+                    const hex = state.board.hexes[hexId];
+                    const targets = eligibleStealTargets(state, humanPlayerId, hexId as HexId);
+                    return (
+                      <div key={hexId} className="thief-target-row">
+                        <span>{hex ? terrainLabels[hex.resource] : hexId}</span>
+                        {targets.length > 0 ? targets.map((targetId) => (
+                          <button key={targetId} type="button" onClick={() => moveThief(hexId as HexId, targetId)}>
+                            {state.players[targetId]?.name ?? targetId}
+                          </button>
+                        )) : (
+                          <button type="button" onClick={() => moveThief(hexId as HexId)}>Move</button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
+
+            <div className="phase-card dev-card-panel" aria-label="Development cards">
+              <div className="panel-title">
+                <strong>Development Cards</strong>
+                <span>{ownDevelopmentCards.filter((card) => !card.playedTurn).length}</span>
+              </div>
+              {ownDevelopmentCards.length === 0 ? (
+                <span className="muted-line">No cards</span>
+              ) : (
+                <div className="dev-card-list">
+                  {ownDevelopmentCards.map((card) => {
+                    const playable = !card.playedTurn && card.boughtTurn !== state.turn && state.phase.type !== "DISCARDING" && state.phase.type !== "MOVING_THIEF";
+                    return (
+                      <div key={card.id} className={`dev-card-row ${card.playedTurn ? "played" : ""}`}>
+                        <span>{developmentCardLabels[card.type]}</span>
+                        <small>{card.playedTurn ? "played" : card.boughtTurn === state.turn ? "new" : "ready"}</small>
+                        {card.type === "KNIGHT" && playKnightAction?.type === "PLAY_KNIGHT" && playable ? (
+                          <div className="dev-card-actions">
+                            {playKnightAction.hexes.slice(0, 4).map((hexId) => {
+                              const target = firstStealTarget(state, humanPlayerId, hexId as HexId);
+                              return (
+                                <button key={hexId} type="button" onClick={() => playKnight(card.id, hexId as HexId, target)}>
+                                  {state.board.hexes[hexId]?.resource ?? hexId}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        ) : null}
+                        {card.type === "ROAD_BUILDING" && playRoadBuildingAction?.type === "PLAY_ROAD_BUILDING" && playable ? (
+                          <div className="dev-card-actions dev-card-picker">
+                            {(() => {
+                              const selected = roadBuildingDraft.cardId === card.id ? roadBuildingDraft.edgeIds : [];
+                              const selectedSet = new Set(selected);
+                              const candidates = roadBuildingCandidateEdges(selected);
+                              return (
+                                <>
+                                  {selected.map((edgeId) => (
+                                    <button key={`selected-${edgeId}`} type="button" className="selected" onClick={() => toggleRoadBuildingEdge(card.id, edgeId)}>
+                                      {edgeId}
+                                    </button>
+                                  ))}
+                                  {candidates.slice(0, 12).map((edgeId) => (
+                                    <button key={edgeId} type="button" className={selectedSet.has(edgeId) ? "selected" : ""} onClick={() => toggleRoadBuildingEdge(card.id, edgeId)}>
+                                      {edgeId}
+                                    </button>
+                                  ))}
+                                  {selected.length > 0 ? <button type="button" onClick={() => clearRoadBuildingDraft(card.id)}>Clear</button> : null}
+                                  <button type="button" className="primary-wide" onClick={() => playRoadBuilding(card.id)} disabled={selected.length !== roadBuildingRequiredCount || roadBuildingRequiredCount === 0}>
+                                    Build {roadBuildingRequiredCount}
+                                  </button>
+                                </>
+                              );
+                            })()}
+                          </div>
+                        ) : null}
+                        {card.type === "MONOPOLY" && playMonopolyAction?.type === "PLAY_MONOPOLY" && playable ? (
+                          <div className="dev-card-actions">
+                            {resources.map((resource) => (
+                              <button key={resource} type="button" onClick={() => playMonopoly(card.id, resource)}>{resourceLabels[resource]}</button>
+                            ))}
+                          </div>
+                        ) : null}
+                        {card.type === "YEAR_OF_PLENTY" && playYearOfPlentyAction?.type === "PLAY_YEAR_OF_PLENTY" && playable ? (
+                          <div className="dev-card-actions dev-card-picker">
+                            <select aria-label="Year of Plenty first resource" value={yearOfPlentyDraft[0]} onChange={(event) => setYearOfPlentyResource(0, event.target.value as Resource)}>
+                              {resources.map((resource) => <option key={resource} value={resource}>{resourceLabels[resource]}</option>)}
+                            </select>
+                            <select aria-label="Year of Plenty second resource" value={yearOfPlentyDraft[1]} onChange={(event) => setYearOfPlentyResource(1, event.target.value as Resource)}>
+                              {resources.map((resource) => <option key={resource} value={resource}>{resourceLabels[resource]}</option>)}
+                            </select>
+                            <button type="button" onClick={() => playYearOfPlenty(card.id, yearOfPlentyDraft)}>Take</button>
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
             <div className="game-log-panel" aria-label="Gameplay log">
               <div className="panel-title">
                 <strong>Gameplay Log</strong>
@@ -1621,6 +1928,7 @@ export const App = () => {
               <span>{state.lastRoll ? `${state.lastRoll.dice[0]} + ${state.lastRoll.dice[1]} = ${state.lastRoll.sum}` : "Dice have not rolled yet"}</span>
               {turnTimerLabel ? <span>{turnTimerLabel} remaining</span> : null}
               <span>Target {state.config.victoryPoints} VP · Longest Road {state.longestRoadOwner ? state.players[state.longestRoadOwner]?.name : "unclaimed"}</span>
+              <span>Largest Army {state.largestArmyOwner ? state.players[state.largestArmyOwner]?.name : "unclaimed"} · Thief {state.thiefHexId ? terrainLabels[state.board.hexes[state.thiefHexId]?.resource ?? "desert"] : "unset"}</span>
               <span>Difficulty {state.config.botDifficulty ?? "medium"}{activeRules.length > 0 ? ` · ${activeRules.join(" · ")}` : ""}</span>
             </div>
 
@@ -1629,20 +1937,22 @@ export const App = () => {
                 <article key={player.id} className={`player ${player.id === activePlayer ? "active" : ""}`} style={{ borderColor: player.color }}>
                   <div className="player-heading">
                     <strong>{player.name}</strong>
-                    <div className="player-stats" aria-label={`${player.score} victory points, ${player.resourceCount} cards, ${player.specialCards} special cards, longest road length ${player.longestRoadLength}`}>
+                    <div className="player-stats" aria-label={`${player.score} victory points, ${player.resourceCount} cards, ${player.developmentCardCount} development cards, ${player.playedKnights} knights, longest road length ${player.longestRoadLength}`}>
                       <span>{player.score} VP</span>
                       <span>{player.resourceCount} cards</span>
-                      <span>{player.specialCards} special</span>
+                      <span>{player.developmentCardCount} dev</span>
+                      <span>{player.playedKnights} knights</span>
                       <span>road {player.longestRoadLength}</span>
                     </div>
                     <div className="player-mobile-stats" aria-hidden="true">
                       <span>{player.score} VP</span>
                       <span>{player.resourceCount}C</span>
-                      <span>{player.specialCards}S</span>
+                      <span>{player.developmentCardCount}D</span>
                       <span>R{player.longestRoadLength}</span>
                     </div>
                   </div>
                   {player.hasLongestRoad ? <span className="badge">Longest Road</span> : null}
+                  {player.hasLargestArmy ? <span className="badge">Largest Army</span> : null}
                   {player.resources ? (
                     <div className="mini-resources">
                       {resources.map((resource) => <ResourceCard key={resource} resource={resource} count={player.resources?.[resource] ?? 0} compact />)}

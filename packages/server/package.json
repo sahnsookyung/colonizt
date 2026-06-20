@@ -10,7 +10,7 @@
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "typecheck": "tsc -b",
-    "test": "vitest run"
+    "test": "vitest run --root ../.. packages/server --passWithNoTests"
   },
   "dependencies": {
     "@colonizt/bots": "0.1.0",

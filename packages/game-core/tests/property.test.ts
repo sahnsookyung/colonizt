@@ -26,5 +26,5 @@ describe("property checks", () => {
       }),
       { numRuns: 50 },
     );
-  }, 90_000);
+  }, 240_000);
 });

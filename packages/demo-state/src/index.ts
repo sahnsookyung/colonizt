@@ -5,8 +5,11 @@ import {
   createFixedBoard,
   createGame,
   createSeededBoard,
+  deterministicDiscard,
   emptyResources,
+  eligibleStealTargets,
   getLegalActions,
+  resourceCount,
   resources,
   type EdgeId,
   type BotDifficulty,
@@ -15,15 +18,18 @@ import {
   type GameEvent,
   type GameState,
   type PlayerId,
+  type HexId,
   type ResourceBundle,
   type VertexId,
 } from "@colonizt/game-core";
-import { createBotTradeId, createBotView, evaluateTrade, greedyBot, plannerBot, randomLegalBot, type BotController } from "@colonizt/bots";
+import { createBotTradeId, createBotView, evaluateTrade, greedyBot, plannerBot, randomLegalBot, type BotController, type BotProfile } from "@colonizt/bots";
 
 export const demoPlayerIds = ["p1", "p2", "p3", "p4"] as const;
 
 export interface DemoGameOptions {
   botDifficulty?: BotDifficulty;
+  botDifficulties?: Partial<Record<PlayerId, BotDifficulty>>;
+  botProfiles?: Partial<Record<PlayerId, BotProfile>>;
   rules?: GameConfig["rules"];
 }
 
@@ -126,10 +132,54 @@ export const botControllers: Record<PlayerId, BotController> = {
   p4: randomLegalBot,
 };
 
-const chooseCommand = (state: GameState, playerId: PlayerId): GameCommand | undefined => {
-  const bot = botControllers[playerId] ?? randomLegalBot;
-  const view = createBotView(state, playerId, bot.profile);
+const profileControllers: Record<BotProfile, BotController> = {
+  greedy: greedyBot,
+  planner: plannerBot,
+  random: randomLegalBot,
+};
+
+const controllerFor = (playerId: PlayerId, options: DemoGameOptions): BotController => {
+  const profile = options.botProfiles?.[playerId];
+  return profile ? profileControllers[profile] : botControllers[playerId] ?? randomLegalBot;
+};
+
+const difficultyFor = (state: GameState, playerId: PlayerId, options: DemoGameOptions): BotDifficulty =>
+  options.botDifficulties?.[playerId] ?? options.botDifficulty ?? state.config.botDifficulty ?? "medium";
+
+const chooseCommand = (state: GameState, playerId: PlayerId, options: DemoGameOptions): GameCommand | undefined => {
+  const bot = controllerFor(playerId, options);
+  const view = createBotView(state, playerId, bot.profile, difficultyFor(state, playerId, options));
   return bot.chooseCommand(view, (prefix: string) => createBotTradeId(state, playerId, bot.profile) || prefix);
+};
+
+const fallbackCommand = (state: GameState, playerId: PlayerId): GameCommand | undefined => {
+  if (state.phase.type === "DISCARDING") {
+    const count = state.phase.pending[playerId] ?? 0;
+    return count > 0 ? { type: "DISCARD_RESOURCES", playerId, resources: deterministicDiscard(state, playerId, count) } : undefined;
+  }
+  if (state.phase.type === "MOVING_THIEF") {
+    const action = getLegalActions(state, playerId).find((candidate) => candidate.type === "MOVE_THIEF");
+    if (action?.type !== "MOVE_THIEF") return undefined;
+    const ranked = action.hexes
+      .map((hexId) => {
+        const targets = eligibleStealTargets(state, playerId, hexId as HexId);
+        return {
+          hexId: hexId as HexId,
+          targets,
+          score: targets.reduce((sum, targetId) => sum + resourceCount(state.players[targetId]?.resources ?? emptyResources()) + (state.players[targetId]?.score ?? 0) * 2, 0),
+        };
+      })
+      .sort((left, right) => right.score - left.score || left.hexId.localeCompare(right.hexId));
+    const selected = ranked[0];
+    if (!selected) return undefined;
+    const stealFromPlayerId = selected.targets[0];
+    return { type: "MOVE_THIEF", playerId, hexId: selected.hexId, ...(stealFromPlayerId ? { stealFromPlayerId } : {}) };
+  }
+  const modalTrade = activeCollectingTradeForPlayer(state, playerId);
+  if (modalTrade) return { type: "CANCEL_TRADE", playerId, tradeId: modalTrade.id };
+  if (state.phase.type === "WAITING_FOR_ROLL") return { type: "ROLL_DICE", playerId };
+  if (state.phase.type === "ACTION_PHASE") return { type: "END_TURN", playerId };
+  return undefined;
 };
 
 export const playBotGame = (seed = "bot-game", maxCommands = 300, options: DemoGameOptions = {}): { state: GameState; events: GameEvent[]; invalidCommands: number } => {
@@ -139,7 +189,7 @@ export const playBotGame = (seed = "bot-game", maxCommands = 300, options: DemoG
 
   for (let step = 0; step < maxCommands && current.phase.type !== "GAME_OVER"; step += 1) {
     if (!("activePlayerId" in current.phase)) break;
-    let command = chooseCommand(current, current.phase.activePlayerId);
+    let command = chooseCommand(current, current.phase.activePlayerId, options) ?? fallbackCommand(current, current.phase.activePlayerId);
     if (!command) break;
     if (command.type === "PLACE_SETUP") {
       const setupCommand = command;
@@ -150,12 +200,8 @@ export const playBotGame = (seed = "bot-game", maxCommands = 300, options: DemoG
     if (!result.ok) {
       invalidCommands += 1;
       const active = "activePlayerId" in current.phase ? current.phase.activePlayerId : current.playerOrder[0]!;
-      const modalTrade = activeCollectingTradeForPlayer(current, active);
-      const fallback: GameCommand = modalTrade
-        ? { type: "CANCEL_TRADE", playerId: active, tradeId: modalTrade.id }
-        : current.phase.type === "WAITING_FOR_ROLL"
-          ? { type: "ROLL_DICE", playerId: active }
-          : { type: "END_TURN", playerId: active };
+      const fallback = fallbackCommand(current, active);
+      if (!fallback) break;
       const fallbackResult = applyCommand(current, fallback);
       if (!fallbackResult.ok) break;
       current = fallbackResult.value.nextState;
@@ -167,9 +213,11 @@ export const playBotGame = (seed = "bot-game", maxCommands = 300, options: DemoG
 
     if (command.type === "OFFER_TRADE") {
       for (const recipient of current.playerOrder.filter((candidate) => candidate !== command.playerId)) {
-        const view = createBotView(current, recipient, botControllers[recipient]?.profile ?? "greedy");
+        const bot = controllerFor(recipient, options);
+        const difficulty = difficultyFor(current, recipient, options);
+        const view = createBotView(current, recipient, bot.profile, difficulty);
         const trade = current.trades[command.tradeId];
-        if (!trade || evaluateTrade(view, trade, view.profile ?? "greedy") !== "ACCEPT") continue;
+        if (!trade || evaluateTrade(view, trade, view.profile ?? "greedy", difficulty) !== "ACCEPT") continue;
         const responded = applyCommand(current, { type: "RESPOND_TRADE", playerId: recipient, tradeId: command.tradeId, response: "WANTS_ACCEPT" });
         if (!responded.ok) continue;
         current = responded.value.nextState;

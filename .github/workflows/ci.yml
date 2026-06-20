@@ -49,6 +49,9 @@ jobs:
       - run: npm run test:property
       - run: npm run test:integration
       - run: npm --workspace @colonizt/web run test
+      - run: npm run simulate:bots:gate
+      - run: npm run simulate:bots:default-lineup
+      - run: npm run simulate:bots:difficulty
       - run: npm run replay:fixtures
       - run: npm run build
       - run: npx playwright install --with-deps chromium

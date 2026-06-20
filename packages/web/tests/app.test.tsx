@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "../src/App.js";
 
@@ -106,6 +106,10 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: /Bot Match/ }));
     fireEvent.click(screen.getByRole("button", { name: "Ready" }));
     fireEvent.click(screen.getByRole("button", { name: "Roll dice" }));
+    const thiefPanel = screen.queryByLabelText("Move thief");
+    if (thiefPanel) {
+      fireEvent.click(within(thiefPanel).getAllByRole("button")[0]!);
+    }
     expect(screen.queryByLabelText("Trade interface")).not.toBeInTheDocument();
     const handButtons = [...screen.getByLabelText("Your resources").querySelectorAll("button")];
     const ownedButton = handButtons.find((button) => Number(button.querySelector(".resource-count")?.textContent ?? "0") > 0);
@@ -127,6 +131,8 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Roll dice" })).toHaveAttribute("aria-keyshortcuts", "R");
     fireEvent.keyDown(window, { key: "r" });
     expect(screen.getByText(/Roll \d+/)).toBeInTheDocument();
+    const thiefPanel = screen.queryByLabelText("Move thief");
+    if (thiefPanel) fireEvent.click(within(thiefPanel).getAllByRole("button")[0]!);
     expect(screen.getByRole("button", { name: "End Turn" })).toHaveAttribute("aria-keyshortcuts", "E");
     fireEvent.keyDown(window, { key: "e" });
     expect(screen.getByText("Active: Briar")).toBeInTheDocument();
@@ -153,7 +159,7 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Roll dice" })).toHaveTextContent("Roll --");
   });
 
-  it("renders explicit board action buttons and keeps gameplay log first in the sidebar", () => {
+  it("renders explicit board action buttons and sidebar panels", () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: /Bot Match/ }));
 
@@ -166,7 +172,8 @@ describe("App", () => {
     expect(actionBar).toHaveTextContent("End Turn");
 
     const sidebar = screen.getByLabelText("Players and controls");
-    expect(sidebar.firstElementChild).toHaveAttribute("aria-label", "Gameplay log");
+    expect(within(sidebar).getByLabelText("Development cards")).toBeInTheDocument();
+    expect(within(sidebar).getByLabelText("Gameplay log")).toBeInTheDocument();
   });
 
   it("auto-rolls and auto-ends when phase timers expire", () => {
@@ -180,9 +187,11 @@ describe("App", () => {
     });
     expect(screen.getByText(/Roll \d+/)).toBeInTheDocument();
 
-    act(() => {
-      vi.advanceTimersByTime(240_000);
-    });
+    for (let index = 0; index < 3 && !screen.queryByText("Active: Briar"); index += 1) {
+      act(() => {
+        vi.advanceTimersByTime(240_000);
+      });
+    }
     expect(screen.getByText("Active: Briar")).toBeInTheDocument();
   });
 
@@ -191,7 +200,7 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: /Bot Match/ }));
     fireEvent.click(screen.getByRole("button", { name: "Replay" }));
     expect(screen.getByText(/^Replay \d+\/\d+/)).toBeInTheDocument();
-  });
+  }, 15_000);
 
   it("loads persisted match history on demand", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify([

@@ -5,7 +5,7 @@ export interface TurnDeadline {
   key: string;
   dueAt: number;
   durationMs: number;
-  mode: "roll" | "action";
+  mode: "roll" | "action" | "discard" | "thief";
 }
 
 export interface UseTurnTimerOptions {
@@ -40,7 +40,11 @@ export const useTurnTimer = ({
       ? "roll"
       : state.phase.type === "ACTION_PHASE"
         ? "action"
-        : null;
+        : state.phase.type === "DISCARDING"
+          ? "discard"
+          : state.phase.type === "MOVING_THIEF"
+            ? "thief"
+            : null;
     if (!phaseMode || !activePlayer || paused || state.phase.type === "GAME_OVER") {
       setTurnDeadline(null);
       return undefined;

@@ -37,6 +37,7 @@ export interface BuildServerOptions {
   metrics?: MetricsRegistry;
   nodeId?: string;
   instanceMode?: "single";
+  allowTestRules?: boolean;
 }
 
 type SocketClient = { socket: WebSocketLike; session: Session; roomId?: string; asSpectator?: boolean };
@@ -101,6 +102,7 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
   };
   const sessionTtlMs = options.sessionTtlMs ?? positiveInt(process.env.SESSION_TTL_MS, 30 * 24 * 60 * 60 * 1000);
   const adminToken = configuredSecret(options.adminToken === undefined ? process.env.ADMIN_TOKEN : options.adminToken);
+  const allowTestRules = options.allowTestRules ?? process.env.ALLOW_TEST_RULES === "true";
   let manager = options.manager;
   let ownershipStore = options.roomOwnershipStore;
   let pool: ReturnType<typeof createPool> | undefined;
@@ -262,7 +264,7 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
       broadcastRoom(roomId, (target) => ({
         type: "EVENTS",
         roomId,
-        events: serializeEventsForViewer(result.events, viewerIdFor(target), result.state.playerOrder),
+        events: serializeEventsForViewer(result.events, viewerIdFor(target), result.state.playerOrder, result.state.phase.type === "GAME_OVER"),
         snapshot: snapshotFor(roomId, result.state, target),
       }));
     },
@@ -397,6 +399,9 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     const settings = parsed.data.minPlayers === undefined
       ? (({ minPlayers: _minPlayers, ...rest }) => rest)(parsed.data)
       : parsed.data;
+    if (!allowTestRules && (settings.rules?.maxTurns !== undefined || settings.rules?.maxTurnAdjudication !== undefined)) {
+      return reply.status(400).send({ code: "TEST_RULES_DISABLED", message: "Turn-limit adjudication is available only for test and smoke rooms" });
+    }
     try {
       return publicRoomWithInvite(request, await manager.createRoom(session, settings), session.userId);
     } catch (error) {
@@ -573,7 +578,7 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
           broadcastRoom(canonicalRoomId, (target) => ({
             type: "EVENTS",
             roomId: canonicalRoomId,
-            events: serializeEventsForViewer(result.events, viewerIdFor(target), result.state.playerOrder),
+            events: serializeEventsForViewer(result.events, viewerIdFor(target), result.state.playerOrder, result.state.phase.type === "GAME_OVER"),
             snapshot: snapshotFor(canonicalRoomId, result.state, target),
           }));
         }).catch((error) => {

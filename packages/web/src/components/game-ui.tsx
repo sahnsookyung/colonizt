@@ -337,7 +337,31 @@ export const EventLine = ({ event }: { event: GameEvent }) => {
     return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} upgraded city (+1 VP)</span><CostIcons bundle={event.cost} /></li>;
   }
   if (event.type === "SPECIAL_CARD_BOUGHT") {
-    return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} drew special card #{event.cardIndex}</span><CostIcons bundle={event.cost} /></li>;
+    return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} drew {event.cardType ? event.cardType.toLowerCase().replaceAll("_", " ") : `special card #${event.cardIndex}`}</span><CostIcons bundle={event.cost} /></li>;
+  }
+  if (event.type === "DISCARD_REQUIRED") {
+    return <li><span className="event-seq">{event.seq}</span><span>Discard required after 7</span></li>;
+  }
+  if (event.type === "RESOURCES_DISCARDED") {
+    return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} discarded</span><CostIcons bundle={event.resources} /></li>;
+  }
+  if (event.type === "THIEF_MOVED") {
+    return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} moved thief{event.stealFromPlayerId ? ` and stole from ${event.stealFromPlayerId}` : ""}</span></li>;
+  }
+  if (event.type === "DEVELOPMENT_CARD_PLAYED") {
+    return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} played {event.cardType.toLowerCase().replaceAll("_", " ")}</span></li>;
+  }
+  if (event.type === "ROAD_BUILDING_PLAYED") {
+    return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} used Road Building</span></li>;
+  }
+  if (event.type === "MONOPOLY_PLAYED") {
+    return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} monopolized {event.resource}</span></li>;
+  }
+  if (event.type === "YEAR_OF_PLENTY_PLAYED") {
+    return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} took Year of Plenty</span></li>;
+  }
+  if (event.type === "LARGEST_ARMY_UPDATED") {
+    return <li><span className="event-seq">{event.seq}</span><span>{event.playerId ? `${event.playerId} claimed Largest Army (${event.knightCount})` : "Largest Army unclaimed"}</span></li>;
   }
   if (event.type === "LONGEST_ROAD_UPDATED") {
     return <li><span className="event-seq">{event.seq}</span><span>{event.playerId ? `${event.playerId} claimed Longest Road (${event.length})` : "Longest Road unclaimed"}</span></li>;
@@ -378,8 +402,7 @@ export const EventLine = ({ event }: { event: GameEvent }) => {
     return <li><span className="event-seq">{event.seq}</span><span>Plight destroyed {event.destroyed.length} building{event.destroyed.length === 1 ? "" : "s"}</span></li>;
   }
   if (event.type === "GAME_OVER") {
-    return <li><span className="event-seq">{event.seq}</span><span>{event.winnerId} won the game</span></li>;
+    return <li><span className="event-seq">{event.seq}</span><span>{event.winnerId} won{event.reason === "TURN_LIMIT" ? " by adjudication" : " the game"}</span></li>;
   }
   return <li><span className="event-seq">{event.seq}</span><span>{event.type.replaceAll("_", " ").toLowerCase()}</span></li>;
 };
-

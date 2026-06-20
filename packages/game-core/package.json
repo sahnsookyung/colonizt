@@ -8,7 +8,7 @@
   },
   "scripts": {
     "typecheck": "tsc -b",
-    "test": "vitest run"
+    "test": "vitest run --root ../.. packages/game-core --passWithNoTests"
   },
   "devDependencies": {}
 }

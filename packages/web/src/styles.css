@@ -417,6 +417,40 @@ button:disabled {
   stroke-width: 0.018;
 }
 
+.legal-thief-hex {
+  cursor: pointer;
+  pointer-events: all;
+}
+
+.legal-thief-hex .hex {
+  stroke: #211827;
+  stroke-width: 0.07;
+  filter: drop-shadow(0 0 0.12px rgba(17, 24, 39, 0.7));
+}
+
+.thief-hex .hex {
+  stroke: #111827;
+  stroke-width: 0.08;
+}
+
+.thief-marker {
+  pointer-events: none;
+  filter: drop-shadow(0 0.06px 0.04px rgba(17, 24, 39, 0.45));
+}
+
+.thief-marker circle {
+  fill: #1f2937;
+  stroke: #fffdf7;
+  stroke-width: 0.035;
+}
+
+.thief-marker path {
+  fill: none;
+  stroke: #fffdf7;
+  stroke-width: 0.035;
+  stroke-linecap: round;
+}
+
 .board-icon,
 .token,
 .dead-tile-label,
@@ -1297,6 +1331,107 @@ button.resource-card {
 .phase-card span:not(.eyebrow) {
   color: var(--muted);
   font-weight: 750;
+}
+
+.modal-control-card,
+.dev-card-panel {
+  gap: 10px;
+}
+
+.discard-grid,
+.dev-card-list,
+.thief-target-list {
+  display: grid;
+  gap: 7px;
+}
+
+.discard-row,
+.dev-card-row,
+.thief-target-row {
+  display: grid;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 7px;
+  border: 1px solid rgba(216, 203, 181, 0.85);
+  border-radius: 8px;
+  background: rgba(255, 250, 240, 0.66);
+}
+
+.discard-row {
+  grid-template-columns: auto 32px 24px 32px;
+}
+
+.discard-row button,
+.thief-target-row button,
+.dev-card-row button,
+.primary-wide {
+  min-height: 31px;
+  padding: 5px 9px;
+}
+
+.discard-row strong {
+  text-align: center;
+  font-size: 14px;
+}
+
+.primary-wide {
+  width: 100%;
+  background: var(--accent);
+  color: #fffdf7;
+  border-color: var(--accent-strong);
+}
+
+.thief-target-row {
+  grid-template-columns: minmax(72px, 1fr) repeat(auto-fit, minmax(76px, auto));
+}
+
+.thief-target-row > span,
+.dev-card-row > span {
+  min-width: 0;
+  color: var(--ink);
+  font-weight: 900;
+}
+
+.dev-card-row {
+  grid-template-columns: minmax(92px, 1fr) auto;
+}
+
+.dev-card-row.played {
+  opacity: 0.58;
+}
+
+.dev-card-row small {
+  color: var(--muted);
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.dev-card-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.dev-card-actions button {
+  flex: 1 1 76px;
+}
+
+.dev-card-actions select {
+  flex: 1 1 110px;
+  min-width: 0;
+}
+
+.dev-card-actions button.selected {
+  background: var(--accent);
+  border-color: var(--accent-strong);
+  color: #fffdf7;
+}
+
+.muted-line {
+  color: var(--muted);
+  font-weight: 800;
 }
 
 .eyebrow {

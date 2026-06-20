@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { BoardGraph, BotDifficulty, GameConfig, GameEvent, ViewerState } from "@colonizt/game-core";
 
-export const protocolVersion = 2;
+export const protocolVersion = 3;
 export const websocketAuthMode = "ticket";
 export const defaultWebSocketTicketTtlMs = 30_000;
 
@@ -23,15 +23,23 @@ export const gameRulesSchema = z.object({
   mapRandomized: z.boolean().default(false),
   specialCardCostRandomized: z.boolean().default(false),
   specialCardCost: resourceBundleSchema.optional(),
+  maxTurns: z.number().int().positive().optional(),
+  maxTurnAdjudication: z.literal("leader").optional(),
 }).partial();
 
 export const gameCommandSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("PLACE_SETUP"), playerId: z.string(), vertexId: z.string(), edgeId: z.string() }),
   z.object({ type: z.literal("ROLL_DICE"), playerId: z.string() }),
+  z.object({ type: z.literal("DISCARD_RESOURCES"), playerId: z.string(), resources: resourceBundleSchema }),
+  z.object({ type: z.literal("MOVE_THIEF"), playerId: z.string(), hexId: z.string(), stealFromPlayerId: z.string().optional() }),
   z.object({ type: z.literal("BUILD_ROAD"), playerId: z.string(), edgeId: z.string() }),
   z.object({ type: z.literal("BUILD_SETTLEMENT"), playerId: z.string(), vertexId: z.string() }),
   z.object({ type: z.literal("UPGRADE_CITY"), playerId: z.string(), vertexId: z.string() }),
   z.object({ type: z.literal("BUY_SPECIAL_CARD"), playerId: z.string() }),
+  z.object({ type: z.literal("PLAY_KNIGHT"), playerId: z.string(), cardId: z.string(), hexId: z.string(), stealFromPlayerId: z.string().optional() }),
+  z.object({ type: z.literal("PLAY_ROAD_BUILDING"), playerId: z.string(), cardId: z.string(), edgeIds: z.union([z.tuple([z.string()]), z.tuple([z.string(), z.string()])]) }),
+  z.object({ type: z.literal("PLAY_MONOPOLY"), playerId: z.string(), cardId: z.string(), resource: resourceSchema }),
+  z.object({ type: z.literal("PLAY_YEAR_OF_PLENTY"), playerId: z.string(), cardId: z.string(), resources: z.tuple([resourceSchema, resourceSchema]) }),
   z.object({ type: z.literal("MARITIME_TRADE"), playerId: z.string(), offered: resourceSchema, requested: resourceSchema }),
   z.object({
     type: z.literal("OFFER_TRADE"),
