@@ -4,6 +4,7 @@ export interface NetworkResumeState {
   token: string;
   userId: PlayerId;
   roomId: string;
+  roomCode?: string;
   clientSeq: number;
   lastSeq: number;
 }
@@ -23,7 +24,11 @@ export const writeResumeState = (
   state: NetworkResumeState,
   storage: Pick<Storage, "setItem"> = localStorage,
 ): void => {
-  storage.setItem(resumeStorageKey, JSON.stringify(state));
+  try {
+    storage.setItem(resumeStorageKey, JSON.stringify(state));
+  } catch {
+    // Resume state is opportunistic; online play should continue when storage is unavailable.
+  }
 };
 
 export const clearResumeState = (

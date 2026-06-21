@@ -1,5 +1,5 @@
 import type { BotDifficulty, GameCommand, GameConfig, GameEvent, ViewerState } from "@colonizt/game-core";
-import type { CreateRoomResponse, CreateSessionResponse, MatchSummaryPayload, PublicRoomPayload, ReplayLogPayload, RuntimeNetworkConfig, WsTicketResponse } from "@colonizt/protocol";
+import type { CreateSessionResponse, MatchSummaryPayload, PublicRoomPayload, ReplayLogPayload, RuntimeNetworkConfig, WsTicketResponse } from "@colonizt/protocol";
 
 export type MatchSummary = MatchSummaryPayload;
 export type RoomLookupResult =
@@ -8,7 +8,7 @@ export type RoomLookupResult =
 
 export interface NetworkClient {
   createSession(displayName: string): Promise<CreateSessionResponse>;
-  createRoom(token: string, options?: { mode?: "CLASSIC" | "DUEL" | "RUSH"; botFill?: boolean; ranked?: boolean; minPlayers?: number; botDifficulty?: BotDifficulty; rules?: GameConfig["rules"] }): Promise<CreateRoomResponse>;
+  createRoom(token: string, options?: { mode?: "CLASSIC" | "DUEL" | "RUSH"; botFill?: boolean; ranked?: boolean; minPlayers?: number; botDifficulty?: BotDifficulty; rules?: GameConfig["rules"] }): Promise<PublicRoomPayload>;
   getRoom(roomRef: string): Promise<RoomLookupResult>;
   listMatches(limit?: number): Promise<MatchSummary[]>;
   loadReplay(replayId: string, token?: string): Promise<ReplayLogPayload>;
@@ -119,7 +119,7 @@ export const createNetworkClient = (baseUrl = configuredBaseUrl): NetworkClient 
       body: JSON.stringify({ mode: "CLASSIC", botFill: true, ranked: false, ...options }),
     });
     if (!response.ok) throw new Error("Room creation failed");
-    return response.json() as Promise<CreateRoomResponse>;
+    return response.json() as Promise<PublicRoomPayload>;
   },
   async getRoom(roomRef) {
     const config = await resolveRuntimeConfig(baseUrl);

@@ -33,7 +33,7 @@ import {
   type VertexId,
   type HexId,
 } from "@colonizt/game-core";
-import { completeSetup, createDemoGame } from "@colonizt/demo-state";
+import { createDemoGame } from "@colonizt/demo-state";
 import { platform, track } from "./analytics.js";
 import {
   BoardHousePiece,
@@ -55,24 +55,25 @@ import {
 } from "./components/game-ui.js";
 import { useLocalAutomation } from "./hooks/useLocalAutomation.js";
 import { useNetworkRoom } from "./hooks/useNetworkRoom.js";
-import { useReplayControls } from "./hooks/useReplayControls.js";
 import { useSyncedRef } from "./hooks/useSyncedRef.js";
 import { useTradeDraft } from "./hooks/useTradeDraft.js";
 import { useTurnTimer } from "./hooks/useTurnTimer.js";
-import { createNetworkClient, type MatchSummary } from "./network.js";
-import { createDemoReplayLog, replayAtIndex } from "./replay-state.js";
+import { createNetworkClient } from "./network.js";
 import { clearResumeState, readResumeState, writeResumeState } from "./resume.js";
 import { playSound, playSoundForEvents } from "./sounds.js";
 import { normalizeTradeDraft, type TradeDraft } from "./trade-draft.js";
+import type { PublicRoomPayload } from "@colonizt/protocol";
 
 const diceAnimationMs = 820;
 const rollDeadlineMs = 60_000;
 const actionDeadlineMs = 240_000;
 
 type BuildMode = "road" | "settlement" | "city";
+type AppScreen = "setup" | "localGame" | "onlineLobby" | "onlineGame";
 
 interface MatchOptions {
   botDifficulty: BotDifficulty;
+  playerCount: 2 | 3 | 4;
   rules: {
     diceDoubles: boolean;
     plight: boolean;
@@ -85,6 +86,7 @@ interface MatchOptions {
 
 const defaultMatchOptions: MatchOptions = {
   botDifficulty: "medium",
+  playerCount: 4,
   rules: {
     diceDoubles: false,
     plight: false,
@@ -249,19 +251,6 @@ const applyEventsToViewer = (
   };
 };
 
-interface PublicRoomPayload {
-  id: string;
-  code?: string;
-  inviteUrl?: string;
-  status: string;
-  settings?: {
-    botDifficulty?: BotDifficulty;
-    rules?: GameConfig["rules"];
-  };
-  events?: GameEvent[];
-  game?: ViewerState;
-}
-
 const networkErrorMessage = (input: unknown): string => {
   const code = typeof input === "object" && input && "code" in input ? String((input as { code?: unknown }).code) : "";
   switch (code) {
@@ -290,13 +279,13 @@ export const App = () => {
   const [state, setState] = useState<GameState>(() => createDemoGame("web-local"));
   const [events, setEvents] = useState<GameEvent[]>([]);
   const [serverViewer, setServerViewer] = useState<ViewerState | null>(null);
-  const { replayLog, setReplayLog, replayIndex, setReplayIndex } = useReplayControls();
-  const [matchMenuOpen, setMatchMenuOpen] = useState(true);
+  const [appScreen, setAppScreen] = useState<AppScreen>("setup");
   const [selectedEdge, setSelectedEdge] = useState<EdgeId | null>(null);
   const [selectedVertex, setSelectedVertex] = useState<VertexId | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [historyMatches, setHistoryMatches] = useState<MatchSummary[]>([]);
-  const [historyStatus, setHistoryStatus] = useState("History idle");
+  const [joinCode, setJoinCode] = useState("");
+  const [networkRoom, setNetworkRoom] = useState<PublicRoomPayload | null>(null);
+  const [lobbyReadyPending, setLobbyReadyPending] = useState(false);
   const { tradeOffer, setTradeOffer, tradeRequest, setTradeRequest, tradeOpen, setTradeOpen, setTradeDraft, clearTradeDraft } = useTradeDraft();
   const [selectedTradeResponder, setSelectedTradeResponder] = useState<PlayerId | null>(null);
   const [localTradeDeadlines, setLocalTradeDeadlines] = useState<Record<string, number>>({});
@@ -328,8 +317,13 @@ export const App = () => {
     markCommandPending,
     clearPendingCommands,
   } = useNetworkRoom();
+  const matchMenuOpen = appScreen === "setup";
+  const isPlayableScreen = appScreen === "localGame" || appScreen === "onlineGame";
   const stateRef = useSyncedRef(state);
   const eventsRef = useSyncedRef(events);
+  const networkRoomInfoRef = useSyncedRef(networkRoomInfo);
+  const initialOnlineConnectRef = useRef(false);
+  const networkGenerationRef = useRef(0);
   const soundCursorRef = useRef<{ matchId: string; seq: number; initialized: boolean }>({ matchId: state.config.matchId, seq: 0, initialized: false });
 
   const humanPlayerId = networkSession?.userId ?? "p1";
@@ -451,6 +445,10 @@ export const App = () => {
     setMatchOptions((current) => ({ ...current, botDifficulty }));
   };
 
+  const setPlayerCount = (playerCount: 2 | 3 | 4) => {
+    setMatchOptions((current) => ({ ...current, playerCount }));
+  };
+
   const setRuleEnabled = (rule: "diceDoubles" | "plight" | "specialCardCostRandomized", enabled: boolean) => {
     setMatchOptions((current) => ({
       ...current,
@@ -484,9 +482,7 @@ export const App = () => {
     const nextEvents = [...eventsRef.current, ...result.events];
     eventsRef.current = nextEvents;
     setEvents(nextEvents);
-    setReplayLog(null);
     setError(null);
-    setReplayIndex(null);
     if (command.type === "DISCARD_RESOURCES") setDiscardDraft(emptyResources());
     if (command.type === "MARITIME_TRADE" || command.type === "OFFER_TRADE") {
       clearTradeDraft();
@@ -499,7 +495,7 @@ export const App = () => {
 
   const applyLocalCommandRef = useSyncedRef(applyLocalCommand);
   const { clearAutomationTimers } = useLocalAutomation({
-    enabled: !networkRoomId && replayIndex === null && !matchMenuOpen,
+    enabled: appScreen === "localGame" && !networkRoomId,
     state,
     events,
     activePlayer,
@@ -518,7 +514,7 @@ export const App = () => {
       createNetworkClient().sendCommand(socketRef.current, networkRoomId, clientSeqRef.current, command);
       markCommandPending();
       clientSeqRef.current += 1;
-      if (networkSession) writeResumeState({ token: networkSession.token, userId: networkSession.userId, roomId: networkRoomId, clientSeq: clientSeqRef.current, lastSeq: lastServerSeqRef.current });
+      if (networkSession) writeNetworkResume(networkSession, networkRoomId, networkRoomInfo?.code);
       if (command.type === "DISCARD_RESOURCES") setDiscardDraft(emptyResources());
       if (command.type === "MARITIME_TRADE" || command.type === "OFFER_TRADE") {
         clearTradeDraft();
@@ -535,7 +531,7 @@ export const App = () => {
   const { nowMs, turnDeadline } = useTurnTimer({
     state,
     activePlayer,
-    paused: matchMenuOpen || replayIndex !== null,
+    paused: !isPlayableScreen,
     networkRoomId,
     rollDeadlineMs,
     actionDeadlineMs,
@@ -622,7 +618,40 @@ export const App = () => {
     }
   };
 
+  const clearInviteUrl = () => {
+    const url = new URL(window.location.href);
+    const hadRoomParam = url.searchParams.has("room") || url.searchParams.has("roomId");
+    url.searchParams.delete("room");
+    url.searchParams.delete("roomId");
+    if (hadRoomParam) window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+  };
+
+  const isNetworkGeneration = (generation: number): boolean => networkGenerationRef.current === generation;
+
+  const writeNetworkResume = (
+    session: { token: string; userId: PlayerId },
+    roomId: string,
+    roomCode?: string,
+  ) => {
+    writeResumeState({
+      token: session.token,
+      userId: session.userId,
+      roomId,
+      ...(roomCode ? { roomCode } : {}),
+      clientSeq: clientSeqRef.current,
+      lastSeq: lastServerSeqRef.current,
+    });
+  };
+
+  const requestRoomLeave = () => {
+    const roomRef = activeRoomRef();
+    if (roomRef && socketRef.current?.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify({ type: "LEAVE_ROOM", roomId: roomRef }));
+    }
+  };
+
   const resetNetworkSession = () => {
+    networkGenerationRef.current += 1;
     shouldReconnectRef.current = false;
     resetReconnectState();
     clearPendingCommands();
@@ -631,20 +660,16 @@ export const App = () => {
     setNetworkSession(null);
     setNetworkRoomId(null);
     setNetworkRoomInfo(null);
+    setNetworkRoom(null);
+    setLobbyReadyPending(false);
     clientSeqRef.current = 1;
     lastServerSeqRef.current = 0;
     clearResumeState();
   };
 
-  const startBotMatch = () => {
-    resetNetworkSession();
-    clearAutomationTimers();
-    const next = createDemoGame(`web-bot-${Date.now()}`, matchOptions);
-    setState(next);
+  const resetPlayUi = () => {
     setServerViewer(null);
     setEvents([]);
-    setReplayLog(null);
-    setReplayIndex(null);
     setPendingSetupVertex(null);
     setSelectedEdge(null);
     setSelectedVertex(null);
@@ -652,9 +677,33 @@ export const App = () => {
     setTradeOffer(emptyResources());
     setTradeRequest(emptyResources());
     setTradeOpen(false);
-    setNetworkStatus("Bot match");
+    setSelectedTradeResponder(null);
+    setLocalTradeDeadlines({});
+    setDiscardDraft(emptyResources());
+    setRoadBuildingDraft({ cardId: "", edgeIds: [] });
+    setYearOfPlentyDraft(["grain", "ore"]);
     setError(null);
-    setMatchMenuOpen(false);
+  };
+
+  const returnToSetup = () => {
+    clearAutomationTimers();
+    requestRoomLeave();
+    resetNetworkSession();
+    clearInviteUrl();
+    resetPlayUi();
+    setNetworkStatus("Local game");
+    setAppScreen("setup");
+  };
+
+  const startBotMatch = () => {
+    resetNetworkSession();
+    clearInviteUrl();
+    clearAutomationTimers();
+    const next = createDemoGame(`web-bot-${Date.now()}`, matchOptions);
+    setState(next);
+    resetPlayUi();
+    setNetworkStatus("Bot match");
+    setAppScreen("localGame");
     track("room_creation_completed", { mode: "local", platform: platform(), taps: 1 });
   };
 
@@ -666,24 +715,17 @@ export const App = () => {
     },
   });
 
-  const startReadyGame = () => {
-    if (networkRoomId && socketRef.current?.readyState === WebSocket.OPEN) {
-      socketRef.current.send(JSON.stringify({ type: "READY", roomId: networkRoomId, ready: true }));
-      setNetworkStatus(`Ready in ${networkRoomId}`);
+  const activeRoomRef = (): string | undefined => networkRoom?.code ?? networkRoomInfo?.code ?? networkRoomId ?? undefined;
+
+  const sendLobbyReady = (ready: boolean) => {
+    const roomRef = activeRoomRef();
+    if (!roomRef || socketRef.current?.readyState !== WebSocket.OPEN) {
+      setError("Online room is not connected yet");
       return;
     }
-    clearAutomationTimers();
-    const completed = completeSetup(createDemoGame(`web-ready-${Date.now()}`, matchOptions));
-    setState(completed.state);
-    setServerViewer(null);
-    setEvents(completed.events);
-    setReplayLog(null);
-    setReplayIndex(null);
-    setTradeOffer(emptyResources());
-    setTradeRequest(emptyResources());
-    setTradeOpen(false);
-    setMatchMenuOpen(false);
-    track("room_creation_completed", { mode: "local", platform: platform(), taps: 1 });
+    setLobbyReadyPending(true);
+    socketRef.current.send(JSON.stringify({ type: "READY", roomId: roomRef, ready }));
+    setNetworkStatus(`${ready ? "Ready" : "Not ready"} in ${roomRef}`);
   };
 
   const roll = () => {
@@ -907,20 +949,26 @@ export const App = () => {
     });
   };
 
-  const connectOnlineSession = (session: { token: string; userId: PlayerId }, roomId: string, ready: boolean) => {
+  const connectOnlineSession = (session: { token: string; userId: PlayerId }, roomId: string, ready: boolean, generation = networkGenerationRef.current) => {
+    if (!isNetworkGeneration(generation)) return;
     shouldReconnectRef.current = true;
     const client = createNetworkClient();
     void client.connect(session.token, {
       onOpen: (openSocket) => {
+        if (!isNetworkGeneration(generation)) {
+          openSocket.close();
+          return;
+        }
         resetReconnectState();
         socketRef.current = openSocket;
         openSocket.send(JSON.stringify({ type: "JOIN_ROOM", roomId }));
         if (ready) openSocket.send(JSON.stringify({ type: "READY", roomId, ready: true }));
-        openSocket.send(JSON.stringify({ type: "RESYNC", roomId, lastSeq: lastServerSeqRef.current }));
       },
       onEvents: (incomingEvents, snapshot) => {
-        setReplayLog(null);
+        if (!isNetworkGeneration(generation)) return;
         clearPendingCommands();
+        const roomInfo = networkRoomInfoRef.current;
+        const canonicalRoomId = roomInfo?.id ?? roomId;
         if (incomingEvents.length > 0) {
           const expectedSeq = lastServerSeqRef.current + 1;
           if (incomingEvents[0]!.seq !== expectedSeq && socketRef.current?.readyState === WebSocket.OPEN) {
@@ -930,23 +978,25 @@ export const App = () => {
           lastServerSeqRef.current = Math.max(lastServerSeqRef.current, ...incomingEvents.map((event) => event.seq));
           setEvents((current) => [...current, ...incomingEvents]);
           if (!snapshot) {
-            setServerViewer((current) => current ? applyEventsToViewer(current, incomingEvents, roomId, current.viewerId, currentConfigOptions()) : null);
+            setServerViewer((current) => current ? applyEventsToViewer(current, incomingEvents, canonicalRoomId, current.viewerId, currentConfigOptions()) : null);
             setState((current) => applyEvents(current, incomingEvents));
           }
         }
         if (snapshot) {
-          setState(viewerToGameState(snapshot, roomId, currentConfigOptions()));
+          setState(viewerToGameState(snapshot, canonicalRoomId, currentConfigOptions()));
           setServerViewer(snapshot);
           lastServerSeqRef.current = Math.max(lastServerSeqRef.current, snapshot.eventSeq);
           if (incomingEvents.length === 0) setEvents([]);
+          setAppScreen("onlineGame");
         }
-        writeResumeState({ token: session.token, userId: session.userId, roomId, clientSeq: clientSeqRef.current, lastSeq: lastServerSeqRef.current });
-        setNetworkStatus(`Online ${roomId}`);
+        writeNetworkResume(session, canonicalRoomId, roomInfo?.code ?? (roomId.startsWith("room_") ? undefined : roomId));
+        setNetworkStatus(`Online ${roomInfo?.code ?? roomId}`);
       },
       onRoom: (incomingRoom) => {
+        if (!isNetworkGeneration(generation)) return;
         const publicRoom = incomingRoom as PublicRoomPayload;
-        setReplayLog(null);
-        setReplayIndex(null);
+        setLobbyReadyPending(false);
+        setNetworkRoom(publicRoom);
         setEvents(publicRoom.events ?? []);
         const roomConfigOptions: Partial<Pick<GameConfig, "botDifficulty" | "rules">> = {
           botDifficulty: publicRoom.settings?.botDifficulty ?? currentConfigOptions().botDifficulty,
@@ -959,6 +1009,11 @@ export const App = () => {
           setState(viewerToGameState(publicRoom.game, publicRoom.id, roomConfigOptions));
           setServerViewer(publicRoom.game);
           lastServerSeqRef.current = Math.max(lastServerSeqRef.current, publicRoom.game.eventSeq, ...(publicRoom.events ?? []).map((event) => event.seq));
+          setAppScreen("onlineGame");
+        } else {
+          setServerViewer(null);
+          lastServerSeqRef.current = 0;
+          setAppScreen("onlineLobby");
         }
         setNetworkRoomId(publicRoom.id);
         setNetworkRoomInfo({
@@ -966,11 +1021,13 @@ export const App = () => {
           ...(publicRoom.code ? { code: publicRoom.code } : {}),
           ...(publicRoom.inviteUrl ? { inviteUrl: publicRoom.inviteUrl } : {}),
         });
-        writeResumeState({ token: session.token, userId: session.userId, roomId: publicRoom.id, clientSeq: clientSeqRef.current, lastSeq: lastServerSeqRef.current });
+        writeNetworkResume(session, publicRoom.id, publicRoom.code);
         setNetworkStatus(`Online ${publicRoom.code ?? publicRoom.id} · ${publicRoom.status}`);
       },
       onError: (incomingError) => {
+        if (!isNetworkGeneration(generation)) return;
         clearPendingCommands();
+        setLobbyReadyPending(false);
         const code = typeof incomingError === "object" && incomingError && "code" in incomingError ? String((incomingError as { code?: unknown }).code) : "";
         if (code === "ROOM_EXPIRED" || code === "ROOM_ABANDONED" || code === "ROOM_CLOSED") {
           resetNetworkSession();
@@ -978,14 +1035,23 @@ export const App = () => {
         }
         setError(networkErrorMessage(incomingError));
       },
-      onAck: clearPendingCommands,
+      onAck: () => {
+        if (isNetworkGeneration(generation)) clearPendingCommands();
+      },
       onClose: () => {
+        if (!isNetworkGeneration(generation)) return;
+        if (!shouldReconnectRef.current) return;
         setNetworkStatus("Online connection closed");
-        scheduleReconnect(() => connectOnlineSession(session, roomId, false));
+        scheduleReconnect(() => connectOnlineSession(session, roomId, false, generation));
       },
     }).then((socket) => {
+      if (!isNetworkGeneration(generation)) {
+        socket.close();
+        return;
+      }
       socketRef.current = socket;
     }).catch((connectError) => {
+      if (!isNetworkGeneration(generation)) return;
       setNetworkStatus("Online unavailable");
       setError(networkErrorMessage(connectError));
     });
@@ -997,33 +1063,31 @@ export const App = () => {
   };
 
   const startOnlineRoom = async () => {
+    clearAutomationTimers();
+    resetNetworkSession();
+    const generation = networkGenerationRef.current;
+    clearInviteUrl();
+    resetPlayUi();
     try {
-      setMatchMenuOpen(false);
       setNetworkStatus("Creating online room...");
       const client = createNetworkClient();
       const session = await client.createSession("Browser Host");
-      const room = await client.createRoom(session.token, { ...matchOptions, mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 4 });
-      setState((current) => {
-        const next = {
-          ...current,
-          config: {
-            ...current.config,
-            botDifficulty: matchOptions.botDifficulty,
-            rules: { ...matchOptions.rules },
-          },
-        };
-        stateRef.current = next;
-        return next;
-      });
+      if (!isNetworkGeneration(generation)) return;
+      const { playerCount, ...roomOptions } = matchOptions;
+      const room = await client.createRoom(session.token, { ...roomOptions, mode: "CLASSIC", botFill: false, ranked: false, minPlayers: playerCount });
+      if (!isNetworkGeneration(generation)) return;
       setNetworkSession({ token: session.token, userId: session.userId });
+      setNetworkRoom(room);
       setNetworkRoomId(room.id);
       setNetworkRoomInfo({ id: room.id, ...(room.code ? { code: room.code } : {}), ...(room.inviteUrl ? { inviteUrl: room.inviteUrl } : {}) });
+      setAppScreen(room.game ? "onlineGame" : "onlineLobby");
       clientSeqRef.current = 1;
       lastServerSeqRef.current = 0;
-      writeResumeState({ token: session.token, userId: session.userId, roomId: room.id, clientSeq: clientSeqRef.current, lastSeq: lastServerSeqRef.current });
-      connectOnlineSession({ token: session.token, userId: session.userId }, room.id, false);
+      writeNetworkResume({ token: session.token, userId: session.userId }, room.id, room.code);
+      connectOnlineSession({ token: session.token, userId: session.userId }, room.code ?? room.id, false, generation);
       track("room_creation_completed", { mode: "network", platform: platform(), taps: 1 });
     } catch (onlineError) {
+      if (!isNetworkGeneration(generation)) return;
       setNetworkStatus("Online unavailable");
       setError(networkErrorMessage(onlineError));
     }
@@ -1034,44 +1098,59 @@ export const App = () => {
   };
 
   const joinOnlineRoom = async (roomId: string) => {
+    const roomRef = roomId.trim().toUpperCase();
+    if (!roomRef) return;
+    clearAutomationTimers();
+    resetNetworkSession();
+    const generation = networkGenerationRef.current;
+    resetPlayUi();
     try {
-      setMatchMenuOpen(false);
       const client = createNetworkClient();
       setNetworkStatus("Looking up room...");
-      const lookup = await client.getRoom(roomId);
+      const lookup = await client.getRoom(roomRef);
+      if (!isNetworkGeneration(generation)) return;
       if (!lookup.ok) {
         resetNetworkSession();
+        setAppScreen("setup");
         setNetworkStatus(networkErrorMessage(lookup));
         setError(networkErrorMessage(lookup));
         return;
       }
       setNetworkStatus("Joining online room...");
       const session = await client.createSession("Browser Player");
+      if (!isNetworkGeneration(generation)) return;
       setNetworkSession({ token: session.token, userId: session.userId });
+      setNetworkRoom(lookup.room);
       setNetworkRoomId(lookup.room.id);
       setNetworkRoomInfo({ id: lookup.room.id, ...(lookup.room.code ? { code: lookup.room.code } : {}), ...(lookup.room.inviteUrl ? { inviteUrl: lookup.room.inviteUrl } : {}) });
+      setAppScreen(lookup.room.game ? "onlineGame" : "onlineLobby");
       clientSeqRef.current = 1;
       lastServerSeqRef.current = 0;
-      writeResumeState({ token: session.token, userId: session.userId, roomId: lookup.room.id, clientSeq: clientSeqRef.current, lastSeq: lastServerSeqRef.current });
-      connectOnlineSession({ token: session.token, userId: session.userId }, lookup.room.id, false);
+      writeNetworkResume({ token: session.token, userId: session.userId }, lookup.room.id, lookup.room.code);
+      connectOnlineSession({ token: session.token, userId: session.userId }, lookup.room.code ?? lookup.room.id, false, generation);
       track("room_join_started", { mode: "network", platform: platform(), roomId: lookup.room.id });
     } catch (joinError) {
+      if (!isNetworkGeneration(generation)) return;
       setNetworkStatus("Online unavailable");
       setError(networkErrorMessage(joinError));
     }
   };
 
   const cleanupOnlineSession = () => {
+    networkGenerationRef.current += 1;
     shouldReconnectRef.current = false;
     resetReconnectState();
     socketRef.current?.close();
   };
 
   useEffect(() => {
+    if (initialOnlineConnectRef.current) return undefined;
+    initialOnlineConnectRef.current = true;
     const search = new URLSearchParams(window.location.search);
     const inviteRoomId = search.get("room") ?? search.get("roomId");
+    const inviteRoomRef = inviteRoomId?.trim().toUpperCase();
     const saved = readResumeState();
-    const resumable = saved && (!inviteRoomId || saved.roomId === inviteRoomId) ? saved : undefined;
+    const resumable = saved && (!inviteRoomRef || saved.roomId === inviteRoomId || saved.roomCode?.toUpperCase() === inviteRoomRef) ? saved : undefined;
     if (!resumable) {
       if (inviteRoomId) {
         void joinOnlineRoom(inviteRoomId);
@@ -1079,14 +1158,15 @@ export const App = () => {
       }
       return undefined;
     }
-    setMatchMenuOpen(false);
+    const generation = networkGenerationRef.current;
+    setAppScreen("onlineLobby");
     clientSeqRef.current = resumable.clientSeq;
     lastServerSeqRef.current = resumable.lastSeq;
     setNetworkSession({ token: resumable.token, userId: resumable.userId });
     setNetworkRoomId(resumable.roomId);
-    setNetworkRoomInfo({ id: resumable.roomId });
+    setNetworkRoomInfo({ id: resumable.roomId, ...(resumable.roomCode ? { code: resumable.roomCode } : {}) });
     setNetworkStatus("Resuming online room...");
-    connectOnlineSession({ token: resumable.token, userId: resumable.userId }, resumable.roomId, false);
+    connectOnlineSession({ token: resumable.token, userId: resumable.userId }, resumable.roomCode ?? resumable.roomId, false, generation);
     return cleanupOnlineSession;
   }, []);
 
@@ -1095,7 +1175,7 @@ export const App = () => {
     const maxSeq = events.reduce((current, event) => Math.max(current, event.seq), 0);
     const cursor = soundCursorRef.current;
 
-    if (matchMenuOpen || replayIndex !== null) {
+    if (!isPlayableScreen) {
       soundCursorRef.current = { matchId, seq: maxSeq, initialized: true };
       return;
     }
@@ -1110,7 +1190,7 @@ export const App = () => {
       .sort((left, right) => left.seq - right.seq);
     playSoundForEvents(freshEvents, humanPlayerId);
     soundCursorRef.current = { matchId, seq: maxSeq, initialized: true };
-  }, [events, humanPlayerId, matchMenuOpen, replayIndex, state.config.matchId]);
+  }, [events, humanPlayerId, isPlayableScreen, state.config.matchId]);
 
   useEffect(() => {
     const normalized = normalizeDraftForState(state);
@@ -1137,7 +1217,7 @@ export const App = () => {
       if (event.repeat || event.isComposing || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
       const target = event.target as HTMLElement | null;
       if (target && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))) return;
-      if (matchMenuOpen || replayIndex !== null || state.phase.type === "GAME_OVER" || !isHumanActive) return;
+      if (!isPlayableScreen || state.phase.type === "GAME_OVER" || !isHumanActive) return;
       if (event.key === "Escape" && pendingSetupVertex) {
         event.preventDefault();
         cancelPendingSetupPlacement();
@@ -1154,66 +1234,13 @@ export const App = () => {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [canEndTurn, canRoll, isHumanActive, keyboardShortcutsEnabled, matchMenuOpen, pendingSetupVertex, replayIndex, state.phase.type]);
+  }, [canEndTurn, canRoll, isHumanActive, isPlayableScreen, keyboardShortcutsEnabled, pendingSetupVertex, state.phase.type]);
 
   useEffect(() => {
     if (state.phase.type !== "SETUP_PLACEMENT" || activePlayer !== humanPlayerId) {
       setPendingSetupVertex(null);
     }
   }, [activePlayer, humanPlayerId, state.phase.type]);
-
-  const loadReplay = () => {
-    clearAutomationTimers();
-    const log = createDemoReplayLog();
-    const replayed = replayAtIndex(log, log.events.length);
-    setState(replayed);
-    setServerViewer(null);
-    setEvents(log.events);
-    setReplayLog(log);
-    setReplayIndex(log.events.length);
-  };
-
-  const stepReplay = (direction: -1 | 1) => {
-    if (!replayLog) return;
-    const nextIndex = Math.max(0, Math.min(events.length, (replayIndex ?? events.length) + direction));
-    const replayed = replayAtIndex(replayLog, nextIndex);
-    setState(replayed);
-    setServerViewer(null);
-    setReplayIndex(nextIndex);
-    track("replay_step", { mode: "replay", platform: platform(), index: nextIndex });
-  };
-
-  const loadHistory = async () => {
-    try {
-      setHistoryStatus("Loading history...");
-      const matches = await createNetworkClient().listMatches();
-      setHistoryMatches(matches);
-      setHistoryStatus(matches.length > 0 ? `${matches.length} matches` : "No persisted matches yet");
-      track("match_history_loaded", { mode: "network", platform: platform(), count: matches.length });
-    } catch (historyError) {
-      setHistoryStatus("History unavailable");
-      setError(historyError instanceof Error ? historyError.message : "History unavailable");
-    }
-  };
-
-  const loadPersistedReplay = async (matchId: string) => {
-    try {
-      setHistoryStatus(`Loading ${matchId}...`);
-      const log = await createNetworkClient().loadReplay(matchId, networkSession?.token);
-      const replayed = replayAtIndex(log, log.events.length);
-      setState(replayed);
-      setServerViewer(null);
-      setEvents(log.events);
-      setReplayLog(log);
-      setReplayIndex(log.events.length);
-      setHistoryStatus(`Loaded ${matchId}`);
-      setError(null);
-      track("persisted_replay_loaded", { mode: "network", platform: platform(), matchId, events: log.events.length });
-    } catch (replayError) {
-      setHistoryStatus("Replay unavailable");
-      setError(replayError instanceof Error ? replayError.message : "Replay unavailable");
-    }
-  };
 
   if (matchMenuOpen) {
     return (
@@ -1240,10 +1267,30 @@ export const App = () => {
                   <RoadSymbol />
                 </span>
                 <strong>Player Match</strong>
-                <span>4 player online room</span>
+                <span>{matchOptions.playerCount} player online room</span>
                 <span className="match-cta">Host</span>
               </button>
             </div>
+            <form
+              className="room-code-join"
+              aria-label="Join by room code"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void joinOnlineRoom(joinCode);
+              }}
+            >
+              <label htmlFor="room-code-input">Room code</label>
+              <input
+                id="room-code-input"
+                value={joinCode}
+                onChange={(event) => setJoinCode(event.currentTarget.value.toUpperCase())}
+                inputMode="text"
+                autoComplete="off"
+                maxLength={12}
+                placeholder="ABC123"
+              />
+              <button type="submit" disabled={joinCode.trim().length === 0}>Join</button>
+            </form>
             <div className="match-options" aria-label="Game options">
               <div className="option-row">
                 <span>Bot difficulty</span>
@@ -1286,6 +1333,22 @@ export const App = () => {
                 <span>Plight on turn 20</span>
               </label>
               <div className="option-row">
+                <span>Players</span>
+                <div className="difficulty-options" role="group" aria-label="Players">
+                  {([2, 3, 4] as const).map((playerCount) => (
+                    <button
+                      key={playerCount}
+                      type="button"
+                      className={matchOptions.playerCount === playerCount ? "selected" : ""}
+                      aria-pressed={matchOptions.playerCount === playerCount}
+                      onClick={() => setPlayerCount(playerCount)}
+                    >
+                      {playerCount}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="option-row">
                 <span>Map</span>
                 <div className="difficulty-options" role="group" aria-label="Map">
                   {(["standard", "islands", "continent"] as const).map((mapPreset) => (
@@ -1309,6 +1372,94 @@ export const App = () => {
     );
   }
 
+  if (appScreen === "onlineLobby") {
+    const roomCode = networkRoom?.code ?? networkRoomInfo?.code ?? networkRoomInfo?.id ?? "------";
+    const lobbySeats = networkRoom?.seats ?? [];
+    const ownSeat = lobbySeats.find((seat) => seat.userId === humanPlayerId);
+    const totalSeats = Math.max(4, lobbySeats.length);
+    const neededPlayers = networkRoom?.settings?.minPlayers ?? matchOptions.playerCount;
+    const readyCount = lobbySeats.filter((seat) => seat.ready && (seat.userId || seat.botId)).length;
+    const occupiedCount = lobbySeats.filter((seat) => seat.userId || seat.botId).length;
+    const lobbyRules = [
+      `Players ${neededPlayers}`,
+      `Map ${mapPresetLabels[networkRoom?.settings?.rules?.mapPreset ?? matchOptions.rules.mapPreset]}`,
+      `Difficulty ${networkRoom?.settings?.botDifficulty ?? matchOptions.botDifficulty}`,
+      networkRoom?.settings?.rules?.diceDoubles ? "Doubles x2" : undefined,
+      networkRoom?.settings?.rules?.plight ? `Plight turn ${networkRoom.settings.rules.plightTurn ?? 20}` : undefined,
+      networkRoom?.settings?.rules?.specialCardCostRandomized ? "Random special cost" : undefined,
+    ].filter((rule): rule is string => Boolean(rule));
+    return (
+      <main className="app-shell lobby-app">
+        <section className="online-lobby" aria-label="Online lobby">
+          <header className="topbar">
+            <div className="brand-block">
+              <h1>Colonizt</h1>
+              <p>
+                Room {roomCode} · <span className="phase-code">{networkRoom?.status ?? "LOBBY"}</span>
+              </p>
+            </div>
+            <div className="topbar-actions">
+              <button type="button" onClick={returnToSetup}>New Match</button>
+            </div>
+          </header>
+          <div className="lobby-layout">
+            <div className="lobby-panel">
+              <div className="lobby-code-card">
+                <span>Room Code</span>
+                <strong>{roomCode}</strong>
+                <button type="button" onClick={copyInvite} disabled={!networkRoomInfo}>Copy Invite</button>
+              </div>
+              <div className="lobby-status-card" aria-live="polite">
+                <span>{networkStatus}</span>
+                <strong>{readyCount}/{neededPlayers} ready · {occupiedCount}/{totalSeats} seats</strong>
+                {pendingCommandCount > 0 ? <small>{pendingCommandCount} pending</small> : null}
+                {reconnectRetryAt ? <small>Retry {Math.max(0, Math.ceil((reconnectRetryAt - nowMs) / 1000))}s</small> : null}
+                {error ? <em>{error}</em> : null}
+              </div>
+              <div className="lobby-actions">
+                <button type="button" onClick={() => sendLobbyReady(!ownSeat?.ready)} disabled={!ownSeat || lobbyReadyPending}>
+                  {lobbyReadyPending ? "Saving..." : ownSeat?.ready ? "Unready" : "Ready"}
+                </button>
+                <button type="button" onClick={retryOnlineNow} disabled={!reconnectRetryAt}>Retry</button>
+                <button type="button" onClick={returnToSetup}>Leave</button>
+              </div>
+            </div>
+            <aside className="lobby-side" aria-label="Lobby seats and rules">
+              <div className="phase-card">
+                <div className="panel-title">
+                  <strong>Seats</strong>
+                  <span>{occupiedCount}/{totalSeats}</span>
+                </div>
+                <div className="lobby-seats">
+                  {Array.from({ length: totalSeats }, (_, index) => lobbySeats[index] ?? { seatIndex: index, ready: false, connected: false }).map((seat) => {
+                    const occupant = seat.userId ?? seat.botId;
+                    const isYou = seat.userId === humanPlayerId;
+                    return (
+                      <article key={seat.seatIndex} className={`lobby-seat ${seat.ready ? "ready" : ""} ${isYou ? "you" : ""}`}>
+                        <span>Seat {seat.seatIndex + 1}</span>
+                        <strong>{occupant ? isYou ? "You" : seat.botId ? `Bot ${seat.seatIndex + 1}` : occupant : "Open"}</strong>
+                        <small>{occupant ? seat.ready ? "Ready" : "Not ready" : "Waiting"}</small>
+                      </article>
+                    );
+                  })}
+                </div>
+              </div>
+              <div className="phase-card">
+                <div className="panel-title">
+                  <strong>Rules</strong>
+                  <span>{networkRoom?.settings?.mode ?? "CLASSIC"}</span>
+                </div>
+                <div className="lobby-rules">
+                  {lobbyRules.map((rule) => <span key={rule}>{rule}</span>)}
+                </div>
+              </div>
+            </aside>
+          </div>
+        </section>
+      </main>
+    );
+  }
+
   return (
     <main className="app-shell">
       <section className="game-surface" aria-label="Game board and actions">
@@ -1320,10 +1471,7 @@ export const App = () => {
             </p>
           </div>
           <div className="topbar-actions">
-            <button type="button" onClick={() => setMatchMenuOpen(true)}>New Match</button>
-            <button type="button" onClick={startReadyGame}>Ready</button>
-            <button type="button" onClick={loadReplay}>Replay</button>
-            <button type="button" onClick={loadHistory}>History</button>
+            <button type="button" onClick={returnToSetup}>New Match</button>
           </div>
         </header>
 
@@ -1962,7 +2110,7 @@ export const App = () => {
                   {reconnectRetryAt ? <small>Retry {Math.max(0, Math.ceil((reconnectRetryAt - nowMs) / 1000))}s</small> : null}
                   <button type="button" onClick={copyInvite}>Copy Invite</button>
                   <button type="button" onClick={retryOnlineNow}>Retry</button>
-                  <button type="button" onClick={resetNetworkSession}>Leave</button>
+                  <button type="button" onClick={returnToSetup}>Leave</button>
                 </div>
               ) : null}
               <strong>{activeName ? `Active: ${activeName}` : "Game over"}</strong>
@@ -2003,25 +2151,6 @@ export const App = () => {
               ))}
             </div>
           </aside>
-        </div>
-      </section>
-
-      <section className="event-strip" aria-label="Replay and event log">
-        <div className="replay-controls">
-          <button type="button" onClick={() => stepReplay(-1)} disabled={replayIndex === null || replayIndex <= 0}>Back</button>
-          <span>{replayIndex === null ? "Live" : `Replay ${replayIndex}/${events.length}`}</span>
-          <button type="button" onClick={() => stepReplay(1)} disabled={replayIndex === null || replayIndex >= events.length}>Next</button>
-        </div>
-        <ol>
-          {events.slice(-8).map((event) => <EventLine key={event.seq} event={event} />)}
-        </ol>
-        <div className="history-panel" aria-label="Match history">
-          <span>{historyStatus}</span>
-          {historyMatches.slice(0, 4).map((match) => (
-            <button key={match.id} type="button" onClick={() => void loadPersistedReplay(match.id)}>
-              {match.mode} · {match.eventCount} events
-            </button>
-          ))}
         </div>
       </section>
     </main>

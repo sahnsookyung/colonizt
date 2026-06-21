@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "../src/App.js";
 
@@ -10,6 +10,29 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+const placeHumanSetup = () => {
+  fireEvent.click(screen.getAllByRole("button", { name: /Place setup settlement at corner/ })[0]!);
+  fireEvent.click(screen.getAllByRole("button", { name: /Build road on edge/ })[0]!);
+};
+
+const advanceTimersUntil = (predicate: () => boolean, stepMs = 500, maxSteps = 24) => {
+  for (let index = 0; index < maxSteps; index += 1) {
+    if (predicate()) return;
+    act(() => {
+      vi.advanceTimersByTime(stepMs);
+    });
+  }
+  if (!predicate()) throw new Error("Timed out waiting for UI state");
+};
+
+const completeLocalSetup = () => {
+  vi.useFakeTimers();
+  placeHumanSetup();
+  advanceTimersUntil(() => screen.queryByText("Place setup settlement") !== null);
+  placeHumanSetup();
+  expect(screen.getByText(/WAITING FOR ROLL|ACTION PHASE/)).toBeInTheDocument();
+};
+
 describe("App", () => {
   it("renders the match setup menu first", () => {
     render(<App />);
@@ -18,10 +41,13 @@ describe("App", () => {
     expect(screen.getByLabelText("Game options")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Bot Match/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Player Match/ })).toBeInTheDocument();
+    expect(screen.getByLabelText("Join by room code")).toBeInTheDocument();
     expect(screen.getByRole("group", { name: "Map" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Standard" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("button", { name: "Islands" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Continent" })).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "Players" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "4" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByLabelText("Random special card cost")).not.toBeChecked();
     expect(screen.queryByLabelText("Game board and actions")).not.toBeInTheDocument();
     expect(screen.queryByText(/welcome/i)).not.toBeInTheDocument();
@@ -45,13 +71,15 @@ describe("App", () => {
     expect(screen.getByText("Difficulty medium · Map Islands")).toBeInTheDocument();
   });
 
-  it("ready-starts local games with the selected map preset", () => {
+  it("keeps readiness and replay/history controls out of active local play", () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Continent" }));
     fireEvent.click(screen.getByRole("button", { name: /Bot Match/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Ready" }));
 
     expect(screen.getByText("Difficulty medium · Map Continent")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Ready" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Replay" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "History" })).not.toBeInTheDocument();
   });
 
   it("marks the two settlement corners that grant each harbor bonus", () => {
@@ -114,17 +142,10 @@ describe("App", () => {
     expect(screen.queryByText("Active: Briar")).not.toBeInTheDocument();
   });
 
-  it("can ready a local bot-filled game", () => {
-    render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: /Bot Match/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Ready" }));
-    expect(screen.getByText(/WAITING FOR ROLL|ACTION PHASE|SETUP PLACEMENT/)).toBeInTheDocument();
-  });
-
   it("disables invalid selected player trades", () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: /Bot Match/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Ready" }));
+    completeLocalSetup();
     fireEvent.click(screen.getByRole("button", { name: "Roll dice" }));
     const thiefPanel = screen.queryByLabelText("Move robber");
     if (thiefPanel) {
@@ -147,7 +168,7 @@ describe("App", () => {
   it("supports R and E shortcuts for roll and end", () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: /Bot Match/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Ready" }));
+    completeLocalSetup();
     expect(screen.getByRole("button", { name: "Roll dice" })).toHaveAttribute("aria-keyshortcuts", "R");
     fireEvent.keyDown(window, { key: "r" });
     expect(screen.getByText(/Roll \d+/)).toBeInTheDocument();
@@ -171,7 +192,7 @@ describe("App", () => {
     })));
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: /Bot Match/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Ready" }));
+    completeLocalSetup();
 
     expect(screen.getByRole("button", { name: "Roll dice" })).not.toHaveAttribute("aria-keyshortcuts");
     expect(screen.getByRole("button", { name: "End Turn" })).not.toHaveAttribute("aria-keyshortcuts");
@@ -205,7 +226,7 @@ describe("App", () => {
     vi.useFakeTimers();
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: /Bot Match/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Ready" }));
+    completeLocalSetup();
 
     act(() => {
       vi.advanceTimersByTime(60_000);
@@ -220,29 +241,95 @@ describe("App", () => {
     expect(screen.getByText("Active: Briar")).toBeInTheDocument();
   });
 
-  it("opens replay mode", () => {
+  it("renders multiplayer lobbies without stale local game state or resync failures", async () => {
+    const sentMessages: unknown[] = [];
+    const lobbyRoom = {
+      id: "room_abc",
+      code: "ABC123",
+      inviteUrl: "https://play.example/?room=ABC123",
+      status: "LOBBY",
+      hostUserId: "u_host",
+      settings: { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 4, botDifficulty: "medium", rules: { mapPreset: "continent" } },
+      seats: [
+        { seatIndex: 0, userId: "u_host", ready: false, connected: true },
+        { seatIndex: 1, ready: false, connected: false },
+        { seatIndex: 2, ready: false, connected: false },
+        { seatIndex: 3, ready: false, connected: false },
+      ],
+      spectatorCount: 0,
+      events: [],
+    };
+    class FakeWebSocket extends EventTarget {
+      static readonly OPEN = 1;
+      readyState = FakeWebSocket.OPEN;
+
+      constructor(readonly url: string) {
+        super();
+        queueMicrotask(() => this.dispatchEvent(new Event("open")));
+      }
+
+      send(payload: string): void {
+        const message = JSON.parse(payload) as { type: string };
+        sentMessages.push(message);
+        if (message.type === "JOIN_ROOM") {
+          queueMicrotask(() => this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "ROOM_STATE", room: lobbyRoom }) })));
+        }
+      }
+
+      close(): void {
+        this.dispatchEvent(new Event("close"));
+      }
+    }
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/sessions")) return new Response(JSON.stringify({ token: "s_host", userId: "u_host", displayName: "Browser Host" }), { status: 200 });
+      if (url.endsWith("/rooms")) return new Response(JSON.stringify(lobbyRoom), { status: 200 });
+      if (url.endsWith("/ws-tickets")) return new Response(JSON.stringify({ ticket: "wst_1", expiresAt: "2026-06-22T00:00:00.000Z", ttlMs: 30_000 }), { status: 201 });
+      return new Response("not found", { status: 404 });
+    }));
+
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: /Bot Match/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Replay" }));
-    expect(screen.getByText(/^Replay \d+\/\d+/)).toBeInTheDocument();
-  }, 15_000);
+    expect(screen.getByLabelText("Game board and actions")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "New Match" }));
+    fireEvent.click(screen.getByRole("button", { name: /Player Match/ }));
 
-  it("loads persisted match history on demand", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify([
-      {
-        id: "match_demo",
-        roomId: "room_demo",
-        mode: "CLASSIC",
-        ranked: false,
-        startedAt: "2026-06-14T00:00:00.000Z",
-        eventCount: 3,
-        playerIds: ["p1", "p2"],
-      },
-    ]), { status: 200 })));
+    expect(await screen.findByLabelText("Online lobby")).toBeInTheDocument();
+    expect(screen.getByText("ABC123")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Ready" })).toBeInTheDocument();
+    expect(screen.queryByLabelText("Game board and actions")).not.toBeInTheDocument();
+    expect(screen.queryByText("RESYNC_FAILED")).not.toBeInTheDocument();
+    await waitFor(() => expect(sentMessages).toEqual(expect.arrayContaining([expect.objectContaining({ type: "JOIN_ROOM", roomId: "ABC123" })])));
+    expect(sentMessages).not.toEqual(expect.arrayContaining([expect.objectContaining({ type: "RESYNC" })]));
+  });
+
+  it("ignores stale online room creation after switching back to local play", async () => {
+    let resolveSession!: () => void;
+    const sessionResponse = new Promise<Response>((resolve) => {
+      resolveSession = () => resolve(new Response(JSON.stringify({ token: "s_host", userId: "u_host", displayName: "Browser Host" }), { status: 200 }));
+    });
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/sessions")) return sessionResponse;
+      if (url.endsWith("/rooms")) return new Response(JSON.stringify({ id: "room_stale", code: "STALE1", status: "LOBBY", seats: [] }), { status: 200 });
+      return new Response("not found", { status: 404 });
+    });
+    vi.stubGlobal("fetch", fetchSpy);
 
     render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: /Player Match/ }));
+    await waitFor(() => expect(fetchSpy).toHaveBeenCalled());
     fireEvent.click(screen.getByRole("button", { name: /Bot Match/ }));
-    fireEvent.click(screen.getByRole("button", { name: "History" }));
-    expect(await screen.findByRole("button", { name: "CLASSIC · 3 events" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Game board and actions")).toBeInTheDocument();
+
+    await act(async () => {
+      resolveSession();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByLabelText("Game board and actions")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Online lobby")).not.toBeInTheDocument();
+    expect(fetchSpy).not.toHaveBeenCalledWith(expect.stringContaining("/rooms"), expect.anything());
   });
 });

@@ -12,7 +12,7 @@ import { createPresenceStore, type PresenceStore } from "./presence.js";
 import { defaultRoomCleanupPolicy, RoomCapacityError, RoomManager, type Room, type RoomCleanupPolicy, type Session } from "./room-manager.js";
 import { RoomAutomationScheduler } from "./scheduler.js";
 
-export { RoomManager } from "./room-manager.js";
+export { RoomManager, defaultRoomCleanupPolicy } from "./room-manager.js";
 export { MemoryEventStore, PostgresEventStore } from "./event-store.js";
 export { MemoryPresenceStore, RedisPresenceStore } from "./presence.js";
 export { MetricsRegistry, createStructuredLogger, resolveInstanceMode } from "./observability.js";
@@ -536,6 +536,22 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
             else broadcastRoomState(joined.room);
           }).catch(() => undefined);
         }).catch((error) => send(client, { type: "ERROR", code: "JOIN_FAILED", message: error instanceof Error ? error.message : "Join failed" }));
+        return;
+      }
+      if (message.type === "LEAVE_ROOM") {
+        const canonicalRoomId = manager.roomForRef(message.roomId)?.id ?? client.roomId ?? message.roomId;
+        void manager.leaveRoom(message.roomId, session).then((left) => {
+          if (!left.ok) {
+            send(client, { type: "ERROR", code: left.code, message: left.message });
+            return;
+          }
+          clientsByRoom.get(left.room.id)?.delete(client);
+          if (client.roomId === left.room.id) delete client.roomId;
+          client.asSpectator = false;
+          void presence.disconnect(session, socketId, left.room.id).catch(() => undefined);
+          send(client, { type: "ROOM_LEFT", roomId: left.room.id });
+          broadcastRoomState(left.room);
+        }).catch((error) => send(client, { type: "ERROR", code: "LEAVE_FAILED", message: error instanceof Error ? error.message : "Leave failed", roomId: canonicalRoomId }));
         return;
       }
       if (message.type === "READY") {

@@ -20,7 +20,7 @@ class MemoryStorage {
 describe("network resume storage", () => {
   it("round-trips and clears persisted resume state", () => {
     const storage = new MemoryStorage();
-    const state = { token: "s_1", userId: "u_1", roomId: "room_1", clientSeq: 3, lastSeq: 9 };
+    const state = { token: "s_1", userId: "u_1", roomId: "room_1", roomCode: "ABC123", clientSeq: 3, lastSeq: 9 };
     writeResumeState(state, storage);
     expect(readResumeState(storage)).toEqual(state);
     clearResumeState(storage);
@@ -31,5 +31,12 @@ describe("network resume storage", () => {
     const storage = new MemoryStorage();
     storage.setItem(resumeStorageKey, "{bad");
     expect(readResumeState(storage)).toBeNull();
+  });
+
+  it("ignores storage write failures", () => {
+    expect(() => writeResumeState(
+      { token: "s_1", userId: "u_1", roomId: "room_1", clientSeq: 3, lastSeq: 9 },
+      { setItem: () => { throw new Error("storage disabled"); } },
+    )).not.toThrow();
   });
 });

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { BoardGraph, BotDifficulty, GameConfig, GameEvent, ViewerState } from "@colonizt/game-core";
+import type { BoardGraph, BotDifficulty, GameConfig, GameEvent, PlayerId, ViewerState } from "@colonizt/game-core";
 
 export const protocolVersion = 3;
 export const websocketAuthMode = "ticket";
@@ -60,6 +60,7 @@ export const gameCommandSchema = z.discriminatedUnion("type", [
 
 export const wsClientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("JOIN_ROOM"), roomId: z.string(), asSpectator: z.boolean().optional() }),
+  z.object({ type: z.literal("LEAVE_ROOM"), roomId: z.string() }),
   z.object({ type: z.literal("READY"), roomId: z.string(), ready: z.boolean() }),
   z.object({ type: z.literal("COMMAND"), roomId: z.string(), clientSeq: z.number().int().nonnegative(), command: gameCommandSchema }),
   z.object({ type: z.literal("CHAT"), roomId: z.string(), message: z.string().min(1).max(300) }),
@@ -121,10 +122,12 @@ export interface CreateSessionResponse {
   displayName: string;
 }
 
-export interface CreateRoomResponse {
-  id: string;
-  code?: string;
-  inviteUrl?: string;
+export interface RoomSeatPayload {
+  seatIndex: number;
+  userId?: PlayerId;
+  botId?: PlayerId;
+  ready: boolean;
+  connected: boolean;
 }
 
 export interface WsTicketResponse {
@@ -137,12 +140,27 @@ export interface PublicRoomPayload {
   id: string;
   code?: string;
   inviteUrl?: string;
+  hostUserId?: PlayerId;
   status: string;
   pauseReason?: "EMPTY_ROOM" | "STALLED_AUTOMATION";
   liveness?: "ACTIVE" | "IDLE_LOBBY" | "PAUSED_EMPTY" | "STALLED" | "FINISHED_UNLOADED" | "CLOSED";
   settings?: {
+    mode?: "CLASSIC" | "DUEL" | "RUSH";
+    botFill?: boolean;
+    ranked?: boolean;
+    minPlayers?: number;
     botDifficulty?: BotDifficulty;
     rules?: GameConfig["rules"];
+  };
+  seats?: RoomSeatPayload[];
+  spectatorCount?: number;
+  createdAt?: string;
+  lastActivityAt?: string;
+  pausedAt?: string;
+  cleanupReason?: string;
+  timer?: {
+    activePlayerId: PlayerId;
+    expiresAt: number;
   };
   events?: GameEvent[];
   game?: ViewerState;

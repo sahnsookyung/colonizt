@@ -246,6 +246,25 @@ export class RoomManager {
     return room;
   }
 
+  async createAllBotRoomForTest(settings: RoomSettings, botIds: readonly PlayerId[] = ["bot_1", "bot_2", "bot_3", "bot_4"]): Promise<Room> {
+    if (botIds.length !== 4) throw new Error("createAllBotRoomForTest requires exactly four bot ids");
+    const host = await this.createSession("All Bot Test Host");
+    const room = await this.createRoom(host, { ...settings, botFill: true });
+    room.hostUserId = botIds[0]!;
+    room.seats = room.seats.map((seat, index) => ({
+      seatIndex: seat.seatIndex,
+      botId: botIds[index]!,
+      ready: true,
+      connected: true,
+    }));
+    room.settings = { ...settings, botFill: true };
+    this.touchRoom(room);
+    await this.eventStore.persistRoom(room);
+    await this.startRoom(room);
+    this.updateRoomDueWork(room);
+    return room;
+  }
+
   listRooms() {
     return [...this.rooms.values()].filter((room) => this.isActiveRoom(room)).map((room) => this.publicRoomSummary(room));
   }
@@ -404,11 +423,74 @@ export class RoomManager {
     const seat = room.seats.find((candidate) => candidate.userId === session.userId);
     if (!seat) return { ok: false, code: "NOT_IN_ROOM", message: "You are not seated in this room" };
     seat.ready = ready;
+    seat.connected = true;
     this.touchRoom(room);
     if (room.settings.botFill) this.fillBots(room);
     if (this.canStart(room)) await this.startRoom(room);
     else await this.eventStore.persistRoom(room);
     this.updateRoomDueWork(room);
+    return { ok: true, room };
+  }
+
+  async leaveRoom(roomId: string, session: Session, now = Date.now()): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
+    const targetRoom = await this.ensureRoomLoadedByRef(roomId);
+    if (!targetRoom) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
+    if (targetRoom.archivedAt || targetRoom.status === "EXPIRED" || targetRoom.status === "ABANDONED") {
+      return { ok: false, code: "ROOM_CLOSED", message: "Room is closed" };
+    }
+    return this.enqueueRoom(targetRoom.id, () => this.leaveRoomNow(targetRoom.id, session, now));
+  }
+
+  private async leaveRoomNow(roomId: string, session: Session, now: number): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
+    const room = this.roomForRef(roomId);
+    if (!room) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
+    if (!await this.claimRoom(room)) return { ok: false, code: "ROOM_NOT_OWNED", message: "Room is owned by another server" };
+
+    let changed = false;
+    if (room.spectators.delete(session.userId)) changed = true;
+    const seat = room.seats.find((candidate) => candidate.userId === session.userId);
+    if (seat) {
+      if (room.status === "LOBBY") {
+        delete seat.userId;
+        delete seat.botId;
+        seat.ready = false;
+        seat.connected = false;
+        changed = true;
+      } else {
+        if (seat.connected || seat.ready) changed = true;
+        seat.connected = false;
+        seat.ready = false;
+      }
+    }
+
+    if (room.status === "LOBBY" && room.hostUserId === session.userId) {
+      const nextHost = room.seats.find((candidate) => candidate.userId)?.userId;
+      if (nextHost) room.hostUserId = nextHost;
+    }
+
+    if (this.connectedSeatedHumanCount(room) === 0) {
+      const nowIso = new Date(now).toISOString();
+      if (room.status === "IN_GAME" && !room.pausedAt) {
+        room.pausedAt = nowIso;
+        room.pauseReason = "EMPTY_ROOM";
+        room.emptySince ??= nowIso;
+        changed = true;
+      } else if ((room.status === "LOBBY" || room.status === "FINISHED") && !room.emptySince) {
+        room.emptySince = nowIso;
+        changed = true;
+      }
+    } else if (this.resumeRoomIfNeeded(room, now)) {
+      changed = true;
+    } else if (room.emptySince && room.status !== "IN_GAME") {
+      delete room.emptySince;
+      changed = true;
+    }
+
+    if (changed) {
+      this.touchRoom(room, now);
+      await this.eventStore.persistRoom(room);
+      this.updateRoomDueWork(room, now);
+    }
     return { ok: true, room };
   }
 
@@ -422,6 +504,10 @@ export class RoomManager {
       const connected = connectedUserIds.has(seat.userId);
       if (seat.connected !== connected) {
         seat.connected = connected;
+        changed = true;
+      }
+      if (room.status === "LOBBY" && !connected && seat.ready) {
+        seat.ready = false;
         changed = true;
       }
     }
@@ -604,9 +690,10 @@ export class RoomManager {
   canStart(room: Room): boolean {
     if (room.status !== "LOBBY") return false;
     const occupiedSeats = room.seats.filter((seat) => seat.userId || seat.botId);
-    if (room.settings.botFill) return room.seats.every((seat) => (seat.userId || seat.botId) && seat.ready);
+    const readyConnected = (seat: Seat): boolean => Boolean(seat.botId || (seat.userId && seat.connected)) && seat.ready;
+    if (room.settings.botFill) return room.seats.every((seat) => (seat.userId || seat.botId) && readyConnected(seat));
     const minPlayers = room.settings.minPlayers ?? (room.settings.mode === "DUEL" ? 2 : 4);
-    return occupiedSeats.length >= minPlayers && occupiedSeats.every((seat) => seat.ready);
+    return occupiedSeats.length >= minPlayers && occupiedSeats.every(readyConnected);
   }
 
   async startRoom(room: Room): Promise<void> {
@@ -923,7 +1010,8 @@ export class RoomManager {
 
   async resync(roomId: string, session: Session, lastSeq: number): Promise<{ snapshot?: ViewerState; events: GameEvent[] } | undefined> {
     const room = await this.ensureRoomLoadedByRef(roomId);
-    if (!room?.game) return undefined;
+    if (!room) return undefined;
+    if (!room.game) return { events: [] };
     const viewerId = this.isMember(room, session.userId) ? session.userId : "spectator";
     const events = room.events.filter((event) => event.seq > lastSeq);
     if (events.length === 0 || events[0]!.seq === lastSeq + 1) {
@@ -1068,7 +1156,7 @@ export class RoomManager {
   }
 
   private botFor(botId: PlayerId): BotController {
-    const seatNumber = Number(botId.split("_")[1] ?? "0");
+    const seatNumber = Number(botId.match(/(\d+)$/u)?.[1] ?? "0");
     if (seatNumber % 3 === 0) return plannerBot;
     if (seatNumber % 2 === 0) return greedyBot;
     return randomLegalBot;

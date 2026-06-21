@@ -9,6 +9,7 @@ export interface RoomAutomationSchedulerOptions {
   logger: StructuredLogger;
   metrics: MetricsRegistry;
   onEvents(roomId: string, result: Extract<CommandResult, { ok: true }>): void;
+  onAutomationRejected?(roomId: string, result: Extract<CommandResult, { ok: false }>): void;
   onRoomClosed(closed: { roomId: string; code: string; status: string; cleanupReason?: string }): void;
 }
 
@@ -74,6 +75,9 @@ export class RoomAutomationScheduler {
           if (bot.events.some((event) => event.type === "TURN_ENDED")) this.options.metrics.recordScheduler("forced_end_turn");
           if (bot.events.some((event) => event.type === "TRADE_CLOSED" && event.reason === "RESPONSE_TIMEOUT")) this.options.metrics.recordScheduler("trade_timeout");
           this.options.onEvents(roomId, bot);
+        } else if (bot && !bot.ok) {
+          this.options.metrics.recordScheduler("bot_rejected");
+          this.options.onAutomationRejected?.(roomId, bot);
         }
         if (this.options.manager.rooms.get(roomId)?.pauseReason === "STALLED_AUTOMATION") {
           this.options.metrics.recordScheduler("stalled_automation");

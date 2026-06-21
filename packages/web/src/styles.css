@@ -33,7 +33,8 @@ body {
 }
 
 button,
-select {
+select,
+input {
   min-height: 42px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -148,6 +149,31 @@ button:disabled {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
+}
+
+.room-code-join {
+  display: grid;
+  grid-template-columns: auto minmax(120px, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid rgba(216, 203, 181, 0.78);
+  border-radius: 8px;
+  background: rgba(255, 253, 247, 0.8);
+}
+
+.room-code-join label {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.room-code-join input {
+  width: 100%;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0;
 }
 
 .match-choice {
@@ -306,6 +332,130 @@ button:disabled {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 360px;
   min-height: 0;
+}
+
+.lobby-app {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.online-lobby {
+  min-height: 100vh;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.lobby-layout {
+  display: grid;
+  grid-template-columns: minmax(320px, 1fr) 380px;
+  gap: 18px;
+  align-items: start;
+  padding: 18px;
+}
+
+.lobby-panel,
+.lobby-side {
+  display: grid;
+  gap: 12px;
+}
+
+.lobby-code-card,
+.lobby-status-card {
+  display: grid;
+  gap: 8px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(255, 253, 247, 0.96), rgba(246, 237, 219, 0.92));
+  box-shadow: var(--shadow-soft);
+}
+
+.lobby-code-card span,
+.lobby-status-card span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.lobby-code-card strong {
+  font-size: clamp(36px, 9vw, 72px);
+  line-height: 0.95;
+  letter-spacing: 0;
+}
+
+.lobby-status-card strong {
+  font-size: 22px;
+}
+
+.lobby-status-card small,
+.lobby-status-card em {
+  color: var(--muted);
+  font-style: normal;
+  font-weight: 800;
+}
+
+.lobby-status-card em {
+  color: var(--danger);
+}
+
+.lobby-actions {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 8px;
+}
+
+.lobby-actions button:first-child {
+  border-color: var(--accent-strong);
+  background: #dff6ed;
+  color: var(--accent-strong);
+}
+
+.lobby-seats {
+  display: grid;
+  gap: 8px;
+}
+
+.lobby-seat {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid rgba(216, 203, 181, 0.78);
+  border-radius: 8px;
+  background: rgba(255, 253, 247, 0.82);
+}
+
+.lobby-seat.you {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(19, 127, 113, 0.1);
+}
+
+.lobby-seat.ready small {
+  color: var(--accent-strong);
+}
+
+.lobby-seat span,
+.lobby-seat small,
+.lobby-rules span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.lobby-rules {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.lobby-rules span {
+  padding: 6px 8px;
+  border: 1px solid rgba(216, 203, 181, 0.78);
+  border-radius: 999px;
+  background: rgba(255, 253, 247, 0.8);
 }
 
 .board-stage {
@@ -1991,6 +2141,10 @@ button.resource-card {
     grid-template-columns: 1fr;
   }
 
+  .lobby-layout {
+    grid-template-columns: 1fr;
+  }
+
   .board-stage {
     height: 58vh;
     min-height: 390px;
@@ -2080,7 +2234,8 @@ button.resource-card {
   }
 
   button,
-  select {
+  select,
+  input {
     min-height: 32px;
     border-radius: 7px;
     padding: 0 9px;
@@ -2131,6 +2286,25 @@ button.resource-card {
   .match-menu {
     grid-template-columns: 1fr;
     gap: 8px;
+  }
+
+  .room-code-join {
+    grid-template-columns: 1fr auto;
+    gap: 7px;
+    border-color: rgba(255, 250, 240, 0.28);
+    background: rgba(255, 250, 240, 0.11);
+  }
+
+  .room-code-join label {
+    grid-column: 1 / -1;
+    color: rgba(255, 250, 240, 0.84);
+    font-size: 11px;
+  }
+
+  .room-code-join input {
+    border-color: rgba(255, 250, 240, 0.28);
+    background: #fffaf0;
+    color: #1e5798;
   }
 
   .option-row,
@@ -2236,6 +2410,34 @@ button.resource-card {
   .app-shell:not(.start-app),
   .app-shell:not(.start-app) .game-surface {
     overflow: hidden;
+  }
+
+  .lobby-app {
+    min-height: 100svh;
+    overflow: auto;
+  }
+
+  .lobby-app .topbar {
+    display: flex;
+  }
+
+  .lobby-layout {
+    grid-template-columns: 1fr;
+    gap: 10px;
+    padding: 10px;
+  }
+
+  .lobby-code-card,
+  .lobby-status-card {
+    padding: 14px;
+  }
+
+  .lobby-code-card strong {
+    font-size: clamp(34px, 16vw, 58px);
+  }
+
+  .lobby-actions {
+    grid-template-columns: 1fr 1fr 1fr;
   }
 
   .start-app,

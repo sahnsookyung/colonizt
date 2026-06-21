@@ -12,20 +12,19 @@ test.describe("deployed multiplayer smoke", () => {
     try {
       await pageA.goto("/");
       await pageA.getByRole("button", { name: /Player Match/ }).click();
-      const statusA = pageA.locator(".phase-card .eyebrow");
-      await expect(statusA).toContainText(/Online [A-Z0-9]{6}/);
-      const roomStatus = await statusA.textContent();
-      const roomCode = roomStatus?.match(/[A-Z0-9]{6}/)?.[0];
-      expect(roomCode, `room code in status: ${roomStatus}`).toBeTruthy();
+      await expect(pageA.getByLabel("Online lobby")).toBeVisible();
+      const roomCode = (await pageA.locator(".lobby-code-card strong").textContent())?.trim();
+      expect(roomCode, "room code in lobby").toMatch(/^[A-Z0-9]{6}$/);
 
       for (const page of peerPages) {
         await page.goto(`/?room=${encodeURIComponent(roomCode!)}`);
-        await expect(page.locator(".phase-card .eyebrow")).toContainText(roomCode!);
+        await expect(page.getByLabel("Online lobby")).toBeVisible();
+        await expect(page.locator(".lobby-code-card strong")).toContainText(roomCode!);
       }
 
       await pageA.getByRole("button", { name: "Ready" }).click();
       for (const page of peerPages) await page.getByRole("button", { name: "Ready" }).click();
-      for (const page of pages) await expect(page.getByText(/SETUP PLACEMENT/)).toBeVisible();
+      for (const page of pages) await expect(page.getByLabel("Game board and actions")).toBeVisible();
 
       await pageA.getByRole("button", { name: /Place setup settlement at corner/ }).first().click();
       await pageA.getByRole("button", { name: /Build road on edge/ }).first().click();

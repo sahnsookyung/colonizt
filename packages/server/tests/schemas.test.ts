@@ -11,6 +11,10 @@ describe("WebSocket schemas", () => {
     expect(wsClientMessageSchema.safeParse({ type: "COMMAND", roomId: "r", clientSeq: 1, command: { type: "ROLL_DICE", playerId: "p1" } }).success).toBe(true);
   });
 
+  it("accepts explicit room leave messages", () => {
+    expect(wsClientMessageSchema.safeParse({ type: "LEAVE_ROOM", roomId: "ABC123" }).success).toBe(true);
+  });
+
   it("accepts bot difficulty and optional rule room settings", () => {
     const parsed = createRoomSchema.safeParse({
       mode: "CLASSIC",

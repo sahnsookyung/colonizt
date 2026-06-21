@@ -142,6 +142,47 @@ describe("RoomManager", () => {
     expect(ownerB.roomForRef(room.id)).toBeUndefined();
   });
 
+  it("unseats lobby players on explicit leave", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Host");
+    const guest = await manager.createSession("Guest");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
+    const joined = await manager.joinRoom(room.code, guest);
+    expect(joined.ok).toBe(true);
+    const ready = await manager.setReady(room.id, guest, true);
+    expect(ready.ok).toBe(true);
+
+    const left = await manager.leaveRoom(room.code, guest);
+
+    expect(left.ok).toBe(true);
+    if (!left.ok) throw new Error("leave failed");
+    expect(left.room.status).toBe("LOBBY");
+    expect(left.room.seats.some((seat) => seat.userId === guest.userId)).toBe(false);
+    expect(left.room.seats[1]).toMatchObject({ ready: false, connected: false });
+  });
+
+  it("does not start a lobby with disconnected ready players", async () => {
+    const manager = new RoomManager();
+    const sessions = await Promise.all(["Host", "P2", "P3"].map((name) => manager.createSession(name)));
+    const room = await manager.createRoom(sessions[0]!, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 3 });
+    for (const session of sessions.slice(1)) {
+      const joined = await manager.joinRoom(room.id, session);
+      expect(joined.ok).toBe(true);
+    }
+    await manager.setReady(room.id, sessions[0]!, true);
+    await manager.setReady(room.id, sessions[1]!, true);
+
+    await manager.syncConnections(room.id, new Set([sessions[0]!.userId, sessions[2]!.userId]));
+    const finalReady = await manager.setReady(room.id, sessions[2]!, true);
+
+    expect(finalReady.ok).toBe(true);
+    if (!finalReady.ok) throw new Error("ready failed");
+    expect(finalReady.room.status).toBe("LOBBY");
+    expect(finalReady.room.game).toBeUndefined();
+    const disconnectedSeat = finalReady.room.seats.find((seat) => seat.userId === sessions[1]!.userId);
+    expect(disconnectedSeat).toMatchObject({ ready: false, connected: false });
+  });
+
   it("bot-fills and starts after ready", async () => {
     const { room } = await startedRoom();
     expect(room.status).toBe("IN_GAME");
@@ -364,6 +405,24 @@ describe("RoomManager", () => {
     expect(joined.ok).toBe(true);
     expect(restarted.roomForRef(room.id)?.id).toBe(room.id);
     expect(restarted.roomForRef(room.code)?.seats.some((seat) => seat.userId === guest.userId)).toBe(true);
+  });
+
+  it("joins and readies human lobbies by short room code", async () => {
+    const manager = new RoomManager();
+    const sessions = await Promise.all(["Host", "Guest 1", "Guest 2", "Guest 3"].map((name) => manager.createSession(name)));
+    const room = await manager.createRoom(sessions[0]!, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 4 });
+
+    for (const session of sessions.slice(1)) {
+      const joined = await manager.joinRoom(room.code, session);
+      expect(joined.ok).toBe(true);
+    }
+    for (const session of sessions) {
+      const ready = await manager.setReady(room.code, session, true);
+      expect(ready.ok).toBe(true);
+    }
+
+    expect(room.status).toBe("IN_GAME");
+    expect(room.game?.playerOrder).toEqual(sessions.map((session) => session.userId));
   });
 
   it("keeps expired stored rooms closed during lazy room lookup", async () => {
