@@ -61,7 +61,7 @@ import { useTurnTimer } from "./hooks/useTurnTimer.js";
 import { createNetworkClient, type MatchSummary } from "./network.js";
 import { createDemoReplayLog, replayAtIndex } from "./replay-state.js";
 import { clearResumeState, readResumeState, writeResumeState } from "./resume.js";
-import { playSound, playSoundForEvent } from "./sounds.js";
+import { playSound, playSoundForEvents } from "./sounds.js";
 import { normalizeTradeDraft, type TradeDraft } from "./trade-draft.js";
 
 const diceAnimationMs = 820;
@@ -1088,9 +1088,9 @@ export const App = () => {
     const freshEvents = events
       .filter((event) => event.seq > cursor.seq)
       .sort((left, right) => left.seq - right.seq);
-    for (const event of freshEvents) playSoundForEvent(event);
+    playSoundForEvents(freshEvents, humanPlayerId);
     soundCursorRef.current = { matchId, seq: maxSeq, initialized: true };
-  }, [events, matchMenuOpen, replayIndex, state.config.matchId]);
+  }, [events, humanPlayerId, matchMenuOpen, replayIndex, state.config.matchId]);
 
   useEffect(() => {
     const normalized = normalizeDraftForState(state);
@@ -1412,6 +1412,13 @@ export const App = () => {
                     <polygon className={`hex-texture texture-${hex.resource}`} points={points} />
                     <polygon className="hex-inner-shine" points={points} />
                     <BoardIcon terrain={hex.resource} x={center.x} y={center.y - (hex.token ? 0.14 : 0)} size={0.48} />
+                    {legalThiefDestination ? (
+                      <g className="legal-thief-target" transform={`translate(${center.x} ${center.y - 0.02})`} aria-hidden="true">
+                        <circle r="0.25" />
+                        <circle r="0.12" />
+                        <path d="M-0.32 0h0.14M0.18 0h0.14M0 -0.32v0.14M0 0.18v0.14" />
+                      </g>
+                    ) : null}
                     {hex.token ? (
                       <g className={`token token-${hex.token}`} transform={`translate(${center.x} ${center.y + 0.36})`}>
                         <circle r="0.2" />

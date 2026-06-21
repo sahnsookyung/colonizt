@@ -13,6 +13,30 @@ test("local bot game first screen is playable on desktop", async ({ page, isMobi
   await expect(page.getByText(/Roll \d+/)).toBeVisible();
 });
 
+test("initial desert thief marker is centered without a dark tile seam", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop project only");
+  await page.goto("/");
+  await page.getByRole("button", { name: /Bot Match/ }).click();
+
+  const thiefDesertHex = page.locator(".thief-hex .hex-desert");
+  await expect(thiefDesertHex).toHaveCount(1);
+  await expect(page.locator(".thief-hex .thief-marker")).toHaveCount(1);
+  await expect(page.locator(".thief-hex .legal-thief-target")).toHaveCount(0);
+
+  const stroke = await thiefDesertHex.evaluate((element) => {
+    const styles = window.getComputedStyle(element);
+    const channels = styles.stroke.match(/[\d.]+/g)?.map(Number) ?? [255, 255, 255];
+    const [red = 255, green = 255, blue = 255] = channels;
+    return {
+      luminance: 0.2126 * red + 0.7152 * green + 0.0722 * blue,
+      width: Number.parseFloat(styles.strokeWidth),
+    };
+  });
+
+  expect(stroke.luminance).toBeGreaterThan(35);
+  expect(stroke.width).toBeLessThanOrEqual(0.06);
+});
+
 test("mobile viewport keeps primary controls visible", async ({ page, isMobile }) => {
   test.skip(!isMobile, "mobile project only");
   await page.goto("/");
