@@ -286,6 +286,7 @@ export const App = () => {
   const [joinCode, setJoinCode] = useState("");
   const [networkRoom, setNetworkRoom] = useState<PublicRoomPayload | null>(null);
   const [lobbyReadyPending, setLobbyReadyPending] = useState(false);
+  const [networkSocketOpen, setNetworkSocketOpen] = useState(false);
   const { tradeOffer, setTradeOffer, tradeRequest, setTradeRequest, tradeOpen, setTradeOpen, setTradeDraft, clearTradeDraft } = useTradeDraft();
   const [selectedTradeResponder, setSelectedTradeResponder] = useState<PlayerId | null>(null);
   const [localTradeDeadlines, setLocalTradeDeadlines] = useState<Record<string, number>>({});
@@ -662,6 +663,7 @@ export const App = () => {
     setNetworkRoomInfo(null);
     setNetworkRoom(null);
     setLobbyReadyPending(false);
+    setNetworkSocketOpen(false);
     clientSeqRef.current = 1;
     lastServerSeqRef.current = 0;
     clearResumeState();
@@ -951,6 +953,7 @@ export const App = () => {
 
   const connectOnlineSession = (session: { token: string; userId: PlayerId }, roomId: string, ready: boolean, generation = networkGenerationRef.current) => {
     if (!isNetworkGeneration(generation)) return;
+    setNetworkSocketOpen(false);
     shouldReconnectRef.current = true;
     const client = createNetworkClient();
     void client.connect(session.token, {
@@ -961,6 +964,7 @@ export const App = () => {
         }
         resetReconnectState();
         socketRef.current = openSocket;
+        setNetworkSocketOpen(true);
         openSocket.send(JSON.stringify({ type: "JOIN_ROOM", roomId }));
         if (ready) openSocket.send(JSON.stringify({ type: "READY", roomId, ready: true }));
       },
@@ -1040,6 +1044,7 @@ export const App = () => {
       },
       onClose: () => {
         if (!isNetworkGeneration(generation)) return;
+        setNetworkSocketOpen(false);
         if (!shouldReconnectRef.current) return;
         setNetworkStatus("Online connection closed");
         scheduleReconnect(() => connectOnlineSession(session, roomId, false, generation));
@@ -1141,6 +1146,7 @@ export const App = () => {
     shouldReconnectRef.current = false;
     resetReconnectState();
     socketRef.current?.close();
+    setNetworkSocketOpen(false);
   };
 
   useEffect(() => {
@@ -1417,8 +1423,8 @@ export const App = () => {
                 {error ? <em>{error}</em> : null}
               </div>
               <div className="lobby-actions">
-                <button type="button" onClick={() => sendLobbyReady(!ownSeat?.ready)} disabled={!ownSeat || lobbyReadyPending}>
-                  {lobbyReadyPending ? "Saving..." : ownSeat?.ready ? "Unready" : "Ready"}
+                <button type="button" onClick={() => sendLobbyReady(!ownSeat?.ready)} disabled={!ownSeat || lobbyReadyPending || !networkSocketOpen}>
+                  {!networkSocketOpen ? "Connecting..." : lobbyReadyPending ? "Saving..." : ownSeat?.ready ? "Unready" : "Ready"}
                 </button>
                 <button type="button" onClick={retryOnlineNow} disabled={!reconnectRetryAt}>Retry</button>
                 <button type="button" onClick={returnToSetup}>Leave</button>
