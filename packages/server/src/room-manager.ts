@@ -1156,7 +1156,14 @@ export class RoomManager {
   }
 
   private botFor(botId: PlayerId): BotController {
-    const seatNumber = Number(botId.match(/(\d+)$/u)?.[1] ?? "0");
+    let seatNumber = 0;
+    let placeValue = 1;
+    for (let index = botId.length - 1; index >= 0; index -= 1) {
+      const digit = botId.charCodeAt(index) - 48;
+      if (digit < 0 || digit > 9) break;
+      seatNumber += digit * placeValue;
+      placeValue *= 10;
+    }
     if (seatNumber % 3 === 0) return plannerBot;
     if (seatNumber % 2 === 0) return greedyBot;
     return randomLegalBot;
