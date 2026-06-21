@@ -26,7 +26,9 @@ describe("bot policies", () => {
   it("does not change decisions when opponent hidden hands change", () => {
     let state = completeSetup(createDemoGame("hidden-info")).state;
     const rolled = applyCommand(state, { type: "ROLL_DICE", playerId: "p1" });
-    if (rolled.ok) state = rolled.value.nextState;
+    expect(rolled.ok).toBe(true);
+    if (!rolled.ok) throw new Error("Expected dice roll to enter action phase");
+    state = rolled.value.nextState;
     state = { ...state, phase: { type: "ACTION_PHASE", activePlayerId: "p2" } };
     const baseline = chooseBotCommand(createBotView(state, "p2", greedyBot.profile), greedyBot.profile, () => "trade-a");
     const changed = withResources(state, "p1", { timber: 99, brick: 99, grain: 99, fiber: 99, ore: 99 });
@@ -38,7 +40,7 @@ describe("bot policies", () => {
     let state = completeSetup(createDemoGame("hidden-deck-order", { botDifficulty: "hard" })).state;
     const rolled = applyCommand(state, { type: "ROLL_DICE", playerId: "p1" });
     expect(rolled.ok).toBe(true);
-    if (!rolled.ok) return;
+    if (!rolled.ok) throw new Error("Expected dice roll to enter action phase");
     state = withResources({ ...rolled.value.nextState, phase: { type: "ACTION_PHASE", activePlayerId: "p1" } }, "p1", specialCardCost(rolled.value.nextState.config.rules));
     state.players.p1!.resources.timber = 0;
     state.players.p1!.resources.brick = 0;
@@ -63,7 +65,7 @@ describe("bot policies", () => {
     let state = completeSetup(createDemoGame("winning-city", { botDifficulty: "hard" })).state;
     const rolled = applyCommand(state, { type: "ROLL_DICE", playerId: "p1" });
     expect(rolled.ok).toBe(true);
-    if (!rolled.ok) return;
+    if (!rolled.ok) throw new Error("Expected dice roll to enter action phase");
     state = withResources({ ...rolled.value.nextState, phase: { type: "ACTION_PHASE", activePlayerId: "p1" } }, "p1", cityCost());
     state.players.p1!.score = state.config.victoryPoints - 1;
 
@@ -151,7 +153,8 @@ describe("bot policies", () => {
       state = { ...state, phase: { type: "ACTION_PHASE", activePlayerId: "p2" } };
       state = withResources(state, "p2", { timber: 2, brick: 2, grain: 2, fiber: 2, ore: 2 });
       const command = chooseBotCommand(createBotView(state, "p2", greedyBot.profile), greedyBot.profile, () => `preview-trade-${index}`);
-      if (!command) continue;
+      expect(command).toBeDefined();
+      if (!command) throw new Error("Expected bot to generate a legal preview command");
       expect(applyCommand(state, command).ok).toBe(true);
     }
   }, 20_000);
@@ -160,18 +163,18 @@ describe("bot policies", () => {
     let state = completeSetup(createDemoGame("road-building-bot-sequences", { botDifficulty: "hard" })).state;
     const rolled = applyCommand(state, { type: "ROLL_DICE", playerId: "p1" });
     expect(rolled.ok).toBe(true);
-    if (!rolled.ok) return;
+    if (!rolled.ok) throw new Error("Expected dice roll to enter action phase");
     state = rolled.value.nextState;
     state.players.p1!.resources = emptyResources();
     state.players.p1!.developmentCards = [{ id: "road-card", type: "ROAD_BUILDING", ownerId: "p1", boughtTurn: state.turn - 1 }];
     state.players.p1!.specialCards = 1;
     const roadBuildingAction = createBotView(state, "p1", greedyBot.profile, "hard").legalActions.find((action) => action.type === "PLAY_ROAD_BUILDING");
     expect(roadBuildingAction?.type).toBe("PLAY_ROAD_BUILDING");
-    if (roadBuildingAction?.type !== "PLAY_ROAD_BUILDING") return;
+    if (roadBuildingAction?.type !== "PLAY_ROAD_BUILDING") throw new Error("Expected Road Building to be legal");
 
     const command = chooseBotCommand(createBotView(state, "p1", greedyBot.profile, "hard"), greedyBot.profile, () => "road-building-trade");
     expect(command?.type).toBe("PLAY_ROAD_BUILDING");
-    if (command?.type !== "PLAY_ROAD_BUILDING") return;
+    if (command?.type !== "PLAY_ROAD_BUILDING") throw new Error("Expected bot to play Road Building");
     expect(command.edgeIds).toHaveLength(roadBuildingAction.requiredRoadCount);
     expect(roadBuildingAction.options.some((option) =>
       option.length === command.edgeIds.length && option.every((edgeId, index) => edgeId === command.edgeIds[index]),
@@ -213,16 +216,16 @@ describe("bot policies", () => {
     }
   }, 60_000);
 
-  it("runs mixed-difficulty tournament samples without invalid commands", () => {
+  it("runs mixed-difficulty tournament samples with stronger bots winning more often", () => {
     const wins = new Map<BotDifficulty, number>();
     const entries = new Map<BotDifficulty, number>();
-    for (let index = 0; index < 12; index += 1) {
+    for (let index = 0; index < 24; index += 1) {
       const botDifficulties = rotatedDifficulties(index);
       for (const difficulty of Object.values(botDifficulties)) entries.set(difficulty, (entries.get(difficulty) ?? 0) + 1);
-      const played = playBotGame(`difficulty-tournament-${index}`, 700, {
+      const played = playBotGame(`difficulty-tournament-${index}`, 900, {
         botDifficulties,
         botProfiles: { p1: "greedy", p2: "greedy", p3: "greedy", p4: "greedy" },
-        rules: { maxTurns: 45, maxTurnAdjudication: "leader", mapRandomized: true },
+        rules: { maxTurns: 55, maxTurnAdjudication: "leader", mapRandomized: true },
       });
       expect(played.invalidCommands).toBe(0);
       expect(played.state.phase.type).toBe("GAME_OVER");
@@ -233,10 +236,11 @@ describe("bot policies", () => {
     }
 
     const rate = (difficulty: BotDifficulty) => (wins.get(difficulty) ?? 0) / (entries.get(difficulty) ?? 1);
-    expect(rate("hard") + rate("medium") + rate("easy")).toBeGreaterThan(0);
     expect(entries.get("hard")).toBeGreaterThan(0);
     expect(entries.get("medium")).toBeGreaterThan(0);
     expect(entries.get("easy")).toBeGreaterThan(0);
+    expect(rate("hard")).toBeGreaterThan(rate("medium"));
+    expect(rate("medium")).toBeGreaterThan(rate("easy"));
   }, 60_000);
 
   it("does not repeat an equivalent bot trade after it has been cancelled", () => {
@@ -249,14 +253,14 @@ describe("bot policies", () => {
     }).find((item): item is NonNullable<typeof item> => Boolean(item));
 
     expect(candidate).toBeDefined();
-    if (!candidate) return;
+    if (!candidate) throw new Error("Expected at least one generated bot trade offer");
 
     const offered = applyCommand(candidate.state, candidate.command);
     expect(offered.ok).toBe(true);
-    if (!offered.ok) return;
+    if (!offered.ok) throw new Error("Expected generated bot trade offer to be accepted");
     const cancelled = applyCommand(offered.value.nextState, { type: "CANCEL_TRADE", playerId: "p2", tradeId: candidate.command.tradeId });
     expect(cancelled.ok).toBe(true);
-    if (!cancelled.ok) return;
+    if (!cancelled.ok) throw new Error("Expected generated bot trade offer to be cancelable");
 
     const nextView = createBotView(cancelled.value.nextState, "p2", greedyBot.profile);
     const next = chooseBotCommand(nextView, greedyBot.profile, () => "duplicate");

@@ -2153,6 +2153,21 @@ button.resource-card {
     display: none;
   }
 
+  .dev-card-panel.empty {
+    display: none;
+  }
+
+  .dev-card-panel:not(.empty) {
+    position: fixed;
+    left: max(5px, env(safe-area-inset-left));
+    right: max(5px, env(safe-area-inset-right));
+    bottom: calc(max(5px, env(safe-area-inset-bottom)) + 112px);
+    z-index: 12;
+    max-height: min(30svh, 170px);
+    margin: 0;
+    overflow: auto;
+  }
+
   .phase-card {
     justify-self: start;
     width: min(128px, calc(100vw - 8px));

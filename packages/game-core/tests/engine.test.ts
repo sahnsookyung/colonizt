@@ -720,7 +720,7 @@ describe("development cards, thief, and adjudication", () => {
 
     const result = applyCommand(state, { type: "BUY_SPECIAL_CARD", playerId: "p1" });
     expect(result.ok).toBe(true);
-    if (!result.ok) return;
+    if (!result.ok) throw new Error("Expected VP card purchase to succeed");
     expect(result.value.nextState.phase).toMatchObject({ type: "GAME_OVER", winnerId: "p1" });
     expect(result.value.events.at(-1)).toMatchObject({ type: "GAME_OVER", reason: "VICTORY_POINTS" });
     expect(serializeForViewer(result.value.nextState, "p2").players.find((player) => player.id === "p1")?.developmentCards?.[0]?.type).toBe("VICTORY_POINT");
@@ -791,14 +791,14 @@ describe("development cards, thief, and adjudication", () => {
     state.players.p1!.specialCards = 1;
     const action = getLegalActions(state, "p1").find((candidate) => candidate.type === "PLAY_ROAD_BUILDING");
     expect(action?.type).toBe("PLAY_ROAD_BUILDING");
-    if (action?.type !== "PLAY_ROAD_BUILDING") return;
+    if (action?.type !== "PLAY_ROAD_BUILDING") throw new Error("Expected Road Building to be legal");
     expect(action.requiredRoadCount).toBe(2);
     const option = action.options.find((candidate) => candidate.length === 2);
     const first = option?.[0];
     expect(first).toBeDefined();
     const second = option?.[1];
     expect(second).toBeDefined();
-    if (!first || !second) return;
+    if (!first || !second) throw new Error("Expected a two-road Road Building option");
 
     expectReject(state, { type: "PLAY_ROAD_BUILDING", playerId: "p1", cardId: "road-card", edgeIds: [first] }, "CARD_NOT_PLAYABLE");
     const built = applyOrThrow(state, { type: "PLAY_ROAD_BUILDING", playerId: "p1", cardId: "road-card", edgeIds: [first, second] });
@@ -854,12 +854,12 @@ describe("development cards, thief, and adjudication", () => {
     state = withResources(state, "p2", { timber: 1 });
     const action = getLegalActions(state, "p1").find((candidate) => candidate.type === "PLAY_KNIGHT");
     expect(action?.type).toBe("PLAY_KNIGHT");
-    if (action?.type !== "PLAY_KNIGHT") return;
+    if (action?.type !== "PLAY_KNIGHT") throw new Error("Expected Knight to be legal");
     const target = action.hexes
       .map((hexId) => ({ hexId, targets: state.board.adjacency.hexToVertices[hexId]?.map((vertexId) => state.settlements[vertexId]).filter(Boolean) ?? [] }))
       .find((candidate) => candidate.targets.includes("p2"));
     expect(target).toBeDefined();
-    if (!target) return;
+    if (!target) throw new Error("Expected a thief move target adjacent to p2");
 
     const played = applyOrThrow(state, { type: "PLAY_KNIGHT", playerId: "p1", cardId: "knight-card", hexId: target.hexId as HexId, stealFromPlayerId: "p2" });
     const thief = played.events.find((event) => event.type === "THIEF_MOVED");

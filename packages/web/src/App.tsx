@@ -1822,7 +1822,7 @@ export const App = () => {
               </div>
             ) : null}
 
-            <div className="phase-card dev-card-panel" aria-label="Development cards">
+            <div className={`phase-card dev-card-panel ${ownDevelopmentCards.length === 0 ? "empty" : ""}`} aria-label="Development cards">
               <div className="panel-title">
                 <strong>Development Cards</strong>
                 <span>{ownDevelopmentCards.filter((card) => !card.playedTurn).length}</span>
