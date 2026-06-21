@@ -44,6 +44,7 @@ jobs:
           npm run lint
           npm run typecheck
           npm run test:coverage
+          npm run coverage:sonar
           npm run build
 
       - name: SonarCloud scan

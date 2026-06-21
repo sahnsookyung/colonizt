@@ -8,6 +8,20 @@ export interface NetworkRoomInfo {
 }
 
 const maxReconnectAttempts = 8;
+const reconnectJitterMs = 250;
+
+const randomJitter = (exclusiveMax: number): number => {
+  if (exclusiveMax <= 1) return 0;
+  const sample = new Uint32Array(1);
+  const bucketSize = 0x1_0000_0000;
+  const unbiasedLimit = bucketSize - (bucketSize % exclusiveMax);
+  let value = bucketSize;
+  while (value >= unbiasedLimit) {
+    globalThis.crypto.getRandomValues(sample);
+    value = sample[0] ?? bucketSize;
+  }
+  return value % exclusiveMax;
+};
 
 export const useNetworkRoom = () => {
   const [networkStatus, setNetworkStatus] = useState("Local game");
@@ -43,7 +57,7 @@ export const useNetworkRoom = () => {
       setNetworkStatus("Reconnect paused");
       return false;
     }
-    const delay = Math.min(15_000, 750 * 2 ** Math.min(reconnectAttemptRef.current - 1, 5)) + Math.floor(Math.random() * 250);
+    const delay = Math.min(15_000, 750 * 2 ** Math.min(reconnectAttemptRef.current - 1, 5)) + randomJitter(reconnectJitterMs);
     const retryAt = Date.now() + delay;
     setReconnectRetryAt(retryAt);
     setNetworkStatus(`Reconnecting in ${Math.ceil(delay / 1000)}s`);

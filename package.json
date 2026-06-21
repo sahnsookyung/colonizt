@@ -13,6 +13,7 @@
     "typecheck": "tsc -b",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage --coverage.reporter=lcov --coverage.reporter=text",
+    "coverage:sonar": "node scripts/normalize-lcov.mjs coverage/lcov.info",
     "test:unit": "vitest run packages/game-core packages/test-utils packages/bots packages/demo-state",
     "test:property": "vitest run packages/game-core/tests/property.test.ts",
     "test:integration": "vitest run packages/server packages/db",
