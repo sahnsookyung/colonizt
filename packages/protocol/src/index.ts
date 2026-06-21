@@ -16,6 +16,7 @@ const resourceBundleSchema = z.object({
 const resourceSchema = z.enum(["timber", "brick", "grain", "fiber", "ore"]);
 const botDifficultySchema = z.enum(["easy", "medium", "hard"]);
 const mapPresetSchema = z.enum(["standard", "islands", "continent"]);
+const onlinePlayerCountSchema = z.number().int().min(2).max(4);
 
 export const gameRulesSchema = z.object({
   diceDoubles: z.boolean().default(false),
@@ -72,10 +73,14 @@ export const createRoomSchema = z.object({
   mode: z.enum(["CLASSIC", "DUEL", "RUSH"]).default("CLASSIC"),
   botFill: z.boolean().default(true),
   ranked: z.boolean().default(false),
-  minPlayers: z.number().int().min(2).max(4).optional(),
+  minPlayers: onlinePlayerCountSchema.optional(),
+  maxPlayers: onlinePlayerCountSchema.optional(),
   botDifficulty: botDifficultySchema.default("medium"),
   rules: gameRulesSchema.default({}),
-});
+}).refine(
+  (settings) => settings.minPlayers === undefined || settings.maxPlayers === undefined || settings.minPlayers <= settings.maxPlayers,
+  { path: ["minPlayers"], message: "minPlayers cannot exceed maxPlayers" },
+);
 
 export const analyticsEventSchema = z.object({
   userId: z.string().optional(),
@@ -149,6 +154,7 @@ export interface PublicRoomPayload {
     botFill?: boolean;
     ranked?: boolean;
     minPlayers?: number;
+    maxPlayers?: number;
     botDifficulty?: BotDifficulty;
     rules?: GameConfig["rules"];
   };

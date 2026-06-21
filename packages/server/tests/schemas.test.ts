@@ -21,6 +21,7 @@ describe("WebSocket schemas", () => {
       botFill: true,
       ranked: false,
       minPlayers: 4,
+      maxPlayers: 4,
       botDifficulty: "hard",
       rules: { diceDoubles: true, plight: true, plightTurn: 20, mapPreset: "continent" },
     });
@@ -28,6 +29,7 @@ describe("WebSocket schemas", () => {
     if (parsed.success) {
       expect(parsed.data.botDifficulty).toBe("hard");
       expect(parsed.data.minPlayers).toBe(4);
+      expect(parsed.data.maxPlayers).toBe(4);
       expect(parsed.data.rules).toMatchObject({ diceDoubles: true, plight: true, plightTurn: 20, mapPreset: "continent" });
     }
   });
@@ -43,5 +45,8 @@ describe("WebSocket schemas", () => {
   it("rejects impossible player-room start thresholds", () => {
     expect(createRoomSchema.safeParse({ mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 1 }).success).toBe(false);
     expect(createRoomSchema.safeParse({ mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 5 }).success).toBe(false);
+    expect(createRoomSchema.safeParse({ mode: "CLASSIC", botFill: false, ranked: false, maxPlayers: 1 }).success).toBe(false);
+    expect(createRoomSchema.safeParse({ mode: "CLASSIC", botFill: false, ranked: false, maxPlayers: 5 }).success).toBe(false);
+    expect(createRoomSchema.safeParse({ mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 4, maxPlayers: 2 }).success).toBe(false);
   });
 });

@@ -134,7 +134,10 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     ...(options.roomOwnershipLeaseTtlMs !== undefined ? { ownershipLeaseTtlMs: options.roomOwnershipLeaseTtlMs } : {}),
   });
   const presence: PresenceStore = await createPresenceStore(process.env.REDIS_URL);
-  const allowedOrigins = options.allowedOrigins ?? [process.env.WEB_ORIGIN ?? "http://127.0.0.1:5173"];
+  const defaultAllowedOrigins = process.env.WEB_ORIGIN
+    ? [process.env.WEB_ORIGIN]
+    : ["http://127.0.0.1:5173", "http://localhost:5173"];
+  const allowedOrigins = options.allowedOrigins ?? defaultAllowedOrigins;
   const allowLegacySessionToken = options.allowLegacySessionToken ?? false;
   const wsTicketTtlMs = options.wsTicketTtlMs ?? defaultWebSocketTicketTtlMs;
   const app = Fastify({ logger: false, bodyLimit: 32_000 });
@@ -396,9 +399,12 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     }
     const parsed = createRoomSchema.safeParse(request.body ?? {});
     if (!parsed.success) return reply.status(400).send({ code: "BAD_REQUEST", issues: parsed.error.issues });
-    const parsedSettings = parsed.data.minPlayers === undefined
-      ? (({ minPlayers: _minPlayers, ...rest }) => rest)(parsed.data)
-      : parsed.data;
+    const { minPlayers, maxPlayers, ...baseSettings } = parsed.data;
+    const parsedSettings = {
+      ...baseSettings,
+      ...(minPlayers === undefined ? {} : { minPlayers }),
+      ...(maxPlayers === undefined ? {} : { maxPlayers }),
+    };
     const settings = parsedSettings.rules?.mapPreset
       ? { ...parsedSettings, rules: { ...parsedSettings.rules, mapRandomized: true } }
       : parsedSettings;

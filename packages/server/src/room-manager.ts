@@ -87,6 +87,7 @@ export interface RoomSettings {
   botFill: boolean;
   ranked: boolean;
   minPlayers?: number;
+  maxPlayers?: number;
   botDifficulty?: BotDifficulty;
   rules?: GameConfig["rules"];
 }
@@ -216,19 +217,31 @@ export class RoomManager {
     return persisted;
   }
 
+  private seatCountForSettings(settings: RoomSettings): number {
+    const seatCount = settings.maxPlayers ?? (settings.mode === "DUEL" ? 2 : 4);
+    if (!Number.isInteger(seatCount) || seatCount < 2 || seatCount > 4) {
+      throw new Error("Room maxPlayers must be between 2 and 4");
+    }
+    if (settings.minPlayers !== undefined && settings.minPlayers > seatCount) {
+      throw new Error("Room minPlayers cannot exceed maxPlayers");
+    }
+    return seatCount;
+  }
+
   async createRoom(host: Session, settings: RoomSettings): Promise<Room> {
     await this.cleanupRooms();
     if (this.activeRoomCount() >= this.cleanupPolicy.maxActiveRooms) {
       throw new RoomCapacityError();
     }
     const createdAt = new Date().toISOString();
+    const seatCount = this.seatCountForSettings(settings);
     const room: Room = {
       id: `room_${nanoid(8)}`,
       code: this.createUniqueRoomCode(),
       hostUserId: host.userId,
       status: "LOBBY",
       settings,
-      seats: Array.from({ length: 4 }, (_, seatIndex) => ({ seatIndex, ready: false, connected: false })),
+      seats: Array.from({ length: seatCount }, (_, seatIndex) => ({ seatIndex, ready: false, connected: false })),
       spectators: new Set(),
       createdAt,
       lastActivityAt: createdAt,
@@ -249,7 +262,8 @@ export class RoomManager {
   async createAllBotRoomForTest(settings: RoomSettings, botIds: readonly PlayerId[] = ["bot_1", "bot_2", "bot_3", "bot_4"]): Promise<Room> {
     if (botIds.length !== 4) throw new Error("createAllBotRoomForTest requires exactly four bot ids");
     const host = await this.createSession("All Bot Test Host");
-    const room = await this.createRoom(host, { ...settings, botFill: true });
+    const allBotSettings = { ...settings, botFill: true, maxPlayers: botIds.length };
+    const room = await this.createRoom(host, allBotSettings);
     room.hostUserId = botIds[0]!;
     room.seats = room.seats.map((seat, index) => ({
       seatIndex: seat.seatIndex,
@@ -257,7 +271,7 @@ export class RoomManager {
       ready: true,
       connected: true,
     }));
-    room.settings = { ...settings, botFill: true };
+    room.settings = allBotSettings;
     this.touchRoom(room);
     await this.eventStore.persistRoom(room);
     await this.startRoom(room);

@@ -85,6 +85,64 @@ describe("App", () => {
     expect(screen.queryByRole("button", { name: "History" })).not.toBeInTheDocument();
   });
 
+  it("hosts online rooms with the selected player capacity", async () => {
+    let roomPayload: unknown;
+    const lobbyRoom = {
+      id: "room_two",
+      code: "TWO222",
+      inviteUrl: "https://play.example/?room=TWO222",
+      status: "LOBBY",
+      hostUserId: "u_host",
+      settings: { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 2, botDifficulty: "medium", rules: { mapPreset: "standard" } },
+      seats: [
+        { seatIndex: 0, userId: "u_host", ready: false, connected: true },
+        { seatIndex: 1, ready: false, connected: false },
+      ],
+      spectatorCount: 0,
+      events: [],
+    };
+    class FakeWebSocket extends EventTarget {
+      static readonly OPEN = 1;
+      readyState = FakeWebSocket.OPEN;
+
+      constructor(readonly url: string) {
+        super();
+        queueMicrotask(() => this.dispatchEvent(new Event("open")));
+      }
+
+      send(payload: string): void {
+        const message = JSON.parse(payload) as { type: string };
+        if (message.type === "JOIN_ROOM") {
+          queueMicrotask(() => this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "ROOM_STATE", room: lobbyRoom }) })));
+        }
+      }
+
+      close(): void {
+        this.dispatchEvent(new Event("close"));
+      }
+    }
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/sessions")) return new Response(JSON.stringify({ token: "s_host", userId: "u_host", displayName: "Browser Host" }), { status: 200 });
+      if (url.endsWith("/rooms")) {
+        roomPayload = JSON.parse(String(init?.body ?? "{}"));
+        return new Response(JSON.stringify(lobbyRoom), { status: 200 });
+      }
+      if (url.endsWith("/ws-tickets")) return new Response(JSON.stringify({ ticket: "wst_1", expiresAt: "2026-06-22T00:00:00.000Z", ttlMs: 30_000 }), { status: 201 });
+      return new Response("not found", { status: 404 });
+    }));
+
+    render(<App />);
+    fireEvent.click(within(screen.getByRole("group", { name: "Players" })).getByRole("button", { name: "2" }));
+    fireEvent.click(screen.getByRole("button", { name: /Player Match/ }));
+
+    expect(await screen.findByLabelText("Online lobby")).toBeInTheDocument();
+    expect(roomPayload).toMatchObject({ minPlayers: 2, maxPlayers: 2 });
+    expect(screen.getByText("0/2 ready · 1/2 seats")).toBeInTheDocument();
+    expect(screen.getByText("1/2")).toBeInTheDocument();
+  });
+
   it("marks the two settlement corners that grant each harbor bonus", () => {
     const { container } = render(<App />);
     fireEvent.click(screen.getByRole("button", { name: /Bot Match/ }));

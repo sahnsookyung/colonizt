@@ -1079,7 +1079,7 @@ export const App = () => {
       const session = await client.createSession("Browser Host");
       if (!isNetworkGeneration(generation)) return;
       const { playerCount, ...roomOptions } = matchOptions;
-      const room = await client.createRoom(session.token, { ...roomOptions, mode: "CLASSIC", botFill: false, ranked: false, minPlayers: playerCount });
+      const room = await client.createRoom(session.token, { ...roomOptions, mode: "CLASSIC", botFill: false, ranked: false, minPlayers: playerCount, maxPlayers: playerCount });
       if (!isNetworkGeneration(generation)) return;
       setNetworkSession({ token: session.token, userId: session.userId });
       setNetworkRoom(room);
@@ -1382,8 +1382,8 @@ export const App = () => {
     const roomCode = networkRoom?.code ?? networkRoomInfo?.code ?? networkRoomInfo?.id ?? "------";
     const lobbySeats = networkRoom?.seats ?? [];
     const ownSeat = lobbySeats.find((seat) => seat.userId === humanPlayerId);
-    const totalSeats = Math.max(4, lobbySeats.length);
     const neededPlayers = networkRoom?.settings?.minPlayers ?? matchOptions.playerCount;
+    const totalSeats = networkRoom?.settings?.maxPlayers ?? Math.max(neededPlayers, lobbySeats.length);
     const readyCount = lobbySeats.filter((seat) => seat.ready && (seat.userId || seat.botId)).length;
     const occupiedCount = lobbySeats.filter((seat) => seat.userId || seat.botId).length;
     const lobbyRules = [
@@ -2115,7 +2115,7 @@ export const App = () => {
                   {pendingCommandCount > 0 ? <small>{pendingCommandCount} pending</small> : null}
                   {reconnectRetryAt ? <small>Retry {Math.max(0, Math.ceil((reconnectRetryAt - nowMs) / 1000))}s</small> : null}
                   <button type="button" onClick={copyInvite}>Copy Invite</button>
-                  <button type="button" onClick={retryOnlineNow}>Retry</button>
+                  <button type="button" onClick={retryOnlineNow} disabled={!reconnectRetryAt}>Retry</button>
                   <button type="button" onClick={returnToSetup}>Leave</button>
                 </div>
               ) : null}

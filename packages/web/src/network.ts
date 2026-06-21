@@ -8,7 +8,7 @@ export type RoomLookupResult =
 
 export interface NetworkClient {
   createSession(displayName: string): Promise<CreateSessionResponse>;
-  createRoom(token: string, options?: { mode?: "CLASSIC" | "DUEL" | "RUSH"; botFill?: boolean; ranked?: boolean; minPlayers?: number; botDifficulty?: BotDifficulty; rules?: GameConfig["rules"] }): Promise<PublicRoomPayload>;
+  createRoom(token: string, options?: { mode?: "CLASSIC" | "DUEL" | "RUSH"; botFill?: boolean; ranked?: boolean; minPlayers?: number; maxPlayers?: number; botDifficulty?: BotDifficulty; rules?: GameConfig["rules"] }): Promise<PublicRoomPayload>;
   getRoom(roomRef: string): Promise<RoomLookupResult>;
   listMatches(limit?: number): Promise<MatchSummary[]>;
   loadReplay(replayId: string, token?: string): Promise<ReplayLogPayload>;

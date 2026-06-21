@@ -70,6 +70,7 @@ describe("network client", () => {
       botFill: false,
       ranked: false,
       minPlayers: 4,
+      maxPlayers: 4,
       rules: { mapPreset: "continent", mapRandomized: true },
     })).resolves.toMatchObject({ id: "room_1" });
     expect(roomPayload).toMatchObject({
@@ -77,6 +78,7 @@ describe("network client", () => {
       botFill: false,
       ranked: false,
       minPlayers: 4,
+      maxPlayers: 4,
       rules: { mapPreset: "continent", mapRandomized: true },
     });
   });

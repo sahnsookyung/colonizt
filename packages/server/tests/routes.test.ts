@@ -32,6 +32,23 @@ describe("REST routes", () => {
     });
   });
 
+  it("allows local Vite preflight requests from localhost", async () => {
+    const app = await buildServer({ manager: new RoomManager() });
+    const response = await app.inject({
+      method: "OPTIONS",
+      url: "/sessions",
+      headers: {
+        origin: "http://localhost:5173",
+        "access-control-request-method": "POST",
+        "access-control-request-headers": "content-type",
+      },
+    });
+    await app.close();
+
+    expect(response.statusCode).toBe(204);
+    expect(response.headers["access-control-allow-origin"]).toBe("http://localhost:5173");
+  });
+
   it("rejects turn-limit adjudication rules unless test rules are enabled", async () => {
     const manager = new RoomManager();
     const session = await manager.createSession("Host");
@@ -287,6 +304,24 @@ describe("REST routes", () => {
     expect(createdBody.inviteUrl).toBe(`https://colonizt.example/?room=${createdBody.code}`);
     expect(byCode.statusCode).toBe(200);
     expect(byCode.json()).toMatchObject({ id: createdBody.id, code: createdBody.code });
+  });
+
+  it("creates room-code lobbies with the requested player capacity", async () => {
+    const manager = new RoomManager();
+    const session = await manager.createSession("Host");
+    const app = await buildServer({ manager });
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/rooms",
+      headers: { "x-session-token": session.token },
+      payload: { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 2 },
+    });
+    await app.close();
+
+    expect(created.statusCode).toBe(200);
+    expect(created.json()).toMatchObject({ settings: { minPlayers: 2, maxPlayers: 2 }, seats: [{ seatIndex: 0 }, { seatIndex: 1 }] });
+    expect(created.json().seats).toHaveLength(2);
   });
 
   it("normalizes preset room settings to randomized map semantics", async () => {

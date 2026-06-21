@@ -161,6 +161,28 @@ describe("RoomManager", () => {
     expect(left.room.seats[1]).toMatchObject({ ready: false, connected: false });
   });
 
+  it("honors explicit two-player room capacity", async () => {
+    const manager = new RoomManager();
+    const [host, guest, extra] = await Promise.all(["Host", "Guest", "Extra"].map((name) => manager.createSession(name)));
+    const room = await manager.createRoom(host!, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 2 });
+
+    expect(room.seats).toHaveLength(2);
+    const joined = await manager.joinRoom(room.code, guest!);
+    expect(joined.ok).toBe(true);
+    const full = await manager.joinRoom(room.code, extra!);
+    expect(full).toMatchObject({ ok: false, code: "ROOM_FULL" });
+
+    await manager.syncConnections(room.id, new Set([host!.userId, guest!.userId]));
+    await manager.setReady(room.id, host!, true);
+    const ready = await manager.setReady(room.id, guest!, true);
+
+    expect(ready.ok).toBe(true);
+    if (!ready.ok) throw new Error("ready failed");
+    expect(ready.room.status).toBe("IN_GAME");
+    expect(ready.room.game?.playerOrder).toEqual([host!.userId, guest!.userId]);
+    expect(ready.room.game?.config.maxPlayers).toBe(2);
+  });
+
   it("does not start a lobby with disconnected ready players", async () => {
     const manager = new RoomManager();
     const sessions = await Promise.all(["Host", "P2", "P3"].map((name) => manager.createSession(name)));
