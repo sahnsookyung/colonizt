@@ -1391,7 +1391,7 @@ export const App = () => {
                     className={`${thiefHere ? "thief-hex" : ""} ${legalThiefDestination ? "legal-thief-hex" : ""}`}
                     filter="url(#softShadow)"
                     role={legalThiefDestination ? "button" : undefined}
-                    tabIndex={legalThiefDestination ? 0 : -1}
+                    tabIndex={legalThiefDestination ? 0 : undefined}
                     aria-label={legalThiefDestination ? `Move robber to ${terrainLabels[hex.resource]} hex` : undefined}
                     onClick={(event) => {
                       if (!legalThiefDestination) return;
@@ -1551,7 +1551,7 @@ export const App = () => {
                     className={`vertex-target ${isLegalVertex ? "legal-target" : ""}`}
                     role={isLegalVertex ? "button" : undefined}
                     aria-label={isLegalVertex ? `${isLegalCity ? "Upgrade city" : state.phase.type === "SETUP_PLACEMENT" ? "Place setup settlement" : "Build settlement"} at corner ${vertex.id}` : undefined}
-                    tabIndex={isLegalVertex ? 0 : -1}
+                    tabIndex={isLegalVertex ? 0 : undefined}
                     onClick={(event) => {
                       if (!isLegalVertex) return;
                       event.stopPropagation();

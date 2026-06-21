@@ -120,6 +120,44 @@ test("action controls use solid contained colors", async ({ page, isMobile }) =>
   }
 });
 
+test("board tile drags do not create native SVG selection artifacts", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop project only");
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("button", { name: /Bot Match/ }).click();
+
+  const board = await page.locator(".board").boundingBox();
+  if (!board) throw new Error("Missing board bounds");
+  await page.mouse.move(board.x + board.width * 0.45, board.y + board.height * 0.35);
+  await page.mouse.down();
+  await page.mouse.move(board.x + board.width * 0.66, board.y + board.height * 0.62, { steps: 12 });
+  await page.mouse.up();
+
+  const selectionState = await page.evaluate(() => {
+    const selection = window.getSelection();
+    const boardElement = document.querySelector<SVGSVGElement>(".board");
+    if (!boardElement) throw new Error("Missing board");
+    const boardStyle = window.getComputedStyle(boardElement);
+    return {
+      selectedText: selection?.toString() ?? "",
+      rangeCount: selection?.rangeCount ?? 0,
+      activeTag: document.activeElement?.tagName,
+      activeRole: document.activeElement?.getAttribute("role"),
+      boardUserSelect: boardStyle.userSelect,
+      boardWebkitUserSelect: boardStyle.webkitUserSelect,
+      inactiveTabIndexes: document.querySelectorAll('.board [tabindex="-1"]').length,
+    };
+  });
+
+  expect(selectionState.selectedText).toBe("");
+  expect(selectionState.rangeCount).toBe(0);
+  expect(selectionState.activeTag).toBe("BODY");
+  expect(selectionState.activeRole).toBeNull();
+  expect(selectionState.boardUserSelect).toBe("none");
+  expect(selectionState.boardWebkitUserSelect).toBe("none");
+  expect(selectionState.inactiveTabIndexes).toBe(0);
+});
+
 test("mobile viewport keeps primary controls visible", async ({ page, isMobile }) => {
   test.skip(!isMobile, "mobile project only");
   await page.goto("/");

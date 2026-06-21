@@ -347,7 +347,21 @@ button:disabled {
   width: 100%;
   height: 100%;
   touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
   -webkit-tap-highlight-color: transparent;
+}
+
+.board * {
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.board [role="button"],
+.board [tabindex] {
+  outline: none;
 }
 
 .ocean {
