@@ -8,9 +8,11 @@ test("local bot game first screen is playable on desktop", async ({ page, isMobi
   await expect(page.getByRole("button", { name: /Player Match/ })).toBeVisible();
   await page.getByRole("button", { name: /Bot Match/ }).click();
   await expect(page.getByLabel("Game board and actions")).toBeVisible();
-  await page.getByRole("button", { name: "Ready" }).click();
-  await page.getByRole("button", { name: "Roll dice" }).click();
-  await expect(page.getByText(/Roll \d+/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Ready" })).toHaveCount(0);
+  await page.getByRole("button", { name: /Place setup settlement at corner/ }).first().click();
+  await expect(page.getByText("Place setup road")).toBeVisible();
+  await page.getByRole("button", { name: /Build road on edge/ }).first().click();
+  await expect(page.getByLabel("Game board and actions")).toBeVisible();
 });
 
 test("initial desert robber marker is centered without a dark tile seam", async ({ page, isMobile }) => {
