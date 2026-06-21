@@ -1,4 +1,4 @@
-import { createFixedBoard, replay, type BoardGraph, type GameConfig, type GameEvent, type GameState } from "@colonizt/game-core";
+import { replay, type BoardGraph, type GameConfig, type GameEvent, type GameState } from "@colonizt/game-core";
 import { createDemoConfig, playBotGame } from "@colonizt/demo-state";
 
 export interface ReplayLogState {
@@ -9,7 +9,7 @@ export interface ReplayLogState {
 
 export const createDemoReplayLog = (seed = "web-replay", maxCommands = 220): ReplayLogState => {
   const played = playBotGame(seed, maxCommands);
-  return { config: createDemoConfig(seed), board: createFixedBoard(), events: played.events };
+  return { config: createDemoConfig(seed), board: played.state.board, events: played.events };
 };
 
 export const replayAtIndex = (log: ReplayLogState, index: number): GameState => {

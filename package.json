@@ -21,7 +21,7 @@
     "replay:fixtures": "tsx scripts/replay-fixtures.ts",
     "build": "tsc -b && npm --workspace @colonizt/web run build",
     "simulate:bots": "tsx scripts/simulate-bots.ts",
-    "simulate:bots:gate": "BOT_ASSERT=true BOT_GAMES=100 BOT_MAX_COMMANDS=700 BOT_MAX_TURNS=50 BOT_DIFFICULTY=medium BOT_RANDOM_MAP=true BOT_PROFILE_MODE=greedy tsx scripts/simulate-bots.ts",
+    "simulate:bots:gate": "BOT_ASSERT=true BOT_GAMES=5 BOT_PLAYER_COUNTS=2,3,4,6,8 BOT_MAP_PRESETS=standard,islands,continent BOT_MAX_COMMANDS=900 BOT_MAX_TURNS=55 BOT_DIFFICULTY=medium BOT_PROFILE_MODE=greedy tsx scripts/simulate-bots.ts",
     "simulate:bots:default-lineup": "BOT_ASSERT=true BOT_GAMES=100 BOT_MAX_COMMANDS=700 BOT_MAX_TURNS=50 BOT_DIFFICULTY=medium BOT_RANDOM_MAP=true BOT_PROFILE_MODE=default tsx scripts/simulate-bots.ts",
     "simulate:bots:difficulty": "BOT_ASSERT=true BOT_MIXED_DIFFICULTY=true BOT_GAMES=72 BOT_MAX_COMMANDS=900 BOT_MAX_TURNS=55 BOT_RANDOM_MAP=true BOT_PROFILE_MODE=greedy tsx scripts/simulate-bots.ts",
     "simulate:dice": "tsx scripts/simulate-dice.ts",

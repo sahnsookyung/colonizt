@@ -2,9 +2,8 @@ import {
   applyCommand,
   activeCollectingTradeForPlayer,
   canBuildRoad,
-  createFixedBoard,
   createGame,
-  createSeededBoard,
+  createBoardForRules,
   deterministicDiscard,
   emptyResources,
   eligibleStealTargets,
@@ -17,6 +16,7 @@ import {
   type GameConfig,
   type GameEvent,
   type GameState,
+  type BoardGraph,
   type PlayerId,
   type HexId,
   type ResourceBundle,
@@ -27,45 +27,51 @@ import { createBotTradeId, createBotView, evaluateTrade, greedyBot, plannerBot, 
 export const demoPlayerIds = ["p1", "p2", "p3", "p4"] as const;
 
 export interface DemoGameOptions {
+  playerCount?: number;
+  botCount?: number;
+  playerIds?: readonly PlayerId[];
+  board?: BoardGraph;
   botDifficulty?: BotDifficulty;
   botDifficulties?: Partial<Record<PlayerId, BotDifficulty>>;
   botProfiles?: Partial<Record<PlayerId, BotProfile>>;
   rules?: GameConfig["rules"];
 }
 
-export const createDemoConfig = (seed = "demo-seed", options: DemoGameOptions = {}): GameConfig => ({
-  matchId: `match-${seed}`,
-  seed,
-  victoryPoints: 10,
-  maxPlayers: 4,
-  turnSeconds: 45,
-  playerOrder: [...demoPlayerIds],
-  playerNames: {
-    p1: "Aster",
-    p2: "Briar",
-    p3: "Cyra",
-    p4: "Dax",
-  },
-  playerColors: {
-    p1: "#2563eb",
-    p2: "#dc2626",
-    p3: "#16a34a",
-    p4: "#ca8a04",
-  },
-  botDifficulty: options.botDifficulty ?? "medium",
-  rules: {
-    diceDoubles: false,
-    plight: false,
-    plightTurn: 20,
-    mapRandomized: false,
-    specialCardCostRandomized: false,
-    ...options.rules,
-  },
-});
+const defaultPlayerNames = ["Aster", "Briar", "Cyra", "Dax", "Ember", "Fenn", "Galen", "Hana"];
+const defaultPlayerColors = ["#2563eb", "#dc2626", "#16a34a", "#ca8a04", "#7c3aed", "#0891b2", "#db2777", "#65a30d"];
+
+const playerIdsForOptions = (options: DemoGameOptions): PlayerId[] => {
+  if (options.playerIds?.length) return [...options.playerIds];
+  const count = Math.max(1, Math.floor(options.playerCount ?? (options.botCount !== undefined ? options.botCount + 1 : demoPlayerIds.length)));
+  return Array.from({ length: count }, (_, index) => `p${index + 1}` as PlayerId);
+};
+
+export const createDemoConfig = (seed = "demo-seed", options: DemoGameOptions = {}): GameConfig => {
+  const playerOrder = playerIdsForOptions(options);
+  return {
+    matchId: `match-${seed}`,
+    seed,
+    victoryPoints: 10,
+    maxPlayers: playerOrder.length,
+    turnSeconds: 45,
+    playerOrder,
+    playerNames: Object.fromEntries(playerOrder.map((playerId, index) => [playerId, defaultPlayerNames[index] ?? `Player ${index + 1}`])),
+    playerColors: Object.fromEntries(playerOrder.map((playerId, index) => [playerId, defaultPlayerColors[index] ?? "#64748b"])),
+    botDifficulty: options.botDifficulty ?? "medium",
+    rules: {
+      diceDoubles: false,
+      plight: false,
+      plightTurn: 20,
+      mapRandomized: false,
+      specialCardCostRandomized: false,
+      ...options.rules,
+    },
+  };
+};
 
 export const createDemoGame = (seed = "demo-seed", options: DemoGameOptions = {}): GameState => {
   const config = createDemoConfig(seed, options);
-  const board = config.rules?.mapRandomized ? createSeededBoard(seed, 2) : createFixedBoard();
+  const board = options.board ?? createBoardForRules(seed, config.rules);
   return createGame(config, board);
 };
 

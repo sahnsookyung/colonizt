@@ -25,6 +25,7 @@ import {
   type GameCommand,
   type GameEvent,
   type GameState,
+  type MapPreset,
   type PlayerId,
   type Resource,
   type ResourceBundle,
@@ -77,6 +78,7 @@ interface MatchOptions {
     plight: boolean;
     plightTurn: number;
     mapRandomized: boolean;
+    mapPreset: MapPreset;
     specialCardCostRandomized: boolean;
   };
 }
@@ -88,8 +90,15 @@ const defaultMatchOptions: MatchOptions = {
     plight: false,
     plightTurn: 20,
     mapRandomized: true,
+    mapPreset: "standard",
     specialCardCostRandomized: false,
   },
+};
+
+const mapPresetLabels: Record<MapPreset, string> = {
+  standard: "Standard",
+  islands: "Islands",
+  continent: "Continent",
 };
 
 const developmentCardLabels: Record<DevelopmentCard["type"], string> = {
@@ -383,7 +392,7 @@ export const App = () => {
   const canSubmitOfferTrade = canOfferTrade && resourceCount(tradeOffer) > 0 && resourceCount(tradeRequest) > 0 && !hasTradeOverlap && Boolean(humanPlayer && hasResources(humanPlayer.resources, tradeOffer));
   const keyboardShortcutsEnabled = platform() === "desktop";
   const activeRules = [
-    state.config.rules?.mapRandomized ? "Random map" : "Fixed map",
+    `Map ${mapPresetLabels[state.config.rules?.mapPreset ?? "standard"]}`,
     state.config.rules?.diceDoubles ? "Doubles x2" : undefined,
     state.config.rules?.plight ? `Plight turn ${state.config.rules.plightTurn ?? 20}` : undefined,
     state.config.rules?.specialCardCostRandomized ? "Random special cost" : undefined,
@@ -442,12 +451,23 @@ export const App = () => {
     setMatchOptions((current) => ({ ...current, botDifficulty }));
   };
 
-  const setRuleEnabled = (rule: Exclude<keyof MatchOptions["rules"], "plightTurn">, enabled: boolean) => {
+  const setRuleEnabled = (rule: "diceDoubles" | "plight" | "specialCardCostRandomized", enabled: boolean) => {
     setMatchOptions((current) => ({
       ...current,
       rules: {
         ...current.rules,
         [rule]: enabled,
+      },
+    }));
+  };
+
+  const setMapPreset = (mapPreset: MapPreset) => {
+    setMatchOptions((current) => ({
+      ...current,
+      rules: {
+        ...current.rules,
+        mapPreset,
+        mapRandomized: true,
       },
     }));
   };
@@ -1252,14 +1272,6 @@ export const App = () => {
               <label className="rule-toggle">
                 <input
                   type="checkbox"
-                  checked={matchOptions.rules.mapRandomized}
-                  onChange={(event) => setRuleEnabled("mapRandomized", event.currentTarget.checked)}
-                />
-                <span>Randomized balanced map</span>
-              </label>
-              <label className="rule-toggle">
-                <input
-                  type="checkbox"
                   checked={matchOptions.rules.specialCardCostRandomized}
                   onChange={(event) => setRuleEnabled("specialCardCostRandomized", event.currentTarget.checked)}
                 />
@@ -1273,6 +1285,22 @@ export const App = () => {
                 />
                 <span>Plight on turn 20</span>
               </label>
+              <div className="option-row">
+                <span>Map</span>
+                <div className="difficulty-options" role="group" aria-label="Map">
+                  {(["standard", "islands", "continent"] as const).map((mapPreset) => (
+                    <button
+                      key={mapPreset}
+                      type="button"
+                      className={matchOptions.rules.mapPreset === mapPreset ? "selected" : ""}
+                      aria-pressed={matchOptions.rules.mapPreset === mapPreset}
+                      onClick={() => setMapPreset(mapPreset)}
+                    >
+                      {mapPresetLabels[mapPreset]}
+                    </button>
+                  ))}
+                </div>
+              </div>
             </div>
             {error ? <p className="start-error">{error}</p> : null}
           </div>

@@ -1,12 +1,14 @@
 import { seededShuffle } from "./rng.js";
-import { resources, type BoardGraph, type EdgeId, type HexId, type Resource, type Terrain, type VertexId } from "./types.js";
+import { resources, type BoardGraph, type EdgeId, type GameRules, type HexId, type MapPreset, type Resource, type Terrain, type VertexId } from "./types.js";
 
-interface HexSpec {
+export interface HexSpec {
   q: number;
   r: number;
   resource: Terrain;
   token?: number;
 }
+
+export const mapPresets = ["standard", "islands", "continent"] as const satisfies readonly MapPreset[];
 
 const isResource = (terrain: Terrain): terrain is Resource => resources.includes(terrain as Resource);
 
@@ -28,6 +30,31 @@ const axialDistance = (left: { q: number; r: number }, right: { q: number; r: nu
   const rightS = -right.q - right.r;
   return (Math.abs(left.q - right.q) + Math.abs(left.r - right.r) + Math.abs(leftS - rightS)) / 2;
 };
+
+const axialKey = (coord: { q: number; r: number }): string => `${coord.q},${coord.r}`;
+
+const axialNeighbors = (coord: { q: number; r: number }): Array<{ q: number; r: number }> => [
+  { q: coord.q + 1, r: coord.r },
+  { q: coord.q - 1, r: coord.r },
+  { q: coord.q, r: coord.r + 1 },
+  { q: coord.q, r: coord.r - 1 },
+  { q: coord.q + 1, r: coord.r - 1 },
+  { q: coord.q - 1, r: coord.r + 1 },
+];
+
+const hexCoordsWithinRadius = (radius: number): Array<{ q: number; r: number }> => {
+  const coords: Array<{ q: number; r: number }> = [];
+  for (let q = -radius; q <= radius; q += 1) {
+    for (let r = -radius; r <= radius; r += 1) {
+      const s = -q - r;
+      if (Math.abs(s) <= radius) coords.push({ q, r });
+    }
+  }
+  return coords;
+};
+
+const translateCoords = (coords: readonly { q: number; r: number }[], qOffset: number, rOffset: number): Array<{ q: number; r: number }> =>
+  coords.map((coord) => ({ q: coord.q + qOffset, r: coord.r + rOffset }));
 
 const adjacentCoordinatePairs = (coords: readonly { q: number; r: number }[]): Array<[number, number]> => {
   const pairs: Array<[number, number]> = [];
@@ -247,16 +274,7 @@ export const createBoardFromHexes = (hexSpecs: HexSpec[]): BoardGraph => {
   };
 };
 
-export const createSeededBoard = (seed: string, radius = 1): BoardGraph => {
-  const coords: Array<{ q: number; r: number }> = [];
-  for (let q = -radius; q <= radius; q += 1) {
-    for (let r = -radius; r <= radius; r += 1) {
-      const s = -q - r;
-      if (Math.abs(s) <= radius) {
-        coords.push({ q, r });
-      }
-    }
-  }
+const createSeededBoardFromCoords = (seed: string, coords: Array<{ q: number; r: number }>): BoardGraph => {
   const terrainDeck = coords.length === classicTerrainDeck.length
     ? balancedTerrainDeck(coords, seed)
     : seededShuffle<Terrain>(
@@ -284,7 +302,85 @@ export const createSeededBoard = (seed: string, radius = 1): BoardGraph => {
   );
 };
 
+export const createSeededBoard = (seed: string, radius = 1): BoardGraph =>
+  createSeededBoardFromCoords(seed, hexCoordsWithinRadius(radius));
+
 export const createFixedBoard = (): BoardGraph => createSeededBoard("fixed-board", 2);
+
+export const createIslandBoard = (seed: string): BoardGraph => {
+  const island = hexCoordsWithinRadius(2);
+  return createSeededBoardFromCoords(seed, [
+    ...translateCoords(island, -5, 0),
+    ...translateCoords(island, 5, 0),
+  ]);
+};
+
+const createContinentCoords = (seed: string, targetHexes = 31, radius = 4): Array<{ q: number; r: number }> => {
+  const allowed = new Set(hexCoordsWithinRadius(radius).map(axialKey));
+  const selected = new Map<string, { q: number; r: number }>();
+  const frontier = new Map<string, { q: number; r: number }>();
+  const add = (coord: { q: number; r: number }): void => {
+    const key = axialKey(coord);
+    if (!allowed.has(key) || selected.has(key)) return;
+    selected.set(key, coord);
+    frontier.delete(key);
+    for (const neighbor of axialNeighbors(coord)) {
+      const neighborKey = axialKey(neighbor);
+      if (allowed.has(neighborKey) && !selected.has(neighborKey)) frontier.set(neighborKey, neighbor);
+    }
+  };
+
+  add({ q: 0, r: 0 });
+  while (selected.size < targetHexes && frontier.size > 0) {
+    const candidates = seededShuffle([...frontier.values()], `${seed}:continent-frontier:${selected.size}`);
+    const ranked = candidates
+      .map((coord) => ({
+        coord,
+        neighborCount: axialNeighbors(coord).filter((neighbor) => selected.has(axialKey(neighbor))).length,
+      }))
+      .sort((left, right) => right.neighborCount - left.neighborCount || axialDistance(left.coord, { q: 0, r: 0 }) - axialDistance(right.coord, { q: 0, r: 0 }));
+    add(ranked[0]!.coord);
+  }
+  return [...selected.values()];
+};
+
+export const createContinentBoard = (seed: string): BoardGraph =>
+  createSeededBoardFromCoords(seed, createContinentCoords(seed));
+
+export const createBoardForRules = (seed: string, rules?: Pick<GameRules, "mapPreset" | "mapRandomized">): BoardGraph => {
+  switch (rules?.mapPreset) {
+    case "islands":
+      return createIslandBoard(seed);
+    case "continent":
+      return createContinentBoard(seed);
+    case "standard":
+      return createSeededBoard(seed, 2);
+    case undefined:
+      return rules?.mapRandomized ? createSeededBoard(seed, 2) : createFixedBoard();
+  }
+};
+
+export const boardHexComponentCount = (board: BoardGraph): number => {
+  const unvisited = new Set(Object.keys(board.hexes) as HexId[]);
+  let components = 0;
+  while (unvisited.size > 0) {
+    components += 1;
+    const start = unvisited.values().next().value as HexId;
+    const stack = [start];
+    unvisited.delete(start);
+    while (stack.length > 0) {
+      const current = stack.pop()!;
+      for (const edgeId of Object.keys(board.edges) as EdgeId[]) {
+        const edge = board.edges[edgeId];
+        if (!edge?.adjacentHexes.includes(current) || edge.adjacentHexes.length < 2) continue;
+        for (const neighbor of edge.adjacentHexes) {
+          if (unvisited.delete(neighbor)) stack.push(neighbor);
+        }
+      }
+    }
+  }
+  return components;
+};
 
 const resourceDistributionErrors = (board: BoardGraph): string[] => {
   if (Object.keys(board.hexes).length !== classicTerrainDeck.length) return [];

@@ -25,14 +25,22 @@ describe("protocol schemas", () => {
       ranked: false,
       minPlayers: 4,
       botDifficulty: "hard",
-      rules: { diceDoubles: true, plight: true, plightTurn: 20, maxTurns: 100, maxTurnAdjudication: "leader" },
+      rules: { diceDoubles: true, plight: true, plightTurn: 20, mapPreset: "islands", maxTurns: 100, maxTurnAdjudication: "leader" },
     });
     expect(parsed.success).toBe(true);
     if (parsed.success) {
       expect(parsed.data.botDifficulty).toBe("hard");
       expect(parsed.data.minPlayers).toBe(4);
-      expect(parsed.data.rules).toMatchObject({ diceDoubles: true, plight: true, plightTurn: 20, maxTurns: 100, maxTurnAdjudication: "leader" });
+      expect(parsed.data.rules).toMatchObject({ diceDoubles: true, plight: true, plightTurn: 20, mapPreset: "islands", maxTurns: 100, maxTurnAdjudication: "leader" });
     }
+  });
+
+  it("rejects invalid map presets", () => {
+    expect(createRoomSchema.safeParse({ mode: "CLASSIC", botFill: true, ranked: false, rules: { mapPreset: "archipelago" } }).success).toBe(false);
+  });
+
+  it("accepts standard map presets without legacy mapRandomized flags", () => {
+    expect(createRoomSchema.safeParse({ mode: "CLASSIC", botFill: true, ranked: false, rules: { mapPreset: "standard" } }).success).toBe(true);
   });
 
   it("rejects impossible player-room start thresholds", () => {

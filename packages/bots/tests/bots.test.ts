@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { completeSetup, createDemoGame, playBotGame, withResources } from "@colonizt/demo-state";
-import { applyCommand, cityCost, emptyResources, specialCardCost, type BotDifficulty, type DevelopmentCardType, type PlayerId } from "@colonizt/game-core";
+import { applyCommand, cityCost, emptyResources, specialCardCost, type BotDifficulty, type DevelopmentCardType, type MapPreset, type PlayerId } from "@colonizt/game-core";
 import { botStateFingerprint, chooseBotCommand, createBotView, evaluateState, evaluateTrade, greedyBot, hasEquivalentBotTradeOffer, roadOpensSettlementAccess, scoreBotCandidates, scoreTradeResponder } from "../src/index.js";
 
 const tournamentPlayerIds = ["p1", "p2", "p3", "p4"] as const satisfies readonly PlayerId[];
+const alternateMapPresets = ["islands", "continent"] as const satisfies readonly MapPreset[];
 
 const rotatedDifficulties = (index: number): Record<PlayerId, BotDifficulty> => {
   const tiers: BotDifficulty[] = ["hard", "medium", "easy", "easy"];
@@ -182,6 +183,42 @@ describe("bot policies", () => {
     expect(applyCommand(state, command).ok).toBe(true);
   });
 
+  it("generates legal Road Building sequences on alternate maps", () => {
+    for (const mapPreset of alternateMapPresets) {
+      let state = completeSetup(createDemoGame(`road-building-${mapPreset}`, { botDifficulty: "hard", rules: { mapPreset, mapRandomized: true } })).state;
+      state = {
+        ...state,
+        phase: { type: "ACTION_PHASE", activePlayerId: "p1" },
+      };
+      state.players.p1!.resources = emptyResources();
+      state.players.p1!.developmentCards = [{ id: `road-card-${mapPreset}`, type: "ROAD_BUILDING", ownerId: "p1", boughtTurn: state.turn - 1 }];
+      state.players.p1!.specialCards = 1;
+
+      const candidate = scoreBotCandidates(createBotView(state, "p1", greedyBot.profile, "hard"), greedyBot.profile, () => `road-building-${mapPreset}`)
+        .find((item) => item.command.type === "PLAY_ROAD_BUILDING");
+      expect(candidate?.command.type).toBe("PLAY_ROAD_BUILDING");
+      if (candidate?.command.type !== "PLAY_ROAD_BUILDING") throw new Error(`Expected Road Building candidate on ${mapPreset}`);
+      expect(applyCommand(state, candidate.command).ok).toBe(true);
+    }
+  });
+
+  it("generates legal maritime trades on alternate maps", () => {
+    for (const mapPreset of alternateMapPresets) {
+      let state = completeSetup(createDemoGame(`maritime-${mapPreset}`, { botDifficulty: "hard", rules: { mapPreset, mapRandomized: true } })).state;
+      state = {
+        ...state,
+        phase: { type: "ACTION_PHASE", activePlayerId: "p1" },
+      };
+      state.players.p1!.resources = { ...emptyResources(), timber: 4 };
+
+      const candidate = scoreBotCandidates(createBotView(state, "p1", greedyBot.profile, "hard"), greedyBot.profile, () => `maritime-${mapPreset}`)
+        .find((item) => item.command.type === "MARITIME_TRADE");
+      expect(candidate?.command.type).toBe("MARITIME_TRADE");
+      if (candidate?.command.type !== "MARITIME_TRADE") throw new Error(`Expected maritime trade candidate on ${mapPreset}`);
+      expect(applyCommand(state, candidate.command).ok).toBe(true);
+    }
+  });
+
   it("chooses legal modal commands for discard and thief phases", () => {
     let state = completeSetup(createDemoGame("bot-modal", { botDifficulty: "hard" })).state;
     state = withResources(state, "p2", { timber: 8 });
@@ -194,6 +231,48 @@ describe("bot policies", () => {
     const move = chooseBotCommand(createBotView(state, "p1", greedyBot.profile, "hard"), greedyBot.profile);
     expect(move?.type).toBe("MOVE_THIEF");
     expect(move && applyCommand(state, move).ok).toBe(true);
+  });
+
+  it("chooses legal thief moves on alternate maps", () => {
+    for (const mapPreset of alternateMapPresets) {
+      let state = completeSetup(createDemoGame(`bot-thief-${mapPreset}`, { botDifficulty: "hard", rules: { mapPreset, mapRandomized: true } })).state;
+      state = withResources(state, "p2", { timber: 1 });
+      state.phase = { type: "MOVING_THIEF", activePlayerId: "p1", rollerId: "p1", reason: "ROLL_7" };
+
+      const move = chooseBotCommand(createBotView(state, "p1", greedyBot.profile, "hard"), greedyBot.profile);
+      expect(move?.type).toBe("MOVE_THIEF");
+      expect(move && applyCommand(state, move).ok).toBe(true);
+    }
+  });
+
+  it("resolves staged trades on alternate maps", () => {
+    for (const mapPreset of alternateMapPresets) {
+      let state = completeSetup(createDemoGame(`staged-trade-${mapPreset}`, { botDifficulty: "hard", rules: { mapPreset, mapRandomized: true } })).state;
+      state = {
+        ...state,
+        phase: { type: "ACTION_PHASE", activePlayerId: "p1" },
+      };
+      state = withResources(state, "p1", { timber: 1 });
+      state = withResources(state, "p2", { ore: 1 });
+      const offered = applyCommand(state, {
+        type: "OFFER_TRADE",
+        playerId: "p1",
+        tradeId: `staged-${mapPreset}`,
+        offered: { ...emptyResources(), timber: 1 },
+        requested: { ...emptyResources(), ore: 1 },
+        recipients: ["p2"],
+      });
+      expect(offered.ok).toBe(true);
+      if (!offered.ok) throw new Error(`Expected staged trade offer on ${mapPreset}`);
+
+      const trade = offered.value.nextState.trades[`staged-${mapPreset}`]!;
+      expect(Number.isFinite(scoreTradeResponder(offered.value.nextState, trade, "p2", greedyBot.profile, "hard"))).toBe(true);
+      const responded = applyCommand(offered.value.nextState, { type: "RESPOND_TRADE", playerId: "p2", tradeId: trade.id, response: "WANTS_ACCEPT" });
+      expect(responded.ok).toBe(true);
+      if (!responded.ok) throw new Error(`Expected staged trade response on ${mapPreset}`);
+      const finalized = applyCommand(responded.value.nextState, { type: "FINALIZE_TRADE", playerId: "p1", tradeId: trade.id, toPlayerId: "p2" });
+      expect(finalized.ok).toBe(true);
+    }
   });
 
   it("uses deterministic softmax choices for the same state and salt", () => {
@@ -210,6 +289,27 @@ describe("bot policies", () => {
       const played = playBotGame(`adjudicated-${index}`, 700, {
         botDifficulty: "medium",
         rules: { maxTurns: 50, maxTurnAdjudication: "leader", mapRandomized: true },
+      });
+      expect(played.invalidCommands).toBe(0);
+      expect(played.state.phase.type).toBe("GAME_OVER");
+    }
+  }, 60_000);
+
+  it("supports configurable bot counts across map presets", () => {
+    const scenarios: Array<{ playerCount: number; mapPreset: MapPreset }> = [
+      { playerCount: 2, mapPreset: "standard" },
+      { playerCount: 3, mapPreset: "islands" },
+      { playerCount: 4, mapPreset: "continent" },
+      { playerCount: 6, mapPreset: "islands" },
+      { playerCount: 8, mapPreset: "continent" },
+    ];
+    for (const { playerCount, mapPreset } of scenarios) {
+      const playerIds = Array.from({ length: playerCount }, (_, index) => `p${index + 1}` as PlayerId);
+      const played = playBotGame(`preset-count-${mapPreset}-${playerCount}`, 900, {
+        playerIds,
+        botDifficulty: "medium",
+        botProfiles: Object.fromEntries(playerIds.map((playerId) => [playerId, "greedy" as const])),
+        rules: { mapPreset, mapRandomized: true, maxTurns: 55, maxTurnAdjudication: "leader" },
       });
       expect(played.invalidCommands).toBe(0);
       expect(played.state.phase.type).toBe("GAME_OVER");

@@ -4,9 +4,11 @@ import {
   applyCommand,
   applyEvent,
   assertInvariants,
+  boardHexComponentCount,
   canPlaceSettlement,
   cityCost,
   closeExpiredTrades,
+  createBoardForRules,
   createFixedBoard,
   createGame,
   createSeededBoard,
@@ -106,6 +108,37 @@ describe("board generation and validation", () => {
     expect(createSeededBoard("same")).not.toEqual(createSeededBoard("different"));
   });
 
+  it("creates deterministic valid map preset boards", () => {
+    for (const mapPreset of ["standard", "islands", "continent"] as const) {
+      const first = createBoardForRules("preset-same", { mapPreset, mapRandomized: true });
+      const second = createBoardForRules("preset-same", { mapPreset, mapRandomized: true });
+      expect(first).toEqual(second);
+      expect(validateBoard(first)).toEqual([]);
+    }
+  });
+
+  it("preserves legacy mapRandomized board behavior when no preset is present", () => {
+    expect(createBoardForRules("legacy-random", { mapRandomized: true })).toEqual(createSeededBoard("legacy-random", 2));
+    expect(createBoardForRules("legacy-fixed", { mapRandomized: false })).toEqual(createFixedBoard());
+    expect(createBoardForRules("standard-preset", { mapPreset: "standard", mapRandomized: false })).toEqual(createSeededBoard("standard-preset", 2));
+    expect(createDemoGame("standard-preset-config", { rules: { mapPreset: "standard", mapRandomized: false } }).config.rules?.mapRandomized).toBe(true);
+  });
+
+  it("creates two disconnected seeded islands", () => {
+    const board = createBoardForRules("island-shape", { mapPreset: "islands", mapRandomized: true });
+    expect(validateBoard(board)).toEqual([]);
+    expect(Object.keys(board.hexes)).toHaveLength(38);
+    expect(boardHexComponentCount(board)).toBe(2);
+  });
+
+  it("creates one connected irregular continent", () => {
+    const board = createBoardForRules("continent-shape", { mapPreset: "continent", mapRandomized: true });
+    expect(validateBoard(board)).toEqual([]);
+    expect(Object.keys(board.hexes)).toHaveLength(31);
+    expect(boardHexComponentCount(board)).toBe(1);
+    expect(Object.keys(board.hexes)).not.toHaveLength(Object.keys(createSeededBoard("continent-shape", 3).hexes).length);
+  });
+
   it("rejects invalid token values", () => {
     const board = createFixedBoard();
     const hex = Object.values(board.hexes).find((candidate) => candidate.resource !== "desert")!;
@@ -195,6 +228,20 @@ describe("game setup and phases", () => {
     expect(events.filter((event) => event.type === "SETUP_PLACED")).toHaveLength(8);
     expect(events.filter((event) => event.type === "SETUP_PLACED").map((event) => event.playerId)).toEqual(["p1", "p2", "p3", "p4", "p4", "p3", "p2", "p1"]);
     expect(state.phase).toMatchObject({ type: "WAITING_FOR_ROLL", activePlayerId: "p1" });
+  });
+
+  it("completes setup on every map preset", () => {
+    for (const mapPreset of ["standard", "islands", "continent"] as const) {
+      const { state, events } = completeSetup(createDemoGame(`setup-${mapPreset}`, { rules: { mapPreset, mapRandomized: true } }));
+      expect(events.filter((event) => event.type === "SETUP_PLACED")).toHaveLength(state.playerOrder.length * 2);
+      expect(state.phase).toMatchObject({ type: "WAITING_FOR_ROLL", activePlayerId: "p1" });
+    }
+  });
+
+  it("supports configurable demo player counts", () => {
+    const state = createDemoGame("six-player-demo", { playerCount: 6 });
+    expect(state.playerOrder).toEqual(["p1", "p2", "p3", "p4", "p5", "p6"]);
+    expect(state.config.maxPlayers).toBe(6);
   });
 
   it("enforces settlement distance during setup", () => {
@@ -697,7 +744,7 @@ describe("serialization and replay", () => {
   it("replays events to the same state", () => {
     const seed = "replay-test";
     const played = playBotGame(seed, 120);
-    const replayed = replay({ config: createDemoConfig(seed), board: createFixedBoard(), events: played.events });
+    const replayed = replay({ config: createDemoConfig(seed), board: played.state.board, events: played.events });
     expect(replayed).toEqual(played.state);
   }, 20_000);
 

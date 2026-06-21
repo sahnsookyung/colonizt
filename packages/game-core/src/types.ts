@@ -6,12 +6,14 @@ export type Resource = (typeof resources)[number];
 export type Terrain = Resource | "desert";
 export type ResourceBundle = Record<Resource, number>;
 export type BotDifficulty = "easy" | "medium" | "hard";
+export type MapPreset = "standard" | "islands" | "continent";
 
 export interface GameRules {
   diceDoubles?: boolean | undefined;
   plight?: boolean | undefined;
   plightTurn?: number | undefined;
   mapRandomized?: boolean | undefined;
+  mapPreset?: MapPreset | undefined;
   specialCardCostRandomized?: boolean | undefined;
   specialCardCost?: ResourceBundle | undefined;
   maxTurns?: number | undefined;

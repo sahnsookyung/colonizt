@@ -1,6 +1,5 @@
 import { replay } from "@colonizt/game-core";
 import { createDemoConfig, playBotGame } from "@colonizt/test-utils";
-import { createFixedBoard } from "@colonizt/game-core";
 import { createPool, runMigrations } from "@colonizt/db";
 import { MemoryEventStore, PostgresEventStore, RoomManager } from "@colonizt/server";
 
@@ -75,7 +74,7 @@ if (storedState.eventSeq !== commandResult.state.eventSeq) {
 
 const seed = "smoke-local";
 const played = playBotGame(seed, 120);
-const replayed = replay({ config: createDemoConfig(seed), board: createFixedBoard(), events: played.events });
+const replayed = replay({ config: createDemoConfig(seed), board: played.state.board, events: played.events });
 
 if (replayed.eventSeq !== played.state.eventSeq) {
   throw new Error("Smoke replay reconstruction failed");

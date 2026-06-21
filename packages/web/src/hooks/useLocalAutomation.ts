@@ -8,12 +8,13 @@ import {
   type PlayerId,
 } from "@colonizt/game-core";
 import { createBotTradeId, createBotView, evaluateTrade, greedyBot, randomLegalBot, scoreTradeResponder } from "@colonizt/bots";
-import { isLocalBotPlayer, localBotAutomationKey, localBotIds, nextLocalTradeDeadlines } from "../local-automation.js";
+import { isLocalBotPlayer, localBotAutomationKey, localBotPlayerIdsForState, nextLocalTradeDeadlines } from "../local-automation.js";
 
-const botById = {
-  p2: randomLegalBot,
-  p3: greedyBot,
-  p4: randomLegalBot,
+const localBotControllers = [randomLegalBot, greedyBot, randomLegalBot, greedyBot] as const;
+
+const botForLocalPlayer = (state: Pick<GameState, "playerOrder">, botId: PlayerId, humanPlayerId: PlayerId) => {
+  const index = localBotPlayerIdsForState(state, humanPlayerId).indexOf(botId);
+  return localBotControllers[Math.max(0, index) % localBotControllers.length] ?? randomLegalBot;
 };
 
 const botActionDelays = {
@@ -67,10 +68,10 @@ export const useLocalAutomation = ({
     tradeResponseTimersRef.current.clear();
   }, []);
 
-  const botAutomationKey = localBotAutomationKey({ enabled, state, activePlayer });
+  const botAutomationKey = localBotAutomationKey({ enabled, state, activePlayer, humanPlayerId });
 
   useEffect(() => {
-    if (!botAutomationKey || !isLocalBotPlayer(activePlayer)) return undefined;
+    if (!botAutomationKey || !isLocalBotPlayer(state, humanPlayerId, activePlayer)) return undefined;
     const latestBotRoll = [...eventsRef.current].reverse().find((event) => event.type === "DICE_ROLLED" && event.playerId === activePlayer);
     const isPostRollAction = state.phase.type === "ACTION_PHASE" && latestBotRoll?.type === "DICE_ROLLED" && lastBotRollSeqRef.current !== latestBotRoll.seq;
     const activeCollectingTrade = Object.values(state.trades).find((trade) =>
@@ -91,12 +92,12 @@ export const useLocalAutomation = ({
     botTimerRef.current = setTimeout(() => {
       const current = stateRef.current;
       const currentActive = "activePlayerId" in current.phase ? current.phase.activePlayerId : undefined;
-      const currentKey = current.phase.type !== "GAME_OVER" && isLocalBotPlayer(currentActive)
+      const currentKey = current.phase.type !== "GAME_OVER" && isLocalBotPlayer(current, humanPlayerId, currentActive)
         ? `${current.config.matchId}:${current.eventSeq}:${current.phase.type}:${currentActive}`
         : null;
       if (currentKey !== botAutomationKey || !currentActive) return;
       if (Object.values(current.trades).some((trade) => trade.status === "COLLECTING_RESPONSES" && trade.fromPlayerId === currentActive)) return;
-      const controller = botById[currentActive as keyof typeof botById] ?? randomLegalBot;
+      const controller = botForLocalPlayer(current, currentActive, humanPlayerId);
       const view = createBotView(current, currentActive, controller.profile);
       const command = controller.chooseCommand(view, (prefix: string) => createBotTradeId(current, currentActive, controller.profile) || prefix);
       if (!command) return;
@@ -128,6 +129,7 @@ export const useLocalAutomation = ({
       return next;
     });
     collecting.forEach((trade) => {
+      const localBotIds = new Set(localBotPlayerIdsForState(state, humanPlayerId));
       const recipients = trade.recipients === "ANY"
         ? [...localBotIds].filter((botId) => botId !== trade.fromPlayerId)
         : trade.recipients.filter((botId) => localBotIds.has(botId));
@@ -141,7 +143,7 @@ export const useLocalAutomation = ({
           const currentTrade = current.trades[trade.id];
           if (!currentTrade || currentTrade.status !== "COLLECTING_RESPONSES") return;
           if (currentTrade.recipients !== "ANY" && !currentTrade.recipients.includes(botId)) return;
-          const controller = botById[botId as keyof typeof botById] ?? greedyBot;
+          const controller = botForLocalPlayer(current, botId, humanPlayerId);
           const view = createBotView(current, botId, controller.profile);
           const response = evaluateTrade(view, currentTrade, controller.profile) === "ACCEPT" ? "WANTS_ACCEPT" : "REJECTED";
           applyLocalCommandRef.current({ type: "RESPOND_TRADE", playerId: botId, tradeId: currentTrade.id, response });
@@ -156,11 +158,12 @@ export const useLocalAutomation = ({
         const current = stateRef.current;
         const currentTrade = current.trades[trade.id];
         if (!currentTrade || currentTrade.status !== "COLLECTING_RESPONSES") return;
-        if (!localBotIds.has(currentTrade.fromPlayerId)) {
+        const currentBotIds = new Set(localBotPlayerIdsForState(current, humanPlayerId));
+        if (!currentBotIds.has(currentTrade.fromPlayerId)) {
           applyLocalCommandRef.current({ type: "EXPIRE_TRADE", playerId: currentTrade.fromPlayerId, tradeId: currentTrade.id, reason: "RESPONSE_TIMEOUT" });
           return;
         }
-        const controller = botById[currentTrade.fromPlayerId as keyof typeof botById] ?? greedyBot;
+        const controller = botForLocalPlayer(current, currentTrade.fromPlayerId, humanPlayerId);
         const candidates = current.playerOrder
           .filter((playerId) => playerId !== currentTrade.fromPlayerId)
           .filter((playerId) => currentTrade.recipients === "ANY" || currentTrade.recipients.includes(playerId))

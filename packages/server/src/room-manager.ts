@@ -3,9 +3,8 @@ import {
   applyCommand,
   activeCollectingTradeForPlayer,
   canBuildRoad,
-  createFixedBoard,
   createGame,
-  createSeededBoard,
+  createBoardForRules,
   deterministicDiscard,
   emptyResources,
   eligibleStealTargets,
@@ -637,7 +636,7 @@ export class RoomManager {
         ...room.settings.rules,
       },
     };
-    const board = config.rules?.mapRandomized ? createSeededBoard(room.id, 2) : createFixedBoard();
+    const board = createBoardForRules(room.id, config.rules);
     const game = createGame(config, board);
     const startedRoom: Room = {
       ...room,

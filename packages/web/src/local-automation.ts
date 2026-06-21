@@ -1,21 +1,23 @@
 import type { GameState, PlayerId } from "@colonizt/game-core";
 
-export const localBotPlayerIds = ["p2", "p3", "p4"] as const satisfies readonly PlayerId[];
-export const localBotIds = new Set<PlayerId>(localBotPlayerIds);
+export const localBotPlayerIdsForState = (state: Pick<GameState, "playerOrder">, humanPlayerId: PlayerId): PlayerId[] =>
+  state.playerOrder.filter((playerId) => playerId !== humanPlayerId);
 
-export const isLocalBotPlayer = (playerId: PlayerId | undefined): playerId is PlayerId =>
-  Boolean(playerId && localBotIds.has(playerId));
+export const isLocalBotPlayer = (state: Pick<GameState, "playerOrder">, humanPlayerId: PlayerId, playerId: PlayerId | undefined): playerId is PlayerId =>
+  Boolean(playerId && localBotPlayerIdsForState(state, humanPlayerId).includes(playerId));
 
 export const localBotAutomationKey = ({
   enabled,
   state,
   activePlayer,
+  humanPlayerId,
 }: {
   enabled: boolean;
   state: GameState;
   activePlayer: PlayerId | undefined;
+  humanPlayerId: PlayerId;
 }): string | null => {
-  if (!enabled || state.phase.type === "GAME_OVER" || !isLocalBotPlayer(activePlayer)) return null;
+  if (!enabled || state.phase.type === "GAME_OVER" || !isLocalBotPlayer(state, humanPlayerId, activePlayer)) return null;
   return `${state.config.matchId}:${state.eventSeq}:${state.phase.type}:${activePlayer}`;
 };
 

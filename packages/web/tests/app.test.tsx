@@ -18,7 +18,10 @@ describe("App", () => {
     expect(screen.getByLabelText("Game options")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Bot Match/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Player Match/ })).toBeInTheDocument();
-    expect(screen.getByLabelText("Randomized balanced map")).toBeChecked();
+    expect(screen.getByRole("group", { name: "Map" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Standard" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "Islands" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continent" })).toBeInTheDocument();
     expect(screen.getByLabelText("Random special card cost")).not.toBeChecked();
     expect(screen.queryByLabelText("Game board and actions")).not.toBeInTheDocument();
     expect(screen.queryByText(/welcome/i)).not.toBeInTheDocument();
@@ -31,7 +34,24 @@ describe("App", () => {
     fireEvent.click(screen.getByLabelText("Plight on turn 20"));
     fireEvent.click(screen.getByRole("button", { name: /Bot Match/ }));
 
-    expect(screen.getByText("Difficulty hard · Random map · Doubles x2 · Plight turn 20")).toBeInTheDocument();
+    expect(screen.getByText("Difficulty hard · Map Standard · Doubles x2 · Plight turn 20")).toBeInTheDocument();
+  });
+
+  it("starts local games with the selected map preset", () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Islands" }));
+    fireEvent.click(screen.getByRole("button", { name: /Bot Match/ }));
+
+    expect(screen.getByText("Difficulty medium · Map Islands")).toBeInTheDocument();
+  });
+
+  it("ready-starts local games with the selected map preset", () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Continent" }));
+    fireEvent.click(screen.getByRole("button", { name: /Bot Match/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Ready" }));
+
+    expect(screen.getByText("Difficulty medium · Map Continent")).toBeInTheDocument();
   });
 
   it("marks the two settlement corners that grant each harbor bonus", () => {

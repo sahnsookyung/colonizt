@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { emptyResources, getLegalActions, serializeForViewer, type GameCommand, type GameState, type TradeOffer } from "@colonizt/game-core";
+import { boardHexComponentCount, createSeededBoard, emptyResources, getLegalActions, serializeForViewer, type GameCommand, type GameState, type TradeOffer } from "@colonizt/game-core";
 import { MemoryEventStore, type EventStore, type StoredCommandResult } from "../src/event-store.js";
 import { MemoryRoomOwnershipStore } from "../src/ownership.js";
 import { RoomCapacityError, RoomManager, type Room } from "../src/room-manager.js";
@@ -147,6 +147,38 @@ describe("RoomManager", () => {
     expect(room.status).toBe("IN_GAME");
     expect(room.game?.phase.type).toBe("SETUP_PLACEMENT");
     expect(room.seats.every((seat) => seat.userId || seat.botId)).toBe(true);
+  });
+
+  it("starts rooms with the selected map preset", async () => {
+    const manager = new RoomManager();
+    const session = await manager.createSession("Host");
+    const room = await manager.createRoom(session, {
+      mode: "CLASSIC",
+      botFill: true,
+      ranked: false,
+      rules: { mapPreset: "islands", mapRandomized: true },
+    });
+    const ready = await manager.setReady(room.id, session, true);
+    expect(ready.ok).toBe(true);
+    if (!ready.ok || !ready.room.game) throw new Error("room did not start");
+    expect(ready.room.game.config.rules?.mapPreset).toBe("islands");
+    expect(boardHexComponentCount(ready.room.game.board)).toBe(2);
+  });
+
+  it("treats standard as a seeded preset even when legacy mapRandomized is false", async () => {
+    const manager = new RoomManager();
+    const session = await manager.createSession("Host");
+    const room = await manager.createRoom(session, {
+      mode: "CLASSIC",
+      botFill: true,
+      ranked: false,
+      rules: { mapPreset: "standard", mapRandomized: false },
+    });
+    const ready = await manager.setReady(room.id, session, true);
+    expect(ready.ok).toBe(true);
+    if (!ready.ok || !ready.room.game) throw new Error("room did not start");
+    expect(ready.room.game.config.rules).toMatchObject({ mapPreset: "standard", mapRandomized: true });
+    expect(ready.room.game.board).toEqual(createSeededBoard(room.id, 2));
   });
 
   it("does not expose started rooms before durable match start finishes", async () => {

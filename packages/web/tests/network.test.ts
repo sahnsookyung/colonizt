@@ -48,6 +48,39 @@ describe("network client", () => {
     expect(requests).toEqual(["/config", "https://bootstrap.example/config", "https://api.example/matches?limit=7"]);
   });
 
+  it("sends selected map presets in room creation payloads", async () => {
+    let roomPayload: unknown;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "https://room-bootstrap.example/config") {
+        return new Response(JSON.stringify({
+          apiBaseUrl: "https://room-api.example",
+          wsBaseUrl: "wss://room-socket.example",
+        }), { status: 200 });
+      }
+      if (url === "https://room-api.example/rooms") {
+        roomPayload = JSON.parse(String(init?.body ?? "{}"));
+        return new Response(JSON.stringify({ id: "room_1", code: "ABC123" }), { status: 201 });
+      }
+      return new Response("not found", { status: 404 });
+    }));
+
+    await expect(createNetworkClient("https://room-bootstrap.example").createRoom("s1", {
+      mode: "CLASSIC",
+      botFill: false,
+      ranked: false,
+      minPlayers: 4,
+      rules: { mapPreset: "continent", mapRandomized: true },
+    })).resolves.toMatchObject({ id: "room_1" });
+    expect(roomPayload).toMatchObject({
+      mode: "CLASSIC",
+      botFill: false,
+      ranked: false,
+      minPlayers: 4,
+      rules: { mapPreset: "continent", mapRandomized: true },
+    });
+  });
+
   it("uses advertised runtime WSS config for websocket connections", async () => {
     class FakeWebSocket {
       static readonly OPEN = 1;

@@ -15,12 +15,14 @@ const resourceBundleSchema = z.object({
 
 const resourceSchema = z.enum(["timber", "brick", "grain", "fiber", "ore"]);
 const botDifficultySchema = z.enum(["easy", "medium", "hard"]);
+const mapPresetSchema = z.enum(["standard", "islands", "continent"]);
 
 export const gameRulesSchema = z.object({
   diceDoubles: z.boolean().default(false),
   plight: z.boolean().default(false),
   plightTurn: z.number().int().positive().default(20),
   mapRandomized: z.boolean().default(false),
+  mapPreset: mapPresetSchema.optional(),
   specialCardCostRandomized: z.boolean().default(false),
   specialCardCost: resourceBundleSchema.optional(),
   maxTurns: z.number().int().positive().optional(),

@@ -289,6 +289,23 @@ describe("REST routes", () => {
     expect(byCode.json()).toMatchObject({ id: createdBody.id, code: createdBody.code });
   });
 
+  it("normalizes preset room settings to randomized map semantics", async () => {
+    const manager = new RoomManager();
+    const session = await manager.createSession("Host");
+    const app = await buildServer({ manager });
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/rooms",
+      headers: { "x-session-token": session.token },
+      payload: { mode: "CLASSIC", botFill: true, ranked: false, rules: { mapPreset: "standard" } },
+    });
+    await app.close();
+
+    expect(created.statusCode).toBe(200);
+    expect(created.json()).toMatchObject({ settings: { rules: { mapPreset: "standard", mapRandomized: true } } });
+  });
+
   it("preflights persisted active room invite codes after a manager restart", async () => {
     const store = new MemoryEventStore();
     const originalManager = new RoomManager(store);

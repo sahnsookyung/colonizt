@@ -396,9 +396,12 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     }
     const parsed = createRoomSchema.safeParse(request.body ?? {});
     if (!parsed.success) return reply.status(400).send({ code: "BAD_REQUEST", issues: parsed.error.issues });
-    const settings = parsed.data.minPlayers === undefined
+    const parsedSettings = parsed.data.minPlayers === undefined
       ? (({ minPlayers: _minPlayers, ...rest }) => rest)(parsed.data)
       : parsed.data;
+    const settings = parsedSettings.rules?.mapPreset
+      ? { ...parsedSettings, rules: { ...parsedSettings.rules, mapRandomized: true } }
+      : parsedSettings;
     if (!allowTestRules && (settings.rules?.maxTurns !== undefined || settings.rules?.maxTurnAdjudication !== undefined)) {
       return reply.status(400).send({ code: "TEST_RULES_DISABLED", message: "Turn-limit adjudication is available only for test and smoke rooms" });
     }

@@ -1,4 +1,4 @@
-import { createFixedBoard, createSeededBoard, validateBoard } from "./board.js";
+import { createBoardForRules, validateBoard } from "./board.js";
 import { randomIntAt, rollSeededDice, seededShuffle } from "./rng.js";
 import {
   addResources,
@@ -70,11 +70,15 @@ const normalizeRules = (config: GameConfig, mapRandomizedDefault: boolean): Game
     specialCardCostRandomized: false,
     ...config.rules,
   };
-  return {
+  const normalizedRules = {
     ...baseRules,
-    specialCardCost: baseRules.specialCardCost
-      ? specialCardCost(baseRules)
-      : baseRules.specialCardCostRandomized
+    mapRandomized: baseRules.mapPreset ? true : baseRules.mapRandomized,
+  };
+  return {
+    ...normalizedRules,
+    specialCardCost: normalizedRules.specialCardCost
+      ? specialCardCost(normalizedRules)
+      : normalizedRules.specialCardCostRandomized
         ? randomizedSpecialCardCost(config.seed)
         : defaultSpecialCardCost(),
   };
@@ -86,7 +90,7 @@ const initialThiefHex = (board: GameState["board"]): HexId | undefined =>
 
 export const createGame = (config: GameConfig, board?: GameState["board"]): GameState => {
   const normalizedRules = normalizeRules(config, !board);
-  const selectedBoard = board ?? (normalizedRules.mapRandomized ? createSeededBoard(config.seed, 2) : createFixedBoard());
+  const selectedBoard = board ?? createBoardForRules(config.seed, normalizedRules);
   const boardErrors = validateBoard(selectedBoard);
   if (boardErrors.length > 0) {
     throw new Error(`Invalid board: ${boardErrors.join("; ")}`);
