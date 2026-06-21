@@ -346,7 +346,7 @@ export const EventLine = ({ event }: { event: GameEvent }) => {
     return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} discarded</span><CostIcons bundle={event.resources} /></li>;
   }
   if (event.type === "THIEF_MOVED") {
-    return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} moved thief{event.stealFromPlayerId ? ` and stole from ${event.stealFromPlayerId}` : ""}</span></li>;
+    return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} moved the robber{event.stealFromPlayerId ? ` and stole from ${event.stealFromPlayerId}` : ""}</span></li>;
   }
   if (event.type === "DEVELOPMENT_CARD_PLAYED") {
     return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} played {event.cardType.toLowerCase().replaceAll("_", " ")}</span></li>;

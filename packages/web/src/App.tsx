@@ -419,7 +419,7 @@ export const App = () => {
   const actionHint = (() => {
     if (state.phase.type === "GAME_OVER") return { title: "Game over", detail: `${state.players[state.phase.winnerId]?.name ?? state.phase.winnerId} reached the victory target.` };
     if (state.phase.type === "DISCARDING") return { title: "Discard", detail: `Choose ${discardAction?.type === "DISCARD_RESOURCES" ? discardAction.count : 0} resources.` };
-    if (state.phase.type === "MOVING_THIEF") return { title: "Move thief", detail: "Choose a destination and steal target if available." };
+    if (state.phase.type === "MOVING_THIEF") return { title: "Move robber", detail: "Choose a destination and steal target if available." };
     if (!isHumanActive) return { title: "Waiting", detail: `${activeName ?? "Opponent"} is taking a turn.` };
     if (activeStagedTrade?.fromPlayerId === humanPlayerId) return { title: "Choose trade partner", detail: "Pick a player who wants to accept, or cancel the offer." };
     if (activeStagedTrade) return { title: "Answer trade", detail: "Mark whether you want to accept before the offer expires." };
@@ -551,7 +551,7 @@ export const App = () => {
   const stagedTradeSeconds = stagedTradeDeadline ? Math.max(0, Math.ceil((stagedTradeDeadline - nowMs) / 1000)) : undefined;
   const turnSecondsRemaining = turnDeadline ? Math.max(0, Math.ceil((turnDeadline.dueAt - nowMs) / 1000)) : undefined;
   const turnTimerLabel = turnDeadline && turnSecondsRemaining !== undefined
-    ? `${turnDeadline.mode === "roll" ? "Roll" : turnDeadline.mode === "discard" ? "Discard" : turnDeadline.mode === "thief" ? "Thief" : "Action"} ${formatTimer(turnSecondsRemaining)}`
+    ? `${turnDeadline.mode === "roll" ? "Roll" : turnDeadline.mode === "discard" ? "Discard" : turnDeadline.mode === "thief" ? "Robber" : "Action"} ${formatTimer(turnSecondsRemaining)}`
     : undefined;
 
   const cancelPendingSetupPlacement = () => {
@@ -778,7 +778,7 @@ export const App = () => {
       label: "Road",
       ariaLabel: "Build road",
       tooltip: `Road: build on a glowing edge connected to your network. Cost: ${formatCost(roadCost())}.`,
-      selected: buildMode === "road" || setupRoadActive,
+      selected: state.phase.type === "SETUP_PLACEMENT" ? setupRoadActive : buildMode === "road",
       disabled: state.phase.type === "SETUP_PLACEMENT" ? !setupRoadActive : state.phase.type !== "ACTION_PHASE" || !canBuildRoadAction,
       icon: <RoadSymbol />,
     },
@@ -787,7 +787,7 @@ export const App = () => {
       label: "Settlement",
       ariaLabel: "Build settlement",
       tooltip: `Settlement: build a house on a glowing corner at least two edges away from other houses. Cost: ${formatCost(settlementCost())}.`,
-      selected: buildMode === "settlement" || setupSettlementActive,
+      selected: state.phase.type === "SETUP_PLACEMENT" ? setupSettlementActive : buildMode === "settlement",
       disabled: state.phase.type === "SETUP_PLACEMENT" ? !setupSettlementActive : state.phase.type !== "ACTION_PHASE" || !canBuildSettlement,
       icon: <HouseSymbol />,
     },
@@ -796,7 +796,7 @@ export const App = () => {
       label: "City",
       ariaLabel: "Upgrade city",
       tooltip: `City: upgrade one of your settlements for another point and double production. Cost: ${formatCost(cityCost())}.`,
-      selected: buildMode === "city",
+      selected: state.phase.type === "ACTION_PHASE" && buildMode === "city",
       disabled: state.phase.type !== "ACTION_PHASE" || !canUpgradeCity,
       icon: <HouseSymbol city />,
     },
@@ -1392,7 +1392,7 @@ export const App = () => {
                     filter="url(#softShadow)"
                     role={legalThiefDestination ? "button" : undefined}
                     tabIndex={legalThiefDestination ? 0 : -1}
-                    aria-label={legalThiefDestination ? `Move thief to ${terrainLabels[hex.resource]} hex` : undefined}
+                    aria-label={legalThiefDestination ? `Move robber to ${terrainLabels[hex.resource]} hex` : undefined}
                     onClick={(event) => {
                       if (!legalThiefDestination) return;
                       event.stopPropagation();
@@ -1428,9 +1428,15 @@ export const App = () => {
                       <text className="dead-tile-label" x={center.x} y={center.y + 0.36}>No yield</text>
                     )}
                     {thiefHere ? (
-                      <g className="thief-marker" transform={`translate(${center.x} ${center.y - 0.02})`} aria-label="Thief">
-                        <circle r="0.2" />
-                        <path d="M-0.08 -0.02h0.16M-0.12 0.08h0.24M-0.05 -0.02v0.1M0.05 -0.02v0.1" />
+                      <g className="thief-marker" transform={`translate(${center.x} ${center.y - 0.02})`} role="img" aria-label="Robber">
+                        <circle className="robber-badge" r="0.28" />
+                        <path className="robber-shoulders" d="M-0.23 0.27c0.04-0.16 0.13-0.24 0.23-0.24s0.19 0.08 0.23 0.24z" />
+                        <circle className="robber-hood" r="0.2" />
+                        <path className="robber-face-opening" d="M-0.12 -0.05c0.02-0.07 0.07-0.11 0.12-0.11s0.1 0.04 0.12 0.11c-0.02 0.08-0.07 0.12-0.12 0.12s-0.1-0.04-0.12-0.12z" />
+                        <circle className="robber-eye" cx="-0.055" cy="-0.05" r="0.018" />
+                        <circle className="robber-eye" cx="0.055" cy="-0.05" r="0.018" />
+                        <path className="robber-mouth" d="M-0.05 0.09c0.03 0.02 0.07 0.02 0.1 0" />
+                        <path className="robber-scarf" d="M-0.15 0.15h0.3" />
                       </g>
                     ) : null}
                   </g>
@@ -1611,11 +1617,11 @@ export const App = () => {
             </div>
 
             <div className="board-action-bar" aria-label="Turn actions">
-              <button type="button" className={`board-action ${showTradePanel ? "selected" : ""}`} onClick={openTradePanel} disabled={!canOfferTrade && !activeStagedTrade} aria-label="Open trade">
+              <button type="button" className={`board-action trade-action ${showTradePanel ? "selected" : ""}`} onClick={openTradePanel} disabled={!canOfferTrade && !activeStagedTrade} aria-label="Open trade">
                 <TradeSymbol />
                 <span>Trade</span>
               </button>
-              <button type="button" className="board-action" onClick={buySpecialCard} disabled={!canBuySpecialCard} aria-label="Draw special card">
+              <button type="button" className="board-action special-action" onClick={buySpecialCard} disabled={!canBuySpecialCard} aria-label="Draw special card">
                 <SpecialSymbol />
                 <span>Special Card</span>
                 <small>{resourceCount(specialCost)}</small>
@@ -1624,7 +1630,7 @@ export const App = () => {
                 <button
                   key={action.mode}
                   type="button"
-                  className={`board-action ${action.selected ? "selected" : ""}`}
+                  className={`board-action ${action.mode}-action ${action.selected ? "selected" : ""}`}
                   onClick={() => chooseBuildMode(action.mode)}
                   disabled={action.disabled}
                   aria-label={action.ariaLabel}
@@ -1803,9 +1809,9 @@ export const App = () => {
             ) : null}
 
             {moveThiefAction?.type === "MOVE_THIEF" ? (
-              <div className="phase-card modal-control-card" aria-label="Move thief">
+              <div className="phase-card modal-control-card" aria-label="Move robber">
                 <div className="panel-title">
-                  <strong>Move Thief</strong>
+                  <strong>Move Robber</strong>
                   <span>{moveThiefAction.hexes.length} hexes</span>
                 </div>
                 <div className="thief-target-list">
@@ -1935,7 +1941,7 @@ export const App = () => {
               <span>{state.lastRoll ? `${state.lastRoll.dice[0]} + ${state.lastRoll.dice[1]} = ${state.lastRoll.sum}` : "Dice have not rolled yet"}</span>
               {turnTimerLabel ? <span>{turnTimerLabel} remaining</span> : null}
               <span>Target {state.config.victoryPoints} VP · Longest Road {state.longestRoadOwner ? state.players[state.longestRoadOwner]?.name : "unclaimed"}</span>
-              <span>Largest Army {state.largestArmyOwner ? state.players[state.largestArmyOwner]?.name : "unclaimed"} · Thief {state.thiefHexId ? terrainLabels[state.board.hexes[state.thiefHexId]?.resource ?? "desert"] : "unset"}</span>
+              <span>Largest Army {state.largestArmyOwner ? state.players[state.largestArmyOwner]?.name : "unclaimed"} · Robber {state.thiefHexId ? terrainLabels[state.board.hexes[state.thiefHexId]?.resource ?? "desert"] : "unset"}</span>
               <span>Difficulty {state.config.botDifficulty ?? "medium"}{activeRules.length > 0 ? ` · ${activeRules.join(" · ")}` : ""}</span>
             </div>
 

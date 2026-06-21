@@ -445,19 +445,39 @@ button:disabled {
 
 .thief-marker {
   pointer-events: none;
-  filter: drop-shadow(0 0.06px 0.04px rgba(17, 24, 39, 0.45));
+  filter:
+    drop-shadow(0 0.06px 0.04px rgba(17, 24, 39, 0.45))
+    drop-shadow(0 0 0.12px rgba(255, 250, 240, 0.4));
 }
 
-.thief-marker circle {
-  fill: #1f2937;
+.robber-badge {
+  fill: rgba(255, 253, 247, 0.92);
+  stroke: rgba(19, 127, 113, 0.5);
+  stroke-width: 0.026;
+}
+
+.robber-hood,
+.robber-shoulders {
+  fill: #182636;
   stroke: #fffdf7;
   stroke-width: 0.035;
 }
 
-.thief-marker path {
+.robber-face-opening {
+  fill: #fffdf7;
+  stroke: rgba(24, 38, 54, 0.36);
+  stroke-width: 0.012;
+}
+
+.robber-eye {
+  fill: #182636;
+}
+
+.robber-mouth,
+.robber-scarf {
   fill: none;
   stroke: #fffdf7;
-  stroke-width: 0.035;
+  stroke-width: 0.028;
   stroke-linecap: round;
 }
 
@@ -897,45 +917,133 @@ button:disabled {
 
 .board-action-bar {
   position: absolute;
-  right: 18px;
-  bottom: 18px;
-  width: min(560px, calc(100% - 410px));
-  min-width: 450px;
+  right: 14px;
+  bottom: 14px;
+  width: min(500px, calc(100% - 390px));
+  min-width: 380px;
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 8px;
-  padding: 8px;
+  gap: 6px;
+  padding: 6px;
   border: 1px solid rgba(255, 250, 240, 0.72);
   border-radius: 8px;
-  background:
-    linear-gradient(180deg, rgba(255, 253, 247, 0.9), rgba(235, 246, 243, 0.84));
-  box-shadow: var(--shadow);
-  backdrop-filter: blur(8px);
+  background-color: #efe2ca;
+  background-image: none;
+  box-shadow:
+    0 12px 26px rgba(36, 48, 64, 0.18),
+    inset 0 0 0 1px rgba(255, 250, 240, 0.68);
+  backdrop-filter: none;
   z-index: 4;
 }
 
 .board-action {
   position: relative;
   min-width: 0;
-  min-height: 82px;
+  min-height: 68px;
   display: grid;
   place-items: center;
-  gap: 3px;
-  padding: 7px 4px 6px;
-  background:
-    linear-gradient(180deg, rgba(255,255,255,0.78), rgba(255,250,240,0.88)),
-    rgba(255, 253, 247, 0.94);
+  gap: 2px;
+  padding: 5px 4px 4px;
+  border-color: var(--action-border, rgba(212, 193, 163, 0.78));
+  background-color: var(--action-bg, #fffdf7);
+  background-image: none;
+  color: var(--action-fg, #1d2632);
   overflow: visible;
-  box-shadow: 0 1px 0 rgba(255,255,255,0.88) inset;
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 250, 240, 0.72),
+    0 2px 4px rgba(36, 48, 64, 0.08);
 }
 
 .board-action::before {
   content: "";
   position: absolute;
-  inset: 0;
-  background: radial-gradient(circle at 50% 0%, rgba(255,255,255,0.46), transparent 48%);
-  opacity: 0.72;
+  inset: 0 0 auto;
+  height: 4px;
+  border-radius: 7px 7px 0 0;
+  background: var(--action-accent, var(--accent));
+  opacity: 1;
   pointer-events: none;
+}
+
+.board-action:enabled:hover {
+  border-color: var(--action-hover-border, var(--accent));
+  box-shadow:
+    0 0 0 3px var(--action-focus, rgba(19, 127, 113, 0.12)),
+    0 8px 18px rgba(36, 48, 64, 0.1),
+    inset 0 0 0 1px rgba(255, 250, 240, 0.72);
+  background-color: var(--action-hover-bg, var(--action-bg, #fffdf7));
+}
+
+.board-action:disabled {
+  opacity: 0.68;
+  filter: none;
+  background-color: #e8dfd0;
+  border-color: #c9b99e;
+  color: #69717c;
+}
+
+.board-action:disabled::before {
+  background: #a99d8d;
+}
+
+.trade-action {
+  --action-fg: #503814;
+  --action-bg: #f5cf75;
+  --action-hover-bg: #f8d989;
+  --action-border: #c58d2b;
+  --action-accent: #9a6416;
+  --action-hover-border: #b9821f;
+  --action-focus: rgba(189, 134, 32, 0.18);
+}
+
+.special-action {
+  --action-fg: #42319b;
+  --action-bg: #d8cffd;
+  --action-hover-bg: #e2dbff;
+  --action-border: #8b7ce9;
+  --action-accent: #6c5ce7;
+  --action-hover-border: #6c5ce7;
+  --action-focus: rgba(108, 92, 231, 0.16);
+}
+
+.road-action {
+  --action-fg: #563711;
+  --action-bg: #dcae6c;
+  --action-hover-bg: #e5bd82;
+  --action-border: #9d6b2d;
+  --action-accent: #80521f;
+  --action-hover-border: #8f5f2b;
+  --action-focus: rgba(143, 95, 43, 0.16);
+}
+
+.settlement-action {
+  --action-fg: #064f48;
+  --action-bg: #9edac5;
+  --action-hover-bg: #afe4d2;
+  --action-border: #399983;
+  --action-accent: #137f71;
+  --action-hover-border: #137f71;
+  --action-focus: rgba(19, 127, 113, 0.16);
+}
+
+.city-action {
+  --action-fg: #1f4c91;
+  --action-bg: #b7d1ef;
+  --action-hover-bg: #c6dcf5;
+  --action-border: #5d8ccc;
+  --action-accent: #2f66bd;
+  --action-hover-border: #2f66bd;
+  --action-focus: rgba(47, 102, 189, 0.15);
+}
+
+.end-action {
+  --action-fg: #164f4a;
+  --action-bg: #b7d9cf;
+  --action-hover-bg: #c5e3db;
+  --action-border: #6fa99a;
+  --action-accent: #137f71;
+  --action-hover-border: #137f71;
+  --action-focus: rgba(19, 127, 113, 0.14);
 }
 
 .board-action[data-tooltip]::after {
@@ -970,13 +1078,13 @@ button:disabled {
 }
 
 .board-action.selected {
-  border-color: var(--accent-strong);
-  background:
-    radial-gradient(circle at 50% 0%, rgba(255,255,255,0.5), transparent 42%),
-    #dff6ed;
-  color: var(--accent-strong);
+  border-color: var(--action-hover-border, var(--accent-strong));
+  background-color: var(--action-hover-bg, var(--action-bg, #fffdf7));
+  background-image: none;
+  color: var(--action-fg, var(--accent-strong));
   box-shadow:
-    0 0 0 3px rgba(19, 127, 113, 0.14),
+    0 0 0 3px var(--action-focus, rgba(19, 127, 113, 0.14)),
+    inset 0 0 0 2px var(--action-accent, var(--accent-strong)),
     0 8px 18px rgba(36, 48, 64, 0.1);
 }
 
@@ -984,7 +1092,7 @@ button:disabled {
   max-width: 100%;
   display: block;
   overflow: visible;
-  font-size: 10.5px;
+  font-size: 10px;
   line-height: 1.05;
   overflow-wrap: normal;
   text-align: center;
@@ -993,10 +1101,10 @@ button:disabled {
 
 .board-action small {
   position: absolute;
-  right: 4px;
-  top: 4px;
-  min-width: 20px;
-  padding: 1px 5px;
+  right: 3px;
+  top: 3px;
+  min-width: 18px;
+  padding: 1px 4px;
   border-radius: 999px;
   background: rgba(29, 38, 50, 0.82);
   color: #fffaf0;
@@ -1006,8 +1114,8 @@ button:disabled {
 
 .board-action .piece-symbol,
 .action-symbol {
-  width: 38px;
-  height: 38px;
+  width: 32px;
+  height: 32px;
   filter: drop-shadow(0 4px 5px rgba(29, 38, 50, 0.18));
 }
 
@@ -1143,15 +1251,15 @@ button:disabled {
 
 .hand-rack {
   position: absolute;
-  left: 18px;
+  left: 14px;
   right: auto;
-  width: min(430px, calc(100% - 570px));
-  min-width: 310px;
-  bottom: 18px;
+  width: 352px;
+  min-width: 0;
+  bottom: 14px;
   display: flex;
-  gap: 8px;
-  overflow-x: auto;
-  padding: 8px;
+  gap: 5px;
+  overflow: visible;
+  padding: 6px;
   border: 1px solid rgba(255, 250, 240, 0.72);
   border-radius: 8px;
   background:
@@ -1163,13 +1271,13 @@ button:disabled {
 
 .resource-card {
   position: relative;
-  width: 78px;
-  min-width: 78px;
-  height: 86px;
+  width: 64px;
+  min-width: 64px;
+  height: 74px;
   display: grid;
   align-content: center;
   justify-items: center;
-  gap: 5px;
+  gap: 3px;
   border: 2px solid rgba(29, 38, 50, 0.22);
   border-radius: 8px;
   color: #172033;
@@ -1232,8 +1340,8 @@ button.resource-card {
 .resource-icon {
   position: relative;
   z-index: 1;
-  width: 40px;
-  height: 40px;
+  width: 32px;
+  height: 32px;
   display: block;
 }
 
@@ -1896,13 +2004,38 @@ button.resource-card {
   }
 
   .hand-rack {
-    width: min(360px, calc(100% - 470px));
-    min-width: 270px;
+    width: 316px;
+    min-width: 0;
+    gap: 4px;
+    padding: 5px;
   }
 
   .board-action-bar {
-    min-width: 390px;
-    width: min(500px, calc(100% - 420px));
+    min-width: 330px;
+    width: min(452px, calc(100% - 360px));
+    gap: 5px;
+    padding: 5px;
+  }
+
+  .board-action {
+    min-height: 62px;
+  }
+
+  .board-action .piece-symbol,
+  .action-symbol {
+    width: 29px;
+    height: 29px;
+  }
+
+  .resource-card {
+    width: 58px;
+    min-width: 58px;
+    height: 66px;
+  }
+
+  .resource-icon {
+    width: 28px;
+    height: 28px;
   }
 
   .trade-overlay {
@@ -1926,7 +2059,7 @@ button.resource-card {
   }
 }
 
-@media (max-width: 680px) {
+@media (max-width: 760px) {
   body {
     overflow-x: hidden;
     background: #1e779b;
@@ -2345,9 +2478,9 @@ button.resource-card {
     left: max(5px, env(safe-area-inset-left));
     right: auto;
     bottom: max(5px, env(safe-area-inset-bottom));
-    width: min(58vw, 218px);
+    width: min(60vw, 196px);
     min-width: 0;
-    max-width: calc(100vw - 118px);
+    max-width: calc(100vw - 114px);
     gap: 2px;
     padding: 3px;
     border-radius: 7px;
@@ -2367,10 +2500,10 @@ button.resource-card {
   }
 
   .board-action {
-    width: 43px;
-    min-width: 43px;
-    height: 43px;
-    min-height: 43px;
+    width: 40px;
+    min-width: 40px;
+    height: 40px;
+    min-height: 40px;
     padding: 3px;
     border-radius: 7px;
   }
@@ -2385,8 +2518,8 @@ button.resource-card {
 
   .board-action .piece-symbol,
   .action-symbol {
-    width: 25px;
-    height: 25px;
+    width: 23px;
+    height: 23px;
   }
 
   .board-action span,

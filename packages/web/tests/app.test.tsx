@@ -106,7 +106,7 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: /Bot Match/ }));
     fireEvent.click(screen.getByRole("button", { name: "Ready" }));
     fireEvent.click(screen.getByRole("button", { name: "Roll dice" }));
-    const thiefPanel = screen.queryByLabelText("Move thief");
+    const thiefPanel = screen.queryByLabelText("Move robber");
     if (thiefPanel) {
       fireEvent.click(within(thiefPanel).getAllByRole("button")[0]!);
     }
@@ -131,7 +131,7 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Roll dice" })).toHaveAttribute("aria-keyshortcuts", "R");
     fireEvent.keyDown(window, { key: "r" });
     expect(screen.getByText(/Roll \d+/)).toBeInTheDocument();
-    const thiefPanel = screen.queryByLabelText("Move thief");
+    const thiefPanel = screen.queryByLabelText("Move robber");
     if (thiefPanel) fireEvent.click(within(thiefPanel).getAllByRole("button")[0]!);
     expect(screen.getByRole("button", { name: "End Turn" })).toHaveAttribute("aria-keyshortcuts", "E");
     fireEvent.keyDown(window, { key: "e" });
@@ -170,6 +170,11 @@ describe("App", () => {
     expect(actionBar).toHaveTextContent("Settlement");
     expect(actionBar).toHaveTextContent("City");
     expect(actionBar).toHaveTextContent("End Turn");
+    expect(within(actionBar).getByRole("button", { name: "Open trade" })).toHaveClass("trade-action");
+    expect(within(actionBar).getByRole("button", { name: "Draw special card" })).toHaveClass("special-action");
+    expect(within(actionBar).getByRole("button", { name: "Build road" })).toHaveClass("road-action");
+    expect(within(actionBar).getByRole("button", { name: "Build settlement" })).toHaveClass("settlement-action");
+    expect(within(actionBar).getByRole("button", { name: "Upgrade city" })).toHaveClass("city-action");
 
     const sidebar = screen.getByLabelText("Players and controls");
     expect(within(sidebar).getByLabelText("Development cards")).toBeInTheDocument();
