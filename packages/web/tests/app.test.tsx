@@ -3,9 +3,12 @@ import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "../src/App.js";
+import { clearResumeState } from "../src/resume.js";
 
 afterEach(() => {
   cleanup();
+  clearResumeState(window.localStorage);
+  window.history.replaceState({}, "", "/");
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
