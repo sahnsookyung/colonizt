@@ -13,7 +13,7 @@ const reconnectJitterMs = 250;
 const randomJitter = (exclusiveMax: number): number => {
   if (exclusiveMax <= 1) return 0;
   const sample = new Uint32Array(1);
-  const bucketSize = 0x1_0000_0000;
+  const bucketSize = 2 ** 32;
   const unbiasedLimit = bucketSize - (bucketSize % exclusiveMax);
   let value = bucketSize;
   while (value >= unbiasedLimit) {
