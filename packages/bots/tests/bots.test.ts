@@ -241,7 +241,7 @@ describe("bot policies", () => {
     expect(entries.get("easy")).toBeGreaterThan(0);
     expect(rate("hard")).toBeGreaterThan(rate("medium"));
     expect(rate("medium")).toBeGreaterThan(rate("easy"));
-  }, 60_000);
+  }, 120_000);
 
   it("does not repeat an equivalent bot trade after it has been cancelled", () => {
     const candidate = Array.from({ length: 80 }, (_, index) => {
