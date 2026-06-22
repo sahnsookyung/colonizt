@@ -93,6 +93,40 @@ describe("bot policies", () => {
     expect(evaluateState(createBotView(state, "p1", greedyBot.profile, "hard"))).toBeGreaterThan(baseline);
   });
 
+  it("counts own hidden victory point cards without exposing opponent hidden VP type", () => {
+    let state = completeSetup(createDemoGame("bot-secret-vp", { botDifficulty: "hard" })).state;
+    state = { ...state, phase: { type: "ACTION_PHASE", activePlayerId: "p2" } };
+    state.players.p2!.score = 4;
+    const baselineOwn = evaluateState(createBotView(state, "p2", greedyBot.profile, "hard"));
+    state.players.p2!.developmentCards = [{ id: "own-vp", type: "VICTORY_POINT", ownerId: "p2", boughtTurn: state.turn - 1 }];
+    state.players.p2!.specialCards = 1;
+
+    const ownView = createBotView(state, "p2", greedyBot.profile, "hard");
+    expect(ownView.viewer.players.find((player) => player.id === "p2")).toMatchObject({
+      score: 4,
+      secretVictoryPoints: 1,
+      visibleVictoryPoints: 5,
+    });
+    expect(evaluateState(ownView)).toBeGreaterThan(baselineOwn);
+
+    const hiddenKnight = structuredClone(state);
+    hiddenKnight.players.p1!.score = 8;
+    hiddenKnight.players.p1!.developmentCards = [{ id: "hidden-card", type: "KNIGHT", ownerId: "p1", boughtTurn: state.turn - 1 }];
+    hiddenKnight.players.p1!.specialCards = 1;
+    const hiddenVp = structuredClone(hiddenKnight);
+    hiddenVp.players.p1!.developmentCards = [{ id: "hidden-card", type: "VICTORY_POINT", ownerId: "p1", boughtTurn: state.turn - 1 }];
+
+    const knightView = createBotView(hiddenKnight, "p2", greedyBot.profile, "hard");
+    const vpView = createBotView(hiddenVp, "p2", greedyBot.profile, "hard");
+    expect(vpView.viewer.players.find((player) => player.id === "p1")).toMatchObject({
+      score: 8,
+      secretVictoryPoints: 0,
+      visibleVictoryPoints: 8,
+    });
+    expect(botStateFingerprint(vpView.state, "p2")).toBe(botStateFingerprint(knightView.state, "p2"));
+    expect(evaluateState(vpView)).toBe(evaluateState(knightView));
+  });
+
   it("produces normalized softmax probabilities and sharper hard choices", () => {
     let state = completeSetup(createDemoGame("softmax-shape")).state;
     state = { ...state, phase: { type: "ACTION_PHASE", activePlayerId: "p1" } };

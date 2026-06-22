@@ -27,7 +27,7 @@ test.describe("deployed multiplayer smoke", () => {
       for (const page of pages) await expect(page.getByLabel("Game board and actions")).toBeVisible();
 
       await pageA.getByRole("button", { name: /Place setup settlement at corner/ }).first().click();
-      await pageA.getByRole("button", { name: /Build road on edge/ }).first().click();
+      await pageA.getByRole("button", { name: /Build road here/ }).first().click();
       for (const page of pages) await expect(page.getByLabel("Gameplay log")).toContainText(/placed/i);
 
       await peerPages[0]!.reload();

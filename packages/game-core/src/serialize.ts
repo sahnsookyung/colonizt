@@ -7,6 +7,8 @@ export interface SerializedPlayer {
   name: string;
   color: string;
   score: number;
+  secretVictoryPoints: number;
+  visibleVictoryPoints: number;
   specialCards: number;
   developmentCardCount: number;
   developmentCards?: DevelopmentCard[];
@@ -71,11 +73,16 @@ export const serializeForViewer = (state: GameState, viewerId: PlayerId | "spect
   board: state.board,
   players: state.playerOrder.map((playerId) => {
     const player = state.players[playerId]!;
+    const publicScore = publicVictoryPoints(state, player.id);
+    const victoryPointCards = (player.developmentCards ?? []).filter((card) => card.type === "VICTORY_POINT").length;
+    const visibleSecretVictoryPoints = viewerId === playerId || state.phase.type === "GAME_OVER" ? victoryPointCards : 0;
     return {
       id: player.id,
       name: player.name,
       color: player.color,
-      score: publicVictoryPoints(state, player.id),
+      score: publicScore,
+      secretVictoryPoints: visibleSecretVictoryPoints,
+      visibleVictoryPoints: player.score + visibleSecretVictoryPoints,
       specialCards: player.specialCards,
       developmentCardCount: player.developmentCards?.filter((card) => !card.playedTurn).length ?? player.specialCards,
       ...((viewerId === playerId || state.phase.type === "GAME_OVER") ? { developmentCards: player.developmentCards ?? [] } : {}),

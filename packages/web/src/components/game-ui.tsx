@@ -107,6 +107,8 @@ export const ResourceCard = ({
   onClick,
   buttonLabel,
   selected = false,
+  selectedCount = 0,
+  disabled = false,
 }: {
   resource: Resource;
   count: number;
@@ -114,6 +116,8 @@ export const ResourceCard = ({
   onClick?: () => void;
   buttonLabel?: string;
   selected?: boolean;
+  selectedCount?: number;
+  disabled?: boolean;
 }) => {
   const className = `resource-card resource-card-${resource} ${compact ? "compact" : ""} ${onClick ? "resource-card-button" : ""} ${selected ? "selected" : ""}`;
   const content = (
@@ -121,11 +125,12 @@ export const ResourceCard = ({
       <ResourceIcon resource={resource} />
       <span className="resource-count">{count}</span>
       <small className="resource-name">{resourceLabels[resource]}</small>
+      {selectedCount > 0 ? <span className="resource-selected-count">x{selectedCount}</span> : null}
     </>
   );
   if (onClick) {
     return (
-      <button type="button" className={className} onClick={onClick} aria-label={buttonLabel ?? `${resourceLabels[resource]}: ${count}`}>
+      <button type="button" className={className} onClick={onClick} disabled={disabled} aria-label={buttonLabel ?? `${resourceLabels[resource]}: ${count}`}>
         {content}
       </button>
     );
@@ -343,7 +348,7 @@ export const EventLine = ({ event }: { event: GameEvent }) => {
     return <li><span className="event-seq">{event.seq}</span><span>Discard required after 7</span></li>;
   }
   if (event.type === "RESOURCES_DISCARDED") {
-    return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} discarded</span><CostIcons bundle={event.resources} /></li>;
+    return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} {event.forced ? "auto-discarded" : "discarded"}</span><CostIcons bundle={event.resources} /></li>;
   }
   if (event.type === "THIEF_MOVED") {
     return <li><span className="event-seq">{event.seq}</span><span>{event.playerId} moved the robber{event.stealFromPlayerId ? ` and stole from ${event.stealFromPlayerId}` : ""}</span></li>;

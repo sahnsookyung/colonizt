@@ -191,7 +191,7 @@ export interface GameState {
 export type GameCommand =
   | { type: "PLACE_SETUP"; playerId: PlayerId; vertexId: VertexId; edgeId: EdgeId }
   | { type: "ROLL_DICE"; playerId: PlayerId }
-  | { type: "DISCARD_RESOURCES"; playerId: PlayerId; resources: ResourceBundle }
+  | { type: "DISCARD_RESOURCES"; playerId: PlayerId; resources: ResourceBundle; forced?: boolean }
   | { type: "MOVE_THIEF"; playerId: PlayerId; hexId: HexId; stealFromPlayerId?: PlayerId }
   | { type: "BUILD_ROAD"; playerId: PlayerId; edgeId: EdgeId }
   | { type: "BUILD_SETTLEMENT"; playerId: PlayerId; vertexId: VertexId }

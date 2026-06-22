@@ -4,7 +4,6 @@ import {
   applyEvents,
   canBuildRoad,
   classicDevelopmentDeck,
-  deterministicDiscard,
   emptyResources,
   eligibleStealTargets,
   getLegalActions,
@@ -17,6 +16,7 @@ import {
   serializeForViewer,
   settlementCost,
   specialCardCost,
+  randomizedDiscard,
   resources,
   type EdgeId,
   type BotDifficulty,
@@ -70,6 +70,9 @@ const actionDeadlineMs = 240_000;
 
 type BuildMode = "road" | "settlement" | "city";
 type AppScreen = "setup" | "localGame" | "onlineLobby" | "onlineGame";
+type SpecialBoardMode =
+  | { type: "roadBuilding"; cardId: string }
+  | { type: "knight"; cardId: string };
 
 interface MatchOptions {
   botDifficulty: BotDifficulty;
@@ -111,6 +114,21 @@ const developmentCardLabels: Record<DevelopmentCard["type"], string> = {
   VICTORY_POINT: "Victory Point",
 };
 
+const victoryPointText = (player: ViewerState["players"][number], compact = false): string => {
+  const secret = player.secretVictoryPoints ?? 0;
+  const total = player.visibleVictoryPoints ?? player.score;
+  if (secret <= 0) return compact ? `${total}VP` : `${total} VP`;
+  const publicPoints = Math.max(0, total - secret);
+  return compact ? `(${publicPoints}+${secret})VP` : `(${publicPoints}+${secret}) VP`;
+};
+
+const victoryPointAria = (player: ViewerState["players"][number]): string => {
+  const secret = player.secretVictoryPoints ?? 0;
+  const total = player.visibleVictoryPoints ?? player.score;
+  if (secret <= 0) return `${total} victory points`;
+  return `${total} victory points, including ${secret} secret victory point${secret === 1 ? "" : "s"}`;
+};
+
 const firstStealTarget = (state: GameState, playerId: PlayerId, hexId: HexId): PlayerId | undefined =>
   eligibleStealTargets(state, playerId, hexId)
     .sort((left, right) =>
@@ -118,6 +136,15 @@ const firstStealTarget = (state: GameState, playerId: PlayerId, hexId: HexId): P
       || resourceCount(state.players[right]?.resources ?? emptyResources()) - resourceCount(state.players[left]?.resources ?? emptyResources())
       || state.playerOrder.indexOf(left) - state.playerOrder.indexOf(right),
     )[0];
+
+const roadBuildingCandidateEdgesFor = (options: EdgeId[][], selected: EdgeId[], requiredCount: number): EdgeId[] => {
+  if (selected.length === 0) return [...new Set(options.map((option) => option[0]).filter((edgeId): edgeId is EdgeId => Boolean(edgeId)))];
+  if (selected.length >= requiredCount) return [];
+  return [...new Set(options
+    .filter((option) => option[0] === selected[0])
+    .map((option) => option[1])
+    .filter((edgeId): edgeId is EdgeId => Boolean(edgeId)))];
+};
 
 const boardBounds = (state: GameState) => {
   const vertices = Object.values(state.board.vertices);
@@ -293,6 +320,7 @@ export const App = () => {
   const [buildMode, setBuildMode] = useState<BuildMode>("road");
   const [discardDraft, setDiscardDraft] = useState<ResourceBundle>(() => emptyResources());
   const [roadBuildingDraft, setRoadBuildingDraft] = useState<{ cardId: string; edgeIds: EdgeId[] }>(() => ({ cardId: "", edgeIds: [] }));
+  const [specialBoardMode, setSpecialBoardMode] = useState<SpecialBoardMode | null>(null);
   const [yearOfPlentyDraft, setYearOfPlentyDraft] = useState<[Resource, Resource]>(["grain", "ore"]);
   const [matchOptions, setMatchOptions] = useState<MatchOptions>(defaultMatchOptions);
   const [pendingSetupVertex, setPendingSetupVertex] = useState<VertexId | null>(null);
@@ -335,12 +363,6 @@ export const App = () => {
     ? (state.board.adjacency.vertexToEdges[pendingSetupVertex] ?? []).filter((edgeId) => canBuildRoad(state, humanPlayerId, edgeId, pendingSetupVertex))
     : [];
   const actionRoadEdges = legal.find((action) => action.type === "BUILD_ROAD")?.edges ?? [];
-  const legalRoads = new Set(state.phase.type === "SETUP_PLACEMENT" ? setupRoadEdges : buildMode === "road" ? actionRoadEdges : []);
-  const legalSettlements = new Set([
-    ...(state.phase.type === "SETUP_PLACEMENT" && !pendingSetupVertex ? [...setupVertices] : []),
-    ...(state.phase.type === "ACTION_PHASE" && buildMode === "settlement" ? legal.find((action) => action.type === "BUILD_SETTLEMENT")?.vertices ?? [] : []),
-  ]);
-  const legalCities = new Set(state.phase.type === "ACTION_PHASE" && buildMode === "city" ? legal.find((action) => action.type === "UPGRADE_CITY")?.vertices ?? [] : []);
   const bounds = useMemo(() => boardBounds(state), [state.board]);
   const activePlayer = "activePlayerId" in state.phase ? state.phase.activePlayerId : undefined;
   const activeName = activePlayer ? state.players[activePlayer]?.name ?? activePlayer : undefined;
@@ -376,9 +398,46 @@ export const App = () => {
   const playYearOfPlentyAction = legal.find((action) => action.type === "PLAY_YEAR_OF_PLENTY");
   const roadBuildingOptions = playRoadBuildingAction?.type === "PLAY_ROAD_BUILDING" ? playRoadBuildingAction.options : [];
   const roadBuildingRequiredCount = playRoadBuildingAction?.type === "PLAY_ROAD_BUILDING" ? playRoadBuildingAction.requiredRoadCount : 0;
+  const activeRoadBuildingCardId = specialBoardMode?.type === "roadBuilding"
+    && playRoadBuildingAction?.type === "PLAY_ROAD_BUILDING"
+    && playRoadBuildingAction.cardIds.includes(specialBoardMode.cardId)
+    ? specialBoardMode.cardId
+    : undefined;
+  const roadBuildingSelectedEdges = activeRoadBuildingCardId && roadBuildingDraft.cardId === activeRoadBuildingCardId ? roadBuildingDraft.edgeIds : [];
+  const roadBuildingCandidateEdges = activeRoadBuildingCardId
+    ? roadBuildingCandidateEdgesFor(roadBuildingOptions, roadBuildingSelectedEdges, roadBuildingRequiredCount)
+    : [];
+  const activeKnightCardId = specialBoardMode?.type === "knight"
+    && playKnightAction?.type === "PLAY_KNIGHT"
+    && playKnightAction.cardIds.includes(specialBoardMode.cardId)
+    ? specialBoardMode.cardId
+    : undefined;
+  const viewerPlayer = (playerId: PlayerId) => viewer.players.find((player) => player.id === playerId);
+  const visiblePlayerResourceCount = (playerId: PlayerId): number =>
+    viewerPlayer(playerId)?.resourceCount ?? resourceCount(state.players[playerId]?.resources ?? emptyResources());
+  const visibleStealTargets = (hexId: HexId): PlayerId[] => {
+    const targets = new Set<PlayerId>();
+    for (const vertexId of state.board.adjacency.hexToVertices[hexId] ?? []) {
+      const owner = state.settlements[vertexId];
+      if (!owner || owner === humanPlayerId || visiblePlayerResourceCount(owner) <= 0) continue;
+      targets.add(owner);
+    }
+    return [...targets].sort((left, right) =>
+      (viewerPlayer(right)?.visibleVictoryPoints ?? state.players[right]?.score ?? 0) - (viewerPlayer(left)?.visibleVictoryPoints ?? state.players[left]?.score ?? 0)
+      || visiblePlayerResourceCount(right) - visiblePlayerResourceCount(left)
+      || state.playerOrder.indexOf(left) - state.playerOrder.indexOf(right),
+    );
+  };
   const legalThiefHexes = new Set([
     ...(moveThiefAction?.type === "MOVE_THIEF" ? moveThiefAction.hexes : []),
+    ...(activeKnightCardId && playKnightAction?.type === "PLAY_KNIGHT" ? playKnightAction.hexes : []),
   ]);
+  const legalRoads = new Set(state.phase.type === "SETUP_PLACEMENT" ? setupRoadEdges : activeRoadBuildingCardId ? roadBuildingCandidateEdges : buildMode === "road" ? actionRoadEdges : []);
+  const legalSettlements = new Set([
+    ...(state.phase.type === "SETUP_PLACEMENT" && !pendingSetupVertex ? [...setupVertices] : []),
+    ...(state.phase.type === "ACTION_PHASE" && buildMode === "settlement" ? legal.find((action) => action.type === "BUILD_SETTLEMENT")?.vertices ?? [] : []),
+  ]);
+  const legalCities = new Set(state.phase.type === "ACTION_PHASE" && buildMode === "city" ? legal.find((action) => action.type === "UPGRADE_CITY")?.vertices ?? [] : []);
   const ownDevelopmentCards = humanPlayer?.developmentCards ?? [];
   const canSubmitDiscard = discardAction?.type === "DISCARD_RESOURCES"
     && resourceCount(discardDraft) === discardAction.count
@@ -412,7 +471,7 @@ export const App = () => {
     && hasResources(state.players[selectedTradeResponder]?.resources ?? emptyResources(), activeStagedTrade.requested)
     && hasResources(state.players[activeStagedTrade.fromPlayerId]?.resources ?? emptyResources(), activeStagedTrade.offered),
   );
-  const showTradePanel = tradeOpen || Boolean(activeStagedTrade);
+  const showTradePanel = (tradeOpen && discardAction?.type !== "DISCARD_RESOURCES") || Boolean(activeStagedTrade);
   const canUpgradeCity = legalCities.size > 0;
   const canBuildSettlement = (legal.find((action) => action.type === "BUILD_SETTLEMENT")?.vertices.length ?? 0) > 0;
   const canBuildRoadAction = actionRoadEdges.length > 0;
@@ -425,6 +484,8 @@ export const App = () => {
     if (state.phase.type === "DISCARDING") return { title: "Discard", detail: `Choose ${discardAction?.type === "DISCARD_RESOURCES" ? discardAction.count : 0} resources.` };
     if (state.phase.type === "MOVING_THIEF") return { title: "Move robber", detail: "Choose a destination and steal target if available." };
     if (!isHumanActive) return { title: "Waiting", detail: `${activeName ?? "Opponent"} is taking a turn.` };
+    if (activeKnightCardId) return { title: "Play Knight", detail: "Choose a robber destination, then select a victim badge if available." };
+    if (activeRoadBuildingCardId) return { title: "Road Building", detail: `Choose ${roadBuildingRequiredCount - roadBuildingSelectedEdges.length} free road${roadBuildingRequiredCount - roadBuildingSelectedEdges.length === 1 ? "" : "s"} on glowing edges.` };
     if (activeStagedTrade?.fromPlayerId === humanPlayerId) return { title: "Choose trade partner", detail: "Pick a player who wants to accept, or cancel the offer." };
     if (activeStagedTrade) return { title: "Answer trade", detail: "Mark whether you want to accept before the offer expires." };
     if (state.phase.type === "SETUP_PLACEMENT" && pendingSetupVertex) return { title: "Place setup road", detail: "Pick a glowing brown edge attached to the new settlement." };
@@ -485,6 +546,10 @@ export const App = () => {
     setEvents(nextEvents);
     setError(null);
     if (command.type === "DISCARD_RESOURCES") setDiscardDraft(emptyResources());
+    if (command.type === "PLAY_ROAD_BUILDING" || command.type === "PLAY_KNIGHT" || command.type === "MOVE_THIEF") {
+      setSpecialBoardMode(null);
+      setRoadBuildingDraft({ cardId: "", edgeIds: [] });
+    }
     if (command.type === "MARITIME_TRADE" || command.type === "OFFER_TRADE") {
       clearTradeDraft();
       setTradeOpen(false);
@@ -517,6 +582,10 @@ export const App = () => {
       clientSeqRef.current += 1;
       if (networkSession) writeNetworkResume(networkSession, networkRoomId, networkRoomInfo?.code);
       if (command.type === "DISCARD_RESOURCES") setDiscardDraft(emptyResources());
+      if (command.type === "PLAY_ROAD_BUILDING" || command.type === "PLAY_KNIGHT" || command.type === "MOVE_THIEF") {
+        setSpecialBoardMode(null);
+        setRoadBuildingDraft({ cardId: "", edgeIds: [] });
+      }
       if (command.type === "MARITIME_TRADE" || command.type === "OFFER_TRADE") {
         clearTradeDraft();
         setTradeOpen(false);
@@ -534,6 +603,7 @@ export const App = () => {
     activePlayer,
     paused: !isPlayableScreen,
     networkRoomId,
+    serverTimer: networkRoom?.timer ?? networkRoomInfo?.timer ?? null,
     rollDeadlineMs,
     actionDeadlineMs,
     onLocalTimeout: (key) => {
@@ -542,11 +612,14 @@ export const App = () => {
       const currentKey = current.phase.type !== "GAME_OVER" && currentActive
         ? `${current.config.matchId}:${current.turn}:${current.phase.type}:${currentActive}`
         : null;
-      if (currentKey !== key || currentActive !== humanPlayerId) return;
+      if (currentKey !== key || !currentActive) return;
       if (current.phase.type === "DISCARDING") {
-        const count = current.phase.pending[humanPlayerId] ?? 0;
-        if (count > 0) commit({ type: "DISCARD_RESOURCES", playerId: humanPlayerId, resources: deterministicDiscard(current, humanPlayerId, count) });
-      } else if (current.phase.type === "MOVING_THIEF") {
+        const count = current.phase.pending[currentActive] ?? 0;
+        if (count > 0) commit({ type: "DISCARD_RESOURCES", playerId: currentActive, resources: randomizedDiscard(current, currentActive, count), forced: true });
+        return;
+      }
+      if (currentActive !== humanPlayerId) return;
+      if (current.phase.type === "MOVING_THIEF") {
         const hexId = getLegalActions(current, humanPlayerId).find((action) => action.type === "MOVE_THIEF")?.hexes[0] as HexId | undefined;
         if (hexId) {
           const stealFromPlayerId = firstStealTarget(current, humanPlayerId, hexId);
@@ -609,7 +682,9 @@ export const App = () => {
 
   const handleEdge = (edgeId: EdgeId) => {
     setSelectedEdge(edgeId);
-    if (state.phase.type === "SETUP_PLACEMENT" && pendingSetupVertex && legalRoads.has(edgeId)) {
+    if (activeRoadBuildingCardId && legalRoads.has(edgeId)) {
+      selectRoadBuildingEdge(activeRoadBuildingCardId, edgeId);
+    } else if (state.phase.type === "SETUP_PLACEMENT" && pendingSetupVertex && legalRoads.has(edgeId)) {
       playSound("select");
       commit({ type: "PLACE_SETUP", playerId: humanPlayerId, vertexId: pendingSetupVertex, edgeId });
       setPendingSetupVertex(null);
@@ -683,6 +758,7 @@ export const App = () => {
     setLocalTradeDeadlines({});
     setDiscardDraft(emptyResources());
     setRoadBuildingDraft({ cardId: "", edgeIds: [] });
+    setSpecialBoardMode(null);
     setYearOfPlentyDraft(["grain", "ore"]);
     setError(null);
   };
@@ -742,53 +818,15 @@ export const App = () => {
     playSound("select");
     commit({ type: "BUY_SPECIAL_CARD", playerId: humanPlayerId });
   };
-  const roadBuildingCandidateEdges = (selected: EdgeId[]): EdgeId[] => {
-    if (selected.length === 0) return [...new Set(roadBuildingOptions.map((option) => option[0]))];
-    if (selected.length >= roadBuildingRequiredCount) return [];
-    return [...new Set(roadBuildingOptions
-      .filter((option) => option[0] === selected[0])
-      .map((option) => option[1])
-      .filter((edgeId): edgeId is EdgeId => Boolean(edgeId)))];
-  };
-  const toggleRoadBuildingEdge = (cardId: string, edgeId: EdgeId) => {
+  const startRoadBuilding = (cardId: string) => {
     playSound("select");
-    setRoadBuildingDraft((current) => {
-      const activeEdges = current.cardId === cardId ? current.edgeIds : [];
-      if (activeEdges.includes(edgeId)) return { cardId, edgeIds: activeEdges.filter((candidate) => candidate !== edgeId) };
-      if (activeEdges.length >= roadBuildingRequiredCount) return { cardId, edgeIds: [edgeId] };
-      return { cardId, edgeIds: [...activeEdges, edgeId] };
-    });
-  };
-  const clearRoadBuildingDraft = (cardId: string) => {
-    playSound("select");
+    setSpecialBoardMode({ type: "roadBuilding", cardId });
     setRoadBuildingDraft({ cardId, edgeIds: [] });
+    setBuildMode("road");
+    setTradeOpen(false);
+    setSelectedEdge(null);
   };
-  const incrementDiscard = (resource: Resource) => {
-    if (!humanPlayer || humanPlayer.resources[resource] <= discardDraft[resource]) return;
-    if (discardAction?.type === "DISCARD_RESOURCES" && resourceCount(discardDraft) >= discardAction.count) return;
-    playSound("select");
-    setDiscardDraft((current) => ({ ...current, [resource]: current[resource] + 1 }));
-  };
-  const decrementDiscard = (resource: Resource) => {
-    if (discardDraft[resource] <= 0) return;
-    playSound("select");
-    setDiscardDraft((current) => ({ ...current, [resource]: Math.max(0, current[resource] - 1) }));
-  };
-  const submitDiscard = () => {
-    if (!canSubmitDiscard) return;
-    playSound("select");
-    commit({ type: "DISCARD_RESOURCES", playerId: humanPlayerId, resources: discardDraft });
-  };
-  const moveThief = (hexId: HexId, stealFromPlayerId?: PlayerId) => {
-    playSound("select");
-    commit({ type: "MOVE_THIEF", playerId: humanPlayerId, hexId, ...(stealFromPlayerId ? { stealFromPlayerId } : {}) });
-  };
-  const playKnight = (cardId: string, hexId: HexId, stealFromPlayerId?: PlayerId) => {
-    playSound("select");
-    commit({ type: "PLAY_KNIGHT", playerId: humanPlayerId, cardId, hexId, ...(stealFromPlayerId ? { stealFromPlayerId } : {}) });
-  };
-  const playRoadBuilding = (cardId: string) => {
-    const selected = roadBuildingDraft.cardId === cardId ? roadBuildingDraft.edgeIds : [];
+  const playRoadBuildingWithEdges = (cardId: string, selected: EdgeId[]) => {
     if (selected.length !== roadBuildingRequiredCount || !selected[0]) return;
     const legalSequence = roadBuildingOptions.some((option) =>
       option.length === selected.length && option.every((edgeId, index) => edgeId === selected[index]),
@@ -798,6 +836,55 @@ export const App = () => {
     playSound("select");
     commit({ type: "PLAY_ROAD_BUILDING", playerId: humanPlayerId, cardId, edgeIds });
     setRoadBuildingDraft({ cardId: "", edgeIds: [] });
+    setSpecialBoardMode(null);
+  };
+  const selectRoadBuildingEdge = (cardId: string, edgeId: EdgeId) => {
+    playSound("select");
+    const activeEdges = roadBuildingDraft.cardId === cardId ? roadBuildingDraft.edgeIds : [];
+    if (activeEdges.includes(edgeId)) {
+      setRoadBuildingDraft({ cardId, edgeIds: activeEdges.filter((candidate) => candidate !== edgeId) });
+      return;
+    }
+    if (!roadBuildingCandidateEdgesFor(roadBuildingOptions, activeEdges, roadBuildingRequiredCount).includes(edgeId)) return;
+    const nextEdges = [...activeEdges, edgeId];
+    if (nextEdges.length >= roadBuildingRequiredCount) {
+      playRoadBuildingWithEdges(cardId, nextEdges);
+      return;
+    }
+    setRoadBuildingDraft({ cardId, edgeIds: nextEdges });
+  };
+  const cancelRoadBuilding = () => {
+    playSound("select");
+    setSpecialBoardMode(null);
+    setRoadBuildingDraft({ cardId: "", edgeIds: [] });
+  };
+  const incrementDiscard = (resource: Resource) => {
+    if (!humanPlayer || humanPlayer.resources[resource] <= discardDraft[resource]) return;
+    if (discardAction?.type === "DISCARD_RESOURCES" && resourceCount(discardDraft) >= discardAction.count) return;
+    playSound("select");
+    setDiscardDraft((current) => ({ ...current, [resource]: current[resource] + 1 }));
+  };
+  const submitDiscard = () => {
+    if (!canSubmitDiscard) return;
+    playSound("select");
+    commit({ type: "DISCARD_RESOURCES", playerId: humanPlayerId, resources: discardDraft });
+  };
+  const clearDiscard = () => {
+    playSound("select");
+    setDiscardDraft(emptyResources());
+  };
+  const moveThief = (hexId: HexId, stealFromPlayerId?: PlayerId) => {
+    playSound("select");
+    commit({ type: "MOVE_THIEF", playerId: humanPlayerId, hexId, ...(stealFromPlayerId ? { stealFromPlayerId } : {}) });
+  };
+  const playKnight = (cardId: string, hexId: HexId, stealFromPlayerId?: PlayerId) => {
+    playSound("select");
+    commit({ type: "PLAY_KNIGHT", playerId: humanPlayerId, cardId, hexId, ...(stealFromPlayerId ? { stealFromPlayerId } : {}) });
+  };
+  const startKnightTargeting = (cardId: string) => {
+    playSound("select");
+    setSpecialBoardMode({ type: "knight", cardId });
+    setTradeOpen(false);
   };
   const playMonopoly = (cardId: string, resource: Resource) => {
     playSound("select");
@@ -812,7 +899,18 @@ export const App = () => {
   };
   const handleHex = (hexId: HexId) => {
     if (!legalThiefHexes.has(hexId)) return;
-    moveThief(hexId, firstStealTarget(state, humanPlayerId, hexId));
+    const targets = visibleStealTargets(hexId);
+    if (targets.length > 0) return;
+    selectRobberTarget(hexId);
+  };
+  const selectRobberTarget = (hexId: HexId, stealFromPlayerId?: PlayerId) => {
+    if (moveThiefAction?.type === "MOVE_THIEF" && moveThiefAction.hexes.includes(hexId)) {
+      moveThief(hexId, stealFromPlayerId);
+      return;
+    }
+    if (activeKnightCardId && playKnightAction?.type === "PLAY_KNIGHT" && playKnightAction.hexes.includes(hexId)) {
+      playKnight(activeKnightCardId, hexId, stealFromPlayerId);
+    }
   };
   const openTradePanel = () => {
     if (!canOfferTrade && !activeStagedTrade) return;
@@ -823,6 +921,8 @@ export const App = () => {
   const chooseBuildMode = (mode: BuildMode) => {
     if (state.phase.type !== "ACTION_PHASE" && !(mode === "road" && pendingSetupVertex)) return;
     playSound("select");
+    setSpecialBoardMode(null);
+    setRoadBuildingDraft({ cardId: "", edgeIds: [] });
     setBuildMode(mode);
     setTradeOpen(false);
     if (mode !== "road") setSelectedEdge(null);
@@ -1024,6 +1124,7 @@ export const App = () => {
           id: publicRoom.id,
           ...(publicRoom.code ? { code: publicRoom.code } : {}),
           ...(publicRoom.inviteUrl ? { inviteUrl: publicRoom.inviteUrl } : {}),
+          ...(publicRoom.timer ? { timer: publicRoom.timer } : {}),
         });
         writeNetworkResume(session, publicRoom.id, publicRoom.code);
         setNetworkStatus(`Online ${publicRoom.code ?? publicRoom.id} · ${publicRoom.status}`);
@@ -1567,21 +1668,23 @@ export const App = () => {
                 }, { x: 0, y: 0 });
                 const thiefHere = state.thiefHexId === hex.id;
                 const legalThiefDestination = legalThiefHexes.has(hex.id);
+                const stealTargets = legalThiefDestination ? visibleStealTargets(hex.id) : [];
+                const canMoveWithoutStealing = legalThiefDestination && stealTargets.length === 0;
                 return (
                   <g
                     key={hex.id}
-                    className={`${thiefHere ? "thief-hex" : ""} ${legalThiefDestination ? "legal-thief-hex" : ""}`}
+                    className={`${thiefHere ? "thief-hex" : ""} ${legalThiefDestination ? "legal-thief-hex" : ""} ${stealTargets.length > 0 ? "has-steal-targets" : ""}`}
                     filter="url(#softShadow)"
-                    role={legalThiefDestination ? "button" : undefined}
-                    tabIndex={legalThiefDestination ? 0 : undefined}
-                    aria-label={legalThiefDestination ? `Move robber to ${terrainLabels[hex.resource]} hex` : undefined}
+                    role={canMoveWithoutStealing ? "button" : undefined}
+                    tabIndex={canMoveWithoutStealing ? 0 : undefined}
+                    aria-label={canMoveWithoutStealing ? `Move robber to ${terrainLabels[hex.resource]} hex without stealing` : undefined}
                     onClick={(event) => {
-                      if (!legalThiefDestination) return;
+                      if (!canMoveWithoutStealing) return;
                       event.stopPropagation();
                       handleHex(hex.id);
                     }}
                     onKeyDown={(event) => {
-                      if (!legalThiefDestination || (event.key !== "Enter" && event.key !== " ")) return;
+                      if (!canMoveWithoutStealing || (event.key !== "Enter" && event.key !== " ")) return;
                       event.preventDefault();
                       event.stopPropagation();
                       handleHex(hex.id);
@@ -1601,6 +1704,35 @@ export const App = () => {
                         <path d="M-0.32 0h0.14M0.18 0h0.14M0 -0.32v0.14M0 0.18v0.14" />
                       </g>
                     ) : null}
+                    {stealTargets.map((targetId, targetIndex) => {
+                      const targetName = state.players[targetId]?.name ?? targetId;
+                      const badgeX = center.x + (targetIndex - (stealTargets.length - 1) / 2) * 0.38;
+                      const badgeY = center.y - 0.52;
+                      return (
+                        <g
+                          key={`${hex.id}-${targetId}`}
+                          className="robber-victim-badge"
+                          style={{ color: state.players[targetId]?.color ?? "#172033" }}
+                          transform={`translate(${badgeX} ${badgeY})`}
+                          role="button"
+                          tabIndex={0}
+                          aria-label={`Move robber to ${terrainLabels[hex.resource]} hex and steal from ${targetName}`}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            selectRobberTarget(hex.id, targetId);
+                          }}
+                          onKeyDown={(event) => {
+                            if (event.key !== "Enter" && event.key !== " ") return;
+                            event.preventDefault();
+                            event.stopPropagation();
+                            selectRobberTarget(hex.id, targetId);
+                          }}
+                        >
+                          <circle r="0.18" />
+                          <text y="0.055">{targetName.slice(0, 1).toUpperCase()}</text>
+                        </g>
+                      );
+                    })}
                     {hex.token ? (
                       <g className={`token token-${hex.token}`} transform={`translate(${center.x} ${center.y + 0.36})`}>
                         <circle r="0.2" />
@@ -1654,6 +1786,8 @@ export const App = () => {
                 const a = state.board.vertices[edge.vertices[0]]!;
                 const b = state.board.vertices[edge.vertices[1]]!;
                 const owner = state.roads[edge.id];
+                const roadBuildingPreview = activeRoadBuildingCardId && roadBuildingSelectedEdges.includes(edge.id);
+                const displayedOwner = owner ?? (roadBuildingPreview ? humanPlayerId : undefined);
                 const isLegalRoad = legalRoads.has(edge.id);
                 const dx = b.x - a.x;
                 const dy = b.y - a.y;
@@ -1671,10 +1805,10 @@ export const App = () => {
                       y2={b.y}
                       aria-hidden="true"
                     />
-                    {owner ? (
+                    {displayedOwner ? (
                       <g
-                        className={`road-piece ${selectedEdge === edge.id ? "selected" : ""}`}
-                        style={{ color: state.players[owner]?.color ?? "#172033" }}
+                        className={`road-piece ${selectedEdge === edge.id ? "selected" : ""} ${roadBuildingPreview ? "preview" : ""}`}
+                        style={{ color: state.players[displayedOwner]?.color ?? "#172033" }}
                         transform={`translate(${edgeMidX} ${edgeMidY}) rotate(${edgeAngle})`}
                         aria-hidden="true"
                       >
@@ -1686,7 +1820,7 @@ export const App = () => {
                       <g
                         className="edge-build-control"
                         role="button"
-                        aria-label={`Build road on edge ${edge.id}`}
+                        aria-label="Build road here"
                         tabIndex={0}
                         onClick={(event) => {
                           event.stopPropagation();
@@ -1838,16 +1972,25 @@ export const App = () => {
             </div>
 
             <div className="hand-rack" aria-label="Your resources">
-              {resources.map((resource) => (
-                <ResourceCard
-                  key={resource}
-                  resource={resource}
-                  count={humanPlayer?.resources[resource] ?? 0}
-                  onClick={() => openTradeFromResource(resource)}
-                  buttonLabel={`Open trade with ${resourceLabels[resource]}`}
-                  selected={tradeOffer[resource] > 0}
-                />
-              ))}
+              {resources.map((resource) => {
+                const discardSelected = discardDraft[resource] ?? 0;
+                const isDiscardSelection = discardAction?.type === "DISCARD_RESOURCES";
+                const owned = humanPlayer?.resources[resource] ?? 0;
+                const discardFull = isDiscardSelection && resourceCount(discardDraft) >= discardAction.count;
+                const canPickDiscard = isDiscardSelection && owned > discardSelected && !discardFull;
+                return (
+                  <ResourceCard
+                    key={resource}
+                    resource={resource}
+                    count={owned}
+                    onClick={() => isDiscardSelection ? incrementDiscard(resource) : openTradeFromResource(resource)}
+                    buttonLabel={isDiscardSelection ? `Select ${resourceLabels[resource]} to discard` : `Open trade with ${resourceLabels[resource]}`}
+                    selected={isDiscardSelection ? discardSelected > 0 : tradeOffer[resource] > 0}
+                    selectedCount={isDiscardSelection ? discardSelected : 0}
+                    disabled={isDiscardSelection ? !canPickDiscard : false}
+                  />
+                );
+              })}
             </div>
 
             {showTradePanel ? (
@@ -1968,23 +2111,11 @@ export const App = () => {
               <div className="phase-card modal-control-card" aria-label="Discard resources">
                 <div className="panel-title">
                   <strong>Discard</strong>
-                  <span>{resourceCount(discardDraft)}/{discardAction.count}</span>
+                  <span>{resourceCount(discardDraft)}/{discardAction.count}{turnDeadline?.mode === "discard" && turnSecondsRemaining !== undefined ? ` · ${formatTimer(turnSecondsRemaining)}` : ""}</span>
                 </div>
-                <div className="discard-grid">
-                  {resources.map((resource) => (
-                    <div key={resource} className="discard-row">
-                      <ResourceCard resource={resource} count={humanPlayer?.resources[resource] ?? 0} compact />
-                      <button type="button" onClick={() => decrementDiscard(resource)} disabled={discardDraft[resource] <= 0}>-</button>
-                      <strong>{discardDraft[resource]}</strong>
-                      <button
-                        type="button"
-                        onClick={() => incrementDiscard(resource)}
-                        disabled={!humanPlayer || humanPlayer.resources[resource] <= discardDraft[resource] || resourceCount(discardDraft) >= discardAction.count}
-                      >
-                        +
-                      </button>
-                    </div>
-                  ))}
+                <div className="discard-summary">
+                  <span>Select cards from your hand.</span>
+                  <button type="button" onClick={clearDiscard} disabled={resourceCount(discardDraft) === 0}>Clear</button>
                 </div>
                 <button type="button" className="primary-wide" onClick={submitDiscard} disabled={!canSubmitDiscard}>Discard</button>
               </div>
@@ -1996,23 +2127,9 @@ export const App = () => {
                   <strong>Move Robber</strong>
                   <span>{moveThiefAction.hexes.length} hexes</span>
                 </div>
-                <div className="thief-target-list">
-                  {moveThiefAction.hexes.map((hexId) => {
-                    const hex = state.board.hexes[hexId];
-                    const targets = eligibleStealTargets(state, humanPlayerId, hexId as HexId);
-                    return (
-                      <div key={hexId} className="thief-target-row">
-                        <span>{hex ? terrainLabels[hex.resource] : hexId}</span>
-                        {targets.length > 0 ? targets.map((targetId) => (
-                          <button key={targetId} type="button" onClick={() => moveThief(hexId as HexId, targetId)}>
-                            {state.players[targetId]?.name ?? targetId}
-                          </button>
-                        )) : (
-                          <button type="button" onClick={() => moveThief(hexId as HexId)}>Move</button>
-                        )}
-                      </div>
-                    );
-                  })}
+                <div className="robber-target-summary">
+                  <span>Use the highlighted board tiles.</span>
+                  <span>Select a player badge to steal, or an empty highlighted tile to move without stealing.</span>
                 </div>
               </div>
             ) : null}
@@ -2028,47 +2145,33 @@ export const App = () => {
                 <div className="dev-card-list">
                   {ownDevelopmentCards.map((card) => {
                     const playable = !card.playedTurn && card.boughtTurn !== state.turn && state.phase.type !== "DISCARDING" && state.phase.type !== "MOVING_THIEF";
+                    const cardStatus = card.type === "VICTORY_POINT"
+                      ? "Secret +1 VP"
+                      : card.playedTurn
+                        ? "played"
+                        : card.boughtTurn === state.turn
+                          ? "new"
+                          : "ready";
+                    const roadBuildingActive = activeRoadBuildingCardId === card.id;
+                    const roadBuildingSelections = roadBuildingActive ? roadBuildingSelectedEdges.length : 0;
                     return (
                       <div key={card.id} className={`dev-card-row ${card.playedTurn ? "played" : ""}`}>
                         <span>{developmentCardLabels[card.type]}</span>
-                        <small>{card.playedTurn ? "played" : card.boughtTurn === state.turn ? "new" : "ready"}</small>
+                        <small>{cardStatus}</small>
                         {card.type === "KNIGHT" && playKnightAction?.type === "PLAY_KNIGHT" && playable ? (
                           <div className="dev-card-actions">
-                            {playKnightAction.hexes.slice(0, 4).map((hexId) => {
-                              const target = firstStealTarget(state, humanPlayerId, hexId as HexId);
-                              return (
-                                <button key={hexId} type="button" onClick={() => playKnight(card.id, hexId as HexId, target)}>
-                                  {state.board.hexes[hexId]?.resource ?? hexId}
-                                </button>
-                              );
-                            })}
+                            <button type="button" className={activeKnightCardId === card.id ? "selected" : ""} onClick={() => startKnightTargeting(card.id)}>
+                              {activeKnightCardId === card.id ? "Choosing target" : "Use"}
+                            </button>
+                            {activeKnightCardId === card.id ? <button type="button" onClick={() => setSpecialBoardMode(null)}>Cancel</button> : null}
                           </div>
                         ) : null}
                         {card.type === "ROAD_BUILDING" && playRoadBuildingAction?.type === "PLAY_ROAD_BUILDING" && playable ? (
                           <div className="dev-card-actions dev-card-picker">
-                            {(() => {
-                              const selected = roadBuildingDraft.cardId === card.id ? roadBuildingDraft.edgeIds : [];
-                              const selectedSet = new Set(selected);
-                              const candidates = roadBuildingCandidateEdges(selected);
-                              return (
-                                <>
-                                  {selected.map((edgeId) => (
-                                    <button key={`selected-${edgeId}`} type="button" className="selected" onClick={() => toggleRoadBuildingEdge(card.id, edgeId)}>
-                                      {edgeId}
-                                    </button>
-                                  ))}
-                                  {candidates.slice(0, 12).map((edgeId) => (
-                                    <button key={edgeId} type="button" className={selectedSet.has(edgeId) ? "selected" : ""} onClick={() => toggleRoadBuildingEdge(card.id, edgeId)}>
-                                      {edgeId}
-                                    </button>
-                                  ))}
-                                  {selected.length > 0 ? <button type="button" onClick={() => clearRoadBuildingDraft(card.id)}>Clear</button> : null}
-                                  <button type="button" className="primary-wide" onClick={() => playRoadBuilding(card.id)} disabled={selected.length !== roadBuildingRequiredCount || roadBuildingRequiredCount === 0}>
-                                    Build {roadBuildingRequiredCount}
-                                  </button>
-                                </>
-                              );
-                            })()}
+                            <button type="button" className={roadBuildingActive ? "selected" : ""} onClick={() => startRoadBuilding(card.id)}>
+                              {roadBuildingActive ? `${roadBuildingSelections}/${roadBuildingRequiredCount} roads` : "Use"}
+                            </button>
+                            {roadBuildingActive ? <button type="button" onClick={cancelRoadBuilding}>Cancel</button> : null}
                           </div>
                         ) : null}
                         {card.type === "MONOPOLY" && playMonopolyAction?.type === "PLAY_MONOPOLY" && playable ? (
@@ -2132,15 +2235,15 @@ export const App = () => {
                 <article key={player.id} className={`player ${player.id === activePlayer ? "active" : ""}`} style={{ borderColor: player.color }}>
                   <div className="player-heading">
                     <strong>{player.name}</strong>
-                    <div className="player-stats" aria-label={`${player.score} victory points, ${player.resourceCount} cards, ${player.developmentCardCount} development cards, ${player.playedKnights} knights, longest road length ${player.longestRoadLength}`}>
-                      <span>{player.score} VP</span>
+                    <div className="player-stats" aria-label={`${victoryPointAria(player)}, ${player.resourceCount} cards, ${player.developmentCardCount} development cards, ${player.playedKnights} knights, longest road length ${player.longestRoadLength}`}>
+                      <span className={player.secretVictoryPoints ? "vp-secret" : ""}>{victoryPointText(player)}</span>
                       <span>{player.resourceCount} cards</span>
                       <span>{player.developmentCardCount} dev</span>
                       <span>{player.playedKnights} knights</span>
                       <span>road {player.longestRoadLength}</span>
                     </div>
                     <div className="player-mobile-stats" aria-hidden="true">
-                      <span>{player.score} VP</span>
+                      <span className={player.secretVictoryPoints ? "vp-secret" : ""}>{victoryPointText(player, true)}</span>
                       <span>{player.resourceCount}C</span>
                       <span>{player.developmentCardCount}D</span>
                       <span>R{player.longestRoadLength}</span>

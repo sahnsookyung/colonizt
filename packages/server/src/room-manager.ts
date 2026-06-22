@@ -5,12 +5,12 @@ import {
   canBuildRoad,
   createGame,
   createBoardForRules,
-  deterministicDiscard,
   emptyResources,
   eligibleStealTargets,
   getLegalActions,
   hasResources,
   normalizeImportedState,
+  randomizedDiscard,
   replay,
   resourceCount,
   serializeEventsForViewer,
@@ -1211,7 +1211,7 @@ export class RoomManager {
   private timeoutCommand(state: GameState, playerId: PlayerId): GameCommand | undefined {
     if (state.phase.type === "DISCARDING") {
       const count = state.phase.pending[playerId] ?? 0;
-      return count > 0 ? { type: "DISCARD_RESOURCES", playerId, resources: deterministicDiscard(state, playerId, count) } : undefined;
+      return count > 0 ? { type: "DISCARD_RESOURCES", playerId, resources: randomizedDiscard(state, playerId, count), forced: true } : undefined;
     }
     if (state.phase.type === "MOVING_THIEF") {
       const move = getLegalActions(state, playerId).find((action) => action.type === "MOVE_THIEF");

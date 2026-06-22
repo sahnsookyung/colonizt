@@ -11,7 +11,7 @@ test("local bot game first screen is playable on desktop", async ({ page, isMobi
   await expect(page.getByRole("button", { name: "Ready" })).toHaveCount(0);
   await page.getByRole("button", { name: /Place setup settlement at corner/ }).first().click();
   await expect(page.getByText("Place setup road")).toBeVisible();
-  await page.getByRole("button", { name: /Build road on edge/ }).first().click();
+  await page.getByRole("button", { name: /Build road here/ }).first().click();
   await expect(page.getByLabel("Game board and actions")).toBeVisible();
 });
 

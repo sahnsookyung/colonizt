@@ -607,6 +607,36 @@ button:disabled {
   stroke: rgba(255, 232, 156, 0.92);
 }
 
+.robber-victim-badge {
+  cursor: pointer;
+  pointer-events: all;
+  outline: none;
+  filter:
+    drop-shadow(0 0.04px 0.04px rgba(17, 24, 39, 0.4))
+    drop-shadow(0 0 0.1px rgba(255, 250, 240, 0.42));
+}
+
+.robber-victim-badge circle {
+  fill: color-mix(in srgb, currentColor 82%, #fffdf7 18%);
+  stroke: #fffdf7;
+  stroke-width: 0.035;
+}
+
+.robber-victim-badge text {
+  fill: #fffdf7;
+  font-size: 0.16px;
+  font-weight: 900;
+  text-anchor: middle;
+  paint-order: stroke;
+  stroke: rgba(17, 24, 39, 0.34);
+  stroke-width: 0.018;
+}
+
+.robber-victim-badge:focus-visible circle {
+  stroke: #fff27a;
+  stroke-width: 0.055;
+}
+
 .thief-marker {
   pointer-events: none;
   filter:
@@ -857,6 +887,13 @@ button:disabled {
 .edge-build-target.selected {
   fill: rgba(188, 122, 49, 0.72);
   stroke: #f97316;
+}
+
+.road-piece.preview {
+  opacity: 0.7;
+  filter:
+    drop-shadow(0 0 0.1px rgba(255, 242, 122, 0.74))
+    drop-shadow(0 0.04px 0.04px rgba(29, 38, 50, 0.24));
 }
 
 .edge.owned {
@@ -1487,6 +1524,21 @@ button.resource-card {
     inset 0 0 0 2px rgba(255,255,255,0.28);
 }
 
+.resource-selected-count {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  z-index: 2;
+  min-width: 24px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: rgba(24, 38, 54, 0.86);
+  color: #fffdf7;
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1.2;
+}
+
 .resource-card.compact {
   width: 48px;
   min-width: 48px;
@@ -1619,16 +1671,12 @@ button.resource-card {
   gap: 10px;
 }
 
-.discard-grid,
-.dev-card-list,
-.thief-target-list {
+.dev-card-list {
   display: grid;
   gap: 7px;
 }
 
-.discard-row,
-.dev-card-row,
-.thief-target-row {
+.dev-card-row {
   display: grid;
   align-items: center;
   gap: 7px;
@@ -1639,21 +1687,27 @@ button.resource-card {
   background: rgba(255, 250, 240, 0.66);
 }
 
-.discard-row {
-  grid-template-columns: auto 32px 24px 32px;
+.discard-summary,
+.robber-target-summary {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid rgba(216, 203, 181, 0.85);
+  border-radius: 8px;
+  background: rgba(255, 250, 240, 0.66);
 }
 
-.discard-row button,
-.thief-target-row button,
+.discard-summary button {
+  justify-self: start;
+  min-height: 31px;
+  padding: 5px 12px;
+}
+
 .dev-card-row button,
 .primary-wide {
   min-height: 31px;
   padding: 5px 9px;
-}
-
-.discard-row strong {
-  text-align: center;
-  font-size: 14px;
 }
 
 .primary-wide {
@@ -1663,11 +1717,6 @@ button.resource-card {
   border-color: var(--accent-strong);
 }
 
-.thief-target-row {
-  grid-template-columns: minmax(72px, 1fr) repeat(auto-fit, minmax(76px, auto));
-}
-
-.thief-target-row > span,
 .dev-card-row > span {
   min-width: 0;
   color: var(--ink);
@@ -1975,6 +2024,14 @@ button.resource-card {
   font-weight: 900;
   line-height: 1.2;
   white-space: nowrap;
+}
+
+.player-stats span.vp-secret,
+.player-mobile-stats span.vp-secret {
+  border-color: rgba(19, 127, 113, 0.42);
+  background:
+    linear-gradient(180deg, rgba(236, 253, 245, 0.82), rgba(218, 239, 231, 0.68));
+  color: #147368;
 }
 
 .player-mobile-stats {

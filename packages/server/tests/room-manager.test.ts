@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { boardHexComponentCount, createSeededBoard, emptyResources, getLegalActions, serializeForViewer, type GameCommand, type GameState, type TradeOffer } from "@colonizt/game-core";
+import { boardHexComponentCount, createSeededBoard, emptyResources, getLegalActions, resourceCount, serializeForViewer, type GameCommand, type GameState, type TradeOffer } from "@colonizt/game-core";
 import { MemoryEventStore, type EventStore, type StoredCommandResult } from "../src/event-store.js";
 import { MemoryRoomOwnershipStore } from "../src/ownership.js";
 import { RoomCapacityError, RoomManager, type Room } from "../src/room-manager.js";
@@ -648,6 +648,26 @@ describe("RoomManager", () => {
     if (result?.ok) expect(result.events[0]?.type).toBe("SETUP_PLACED");
     expect(room.events.map((event) => event.seq)).toEqual(room.events.map((_, index) => index + 1));
     expect(room.timer?.expiresAt).toBeGreaterThan(Date.now());
+  });
+
+  it("auto-discards a forced randomized bundle when a discard timer expires", async () => {
+    const { manager, room } = await startedRoom();
+    const game = room.game!;
+    const discarder = game.playerOrder[1]!;
+    game.players[discarder]!.resources = { ...emptyResources(), timber: 3, brick: 2, grain: 2, fiber: 1 };
+    game.phase = { type: "DISCARDING", activePlayerId: discarder, rollerId: game.playerOrder[0]!, pending: { [discarder]: 4 }, submitted: {} };
+    room.timer = { activePlayerId: discarder, expiresAt: Date.now() - 1 };
+
+    const result = await manager.expireTurn(room.id);
+
+    expect(result?.ok).toBe(true);
+    if (!result?.ok) throw new Error("expected timer expiry to succeed");
+    const event = result.events.find((candidate) => candidate.type === "RESOURCES_DISCARDED");
+    expect(event).toMatchObject({ type: "RESOURCES_DISCARDED", playerId: discarder, forced: true });
+    if (event?.type !== "RESOURCES_DISCARDED") throw new Error("expected discard event");
+    expect(resourceCount(event.resources)).toBe(4);
+    expect(resourceCount(room.game!.players[discarder]!.resources)).toBe(4);
+    expect(room.game!.phase).toMatchObject({ type: "MOVING_THIEF", activePlayerId: game.playerOrder[0] });
   });
 
   it("does not extend the action timer for commands in the same active phase", async () => {

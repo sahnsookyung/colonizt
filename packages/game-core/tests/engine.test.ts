@@ -20,6 +20,7 @@ import {
   replay,
   resourceCount,
   resources,
+  randomizedDiscard,
   serializeEventsForViewer,
   roadCost,
   rollSeededDice,
@@ -773,6 +774,26 @@ describe("development cards, thief, and adjudication", () => {
     expect(serializeForViewer(result.value.nextState, "p2").players.find((player) => player.id === "p1")?.developmentCards?.[0]?.type).toBe("VICTORY_POINT");
   });
 
+  it("componentizes hidden victory points for the owning viewer only", () => {
+    let state = applyOrThrow(completeSetup(createDemoGame("secret-vp-view")).state, { type: "ROLL_DICE", playerId: "p1" }).state;
+    state.players.p1!.score = 4;
+    state.players.p1!.developmentCards = [{ id: "secret-vp", type: "VICTORY_POINT", ownerId: "p1", boughtTurn: state.turn - 1 }];
+    state.players.p1!.specialCards = 1;
+
+    const own = serializeForViewer(state, "p1").players.find((player) => player.id === "p1");
+    expect(own).toMatchObject({ score: 4, secretVictoryPoints: 1, visibleVictoryPoints: 5 });
+    expect(own?.developmentCards?.[0]?.type).toBe("VICTORY_POINT");
+
+    const opponent = serializeForViewer(state, "p2").players.find((player) => player.id === "p1");
+    expect(opponent).toMatchObject({ score: 4, secretVictoryPoints: 0, visibleVictoryPoints: 4 });
+    expect(opponent?.developmentCards).toBeUndefined();
+
+    state = applyEvent(state, { schemaVersion: state.schemaVersion, seq: state.eventSeq + 1, type: "GAME_OVER", winnerId: "p1", reason: "VICTORY_POINTS" });
+    const revealed = serializeForViewer(state, "p2").players.find((player) => player.id === "p1");
+    expect(revealed).toMatchObject({ secretVictoryPoints: 1, visibleVictoryPoints: 5 });
+    expect(revealed?.developmentCards?.[0]?.type).toBe("VICTORY_POINT");
+  });
+
   it("forces discard after a 7 before moving the thief", () => {
     let state = completeSetup(createDemoGame("discard-seven")).state;
     const sevenIndex = Array.from({ length: 200 }, (_, index) => index).find((index) => {
@@ -796,6 +817,22 @@ describe("development cards, thief, and adjudication", () => {
     const moved = applyOrThrow(discarded.state, { type: "MOVE_THIEF", playerId: "p1", hexId });
     expect(moved.state.thiefHexId).toBe(hexId);
     expect(moved.state.phase).toMatchObject({ type: "ACTION_PHASE", activePlayerId: "p1" });
+  });
+
+  it("creates seeded random forced discard bundles", () => {
+    const state = completeSetup(createDemoGame("forced-random-discard")).state;
+    state.players.p2!.resources = { ...emptyResources(), timber: 3, brick: 2, grain: 2, fiber: 1 };
+    state.phase = { type: "DISCARDING", activePlayerId: "p2", rollerId: "p1", pending: { p2: 4 }, submitted: {} };
+
+    const discard = randomizedDiscard(state, "p2", 4);
+    expect(discard).toEqual(randomizedDiscard(state, "p2", 4));
+    expect(resourceCount(discard)).toBe(4);
+    for (const resource of resources) {
+      expect(discard[resource]).toBeLessThanOrEqual(state.players.p2!.resources[resource]);
+    }
+
+    const result = applyOrThrow(state, { type: "DISCARD_RESOURCES", playerId: "p2", resources: discard, forced: true });
+    expect(result.events[0]).toMatchObject({ type: "RESOURCES_DISCARDED", playerId: "p2", forced: true });
   });
 
   it("blocks production on the thief hex", () => {

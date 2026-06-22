@@ -33,7 +33,7 @@ export const gameRulesSchema = z.object({
 export const gameCommandSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("PLACE_SETUP"), playerId: z.string(), vertexId: z.string(), edgeId: z.string() }),
   z.object({ type: z.literal("ROLL_DICE"), playerId: z.string() }),
-  z.object({ type: z.literal("DISCARD_RESOURCES"), playerId: z.string(), resources: resourceBundleSchema }),
+  z.object({ type: z.literal("DISCARD_RESOURCES"), playerId: z.string(), resources: resourceBundleSchema, forced: z.boolean().optional() }),
   z.object({ type: z.literal("MOVE_THIEF"), playerId: z.string(), hexId: z.string(), stealFromPlayerId: z.string().optional() }),
   z.object({ type: z.literal("BUILD_ROAD"), playerId: z.string(), edgeId: z.string() }),
   z.object({ type: z.literal("BUILD_SETTLEMENT"), playerId: z.string(), vertexId: z.string() }),

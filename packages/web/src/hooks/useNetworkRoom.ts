@@ -5,6 +5,10 @@ export interface NetworkRoomInfo {
   id: string;
   code?: string;
   inviteUrl?: string;
+  timer?: {
+    activePlayerId: PlayerId;
+    expiresAt: number;
+  };
 }
 
 const maxReconnectAttempts = 8;

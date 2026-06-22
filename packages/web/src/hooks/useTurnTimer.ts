@@ -13,6 +13,7 @@ export interface UseTurnTimerOptions {
   activePlayer: PlayerId | undefined;
   paused: boolean;
   networkRoomId: string | null;
+  serverTimer?: { activePlayerId: PlayerId; expiresAt: number } | null;
   rollDeadlineMs: number;
   actionDeadlineMs: number;
   onLocalTimeout(key: string): void;
@@ -23,6 +24,7 @@ export const useTurnTimer = ({
   activePlayer,
   paused,
   networkRoomId,
+  serverTimer,
   rollDeadlineMs,
   actionDeadlineMs,
   onLocalTimeout,
@@ -52,20 +54,22 @@ export const useTurnTimer = ({
 
     const durationMs = phaseMode === "roll" ? rollDeadlineMs : actionDeadlineMs;
     const key = `${state.config.matchId}:${state.turn}:${state.phase.type}:${activePlayer}`;
-    const dueAt = Date.now() + durationMs;
-    setNowMs(Date.now());
-    setTurnDeadline((current) => current?.key === key ? current : { key, dueAt, durationMs, mode: phaseMode });
+    const now = Date.now();
+    const serverDueAt = networkRoomId && serverTimer?.activePlayerId === activePlayer ? serverTimer.expiresAt : undefined;
+    const dueAt = serverDueAt ?? now + durationMs;
+    setNowMs(now);
+    setTurnDeadline((current) => current?.key === key && current.dueAt === dueAt ? current : { key, dueAt, durationMs, mode: phaseMode });
 
     const interval = setInterval(() => setNowMs(Date.now()), 1000);
     const timeout = setTimeout(() => {
       if (!networkRoomId) timeoutRef.current(key);
-    }, durationMs);
+    }, Math.max(0, dueAt - now));
 
     return () => {
       clearInterval(interval);
       clearTimeout(timeout);
     };
-  }, [actionDeadlineMs, activePlayer, networkRoomId, paused, rollDeadlineMs, state.config.matchId, state.phase.type, state.turn]);
+  }, [actionDeadlineMs, activePlayer, networkRoomId, paused, rollDeadlineMs, serverTimer?.activePlayerId, serverTimer?.expiresAt, state.config.matchId, state.phase.type, state.turn]);
 
   return { nowMs, turnDeadline };
 };

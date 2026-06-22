@@ -2,6 +2,8 @@
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { completeSetup, createDemoGame } from "@colonizt/demo-state";
+import { emptyResources, serializeForViewer, type GameState } from "@colonizt/game-core";
 import { App } from "../src/App.js";
 import { clearResumeState } from "../src/resume.js";
 
@@ -15,7 +17,7 @@ afterEach(() => {
 
 const placeHumanSetup = () => {
   fireEvent.click(screen.getAllByRole("button", { name: /Place setup settlement at corner/ })[0]!);
-  fireEvent.click(screen.getAllByRole("button", { name: /Build road on edge/ })[0]!);
+  fireEvent.click(screen.getAllByRole("button", { name: /Build road here/ })[0]!);
 };
 
 const advanceTimersUntil = (predicate: () => boolean, stepMs = 500, maxSteps = 24) => {
@@ -34,6 +36,69 @@ const completeLocalSetup = () => {
   advanceTimersUntil(() => screen.queryByText("Place setup settlement") !== null);
   placeHumanSetup();
   expect(screen.getByText(/WAITING FOR ROLL|ACTION PHASE/)).toBeInTheDocument();
+};
+
+const moveRobberIfPrompted = () => {
+  if (!screen.queryByLabelText("Move robber")) return;
+  const target = screen.getAllByRole("button", { name: /Move robber to/ })[0];
+  if (target) fireEvent.click(target);
+};
+
+const renderOnlineGame = async (game: GameState) => {
+  const sentMessages: Array<{ type: string; command?: unknown }> = [];
+  const room = {
+    id: `room_${game.config.matchId}`,
+    code: "PLAY01",
+    inviteUrl: "https://play.example/?room=PLAY01",
+    status: "ACTIVE",
+    hostUserId: "p1",
+    settings: { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 4, botDifficulty: "medium", rules: game.config.rules },
+    seats: [
+      { seatIndex: 0, userId: "p1", ready: true, connected: true },
+      { seatIndex: 1, userId: "p2", ready: true, connected: true },
+      { seatIndex: 2, userId: "p3", ready: true, connected: true },
+      { seatIndex: 3, userId: "p4", ready: true, connected: true },
+    ],
+    spectatorCount: 0,
+    events: [],
+    game: serializeForViewer(game, "p1"),
+  };
+
+  class FakeWebSocket extends EventTarget {
+    static readonly OPEN = 1;
+    readyState = FakeWebSocket.OPEN;
+
+    constructor(readonly url: string) {
+      super();
+      queueMicrotask(() => this.dispatchEvent(new Event("open")));
+    }
+
+    send(payload: string): void {
+      const message = JSON.parse(payload) as { type: string; command?: unknown };
+      sentMessages.push(message);
+      if (message.type === "JOIN_ROOM") {
+        queueMicrotask(() => this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "ROOM_STATE", room }) })));
+      }
+    }
+
+    close(): void {
+      this.dispatchEvent(new Event("close"));
+    }
+  }
+
+  vi.stubGlobal("WebSocket", FakeWebSocket);
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/sessions")) return new Response(JSON.stringify({ token: "s_host", userId: "p1", displayName: "Browser Host" }), { status: 200 });
+    if (url.endsWith("/rooms")) return new Response(JSON.stringify(room), { status: 200 });
+    if (url.endsWith("/ws-tickets")) return new Response(JSON.stringify({ ticket: "wst_1", expiresAt: "2026-06-22T00:00:00.000Z", ttlMs: 30_000 }), { status: 201 });
+    return new Response("not found", { status: 404 });
+  }));
+
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: /Player Match/ }));
+  expect(await screen.findByLabelText("Game board and actions")).toBeInTheDocument();
+  return { room, sentMessages };
 };
 
 describe("App", () => {
@@ -166,7 +231,7 @@ describe("App", () => {
     fireEvent.keyDown(setupActions[0]!, { key: "Enter" });
     expect(screen.getByText("Place setup road")).toBeInTheDocument();
     expect(screen.getByRole("img", { name: /Pending setup settlement at corner/ })).toBeInTheDocument();
-    const setupRoads = screen.getAllByRole("button", { name: /Build road on edge/ });
+    const setupRoads = screen.getAllByRole("button", { name: /Build road here/ });
     fireEvent.keyDown(setupRoads[0]!, { key: "Enter" });
     expect(screen.getByText("Active: Briar")).toBeInTheDocument();
   });
@@ -194,7 +259,7 @@ describe("App", () => {
     expect(screen.queryByRole("button", { name: "Bots" })).not.toBeInTheDocument();
     const setupActions = screen.getAllByRole("button", { name: /Place setup settlement at corner/ });
     fireEvent.click(setupActions[0]!);
-    const setupRoads = screen.getAllByRole("button", { name: /Build road on edge/ });
+    const setupRoads = screen.getAllByRole("button", { name: /Build road here/ });
     fireEvent.click(setupRoads[0]!);
     expect(screen.getByText("Active: Briar")).toBeInTheDocument();
     act(() => {
@@ -208,10 +273,7 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: /Bot Match/ }));
     completeLocalSetup();
     fireEvent.click(screen.getByRole("button", { name: "Roll dice" }));
-    const thiefPanel = screen.queryByLabelText("Move robber");
-    if (thiefPanel) {
-      fireEvent.click(within(thiefPanel).getAllByRole("button")[0]!);
-    }
+    moveRobberIfPrompted();
     expect(screen.queryByLabelText("Trade interface")).not.toBeInTheDocument();
     const handButtons = [...screen.getByLabelText("Your resources").querySelectorAll("button")];
     const ownedButton = handButtons.find((button) => Number(button.querySelector(".resource-count")?.textContent ?? "0") > 0);
@@ -233,8 +295,7 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Roll dice" })).toHaveAttribute("aria-keyshortcuts", "R");
     fireEvent.keyDown(window, { key: "r" });
     expect(screen.getByText(/Roll \d+/)).toBeInTheDocument();
-    const thiefPanel = screen.queryByLabelText("Move robber");
-    if (thiefPanel) fireEvent.click(within(thiefPanel).getAllByRole("button")[0]!);
+    moveRobberIfPrompted();
     expect(screen.getByRole("button", { name: "End Turn" })).toHaveAttribute("aria-keyshortcuts", "E");
     fireEvent.keyDown(window, { key: "e" });
     expect(screen.getByText("Active: Briar")).toBeInTheDocument();
@@ -281,6 +342,83 @@ describe("App", () => {
     const sidebar = screen.getByLabelText("Players and controls");
     expect(within(sidebar).getByLabelText("Development cards")).toBeInTheDocument();
     expect(within(sidebar).getByLabelText("Gameplay log")).toBeInTheDocument();
+  });
+
+  it("componentizes own secret VP and keeps Road Building on the board", async () => {
+    const game = completeSetup(createDemoGame("web-road-building-vp")).state;
+    game.phase = { type: "ACTION_PHASE", activePlayerId: "p1" };
+    game.players.p1!.score = 4;
+    game.players.p1!.developmentCards = [
+      { id: "vp-card", type: "VICTORY_POINT", ownerId: "p1", boughtTurn: game.turn - 1 },
+      { id: "road-card", type: "ROAD_BUILDING", ownerId: "p1", boughtTurn: game.turn - 1 },
+    ];
+    game.players.p1!.specialCards = 2;
+    game.players.p2!.score = 5;
+    game.players.p2!.developmentCards = [{ id: "opponent-vp", type: "VICTORY_POINT", ownerId: "p2", boughtTurn: game.turn - 1 }];
+    game.players.p2!.specialCards = 1;
+
+    const { sentMessages } = await renderOnlineGame(game);
+
+    expect(screen.getByText("(4+1) VP")).toBeInTheDocument();
+    expect(screen.queryByText("(5+1) VP")).not.toBeInTheDocument();
+    expect(screen.getByText("Secret +1 VP")).toBeInTheDocument();
+
+    const devPanel = screen.getByLabelText("Development cards");
+    expect(within(devPanel).queryByRole("button", { name: /^e\d+$/ })).not.toBeInTheDocument();
+    fireEvent.click(within(devPanel).getByRole("button", { name: "Use" }));
+    expect(within(devPanel).getByRole("button", { name: "0/2 roads" })).toBeInTheDocument();
+    expect(within(devPanel).queryByRole("button", { name: /^e\d+$/ })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getAllByRole("button", { name: /Build road here/ })[0]!);
+    expect(within(devPanel).getByRole("button", { name: "1/2 roads" })).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: /Build road here/ })[0]!);
+
+    await waitFor(() => expect(sentMessages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "COMMAND",
+        command: expect.objectContaining({ type: "PLAY_ROAD_BUILDING", playerId: "p1", cardId: "road-card", edgeIds: expect.any(Array) }),
+      }),
+    ])));
+  });
+
+  it("uses board victim badges for Knight robber targeting", async () => {
+    const game = completeSetup(createDemoGame("web-knight-targeting")).state;
+    game.phase = { type: "ACTION_PHASE", activePlayerId: "p1" };
+    game.players.p1!.developmentCards = [{ id: "knight-card", type: "KNIGHT", ownerId: "p1", boughtTurn: game.turn - 1 }];
+    game.players.p1!.specialCards = 1;
+    game.players.p2!.resources = { ...emptyResources(), timber: 1 };
+
+    const { sentMessages } = await renderOnlineGame(game);
+    const devPanel = screen.getByLabelText("Development cards");
+    fireEvent.click(within(devPanel).getByRole("button", { name: "Use" }));
+
+    const victimBadge = screen.getAllByRole("button", { name: /steal from Briar/ })[0];
+    expect(victimBadge).toBeDefined();
+    fireEvent.click(victimBadge!);
+
+    await waitFor(() => expect(sentMessages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "COMMAND",
+        command: expect.objectContaining({ type: "PLAY_KNIGHT", playerId: "p1", cardId: "knight-card", stealFromPlayerId: "p2" }),
+      }),
+    ])));
+  });
+
+  it("selects discard cards from the hand rack instead of opening trade", async () => {
+    const game = completeSetup(createDemoGame("web-discard-hand")).state;
+    game.players.p1!.resources = { ...emptyResources(), timber: 8 };
+    game.phase = { type: "DISCARDING", activePlayerId: "p1", rollerId: "p2", pending: { p1: 4 }, submitted: {} };
+
+    await renderOnlineGame(game);
+
+    expect(screen.getByLabelText("Discard resources")).toBeInTheDocument();
+    const discardPanel = screen.getByLabelText("Discard resources");
+    await waitFor(() => expect(within(discardPanel).getByText(/0\/4 · \d+:\d{2}/)).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Select Timber to discard" }));
+    expect(screen.queryByLabelText("Trade interface")).not.toBeInTheDocument();
+    expect(screen.getByText("x1")).toBeInTheDocument();
+    expect(within(discardPanel).getByRole("button", { name: "Clear" })).toBeInTheDocument();
+    expect(within(discardPanel).queryByRole("button", { name: "+" })).not.toBeInTheDocument();
   });
 
   it("auto-rolls and auto-ends when phase timers expire", () => {

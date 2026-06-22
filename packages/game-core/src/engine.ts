@@ -501,6 +501,29 @@ export const deterministicDiscard = (state: GameState, playerId: PlayerId, count
   return discard;
 };
 
+export const randomizedDiscard = (state: GameState, playerId: PlayerId, count?: number, salt = "timeout"): ResourceBundle => {
+  const player = state.players[playerId];
+  const target = count ?? (state.phase.type === "DISCARDING" ? state.phase.pending[playerId] ?? 0 : Math.floor(resourceCount(player?.resources ?? emptyResources()) / 2));
+  const discard = emptyResources();
+  if (!player || target <= 0) return discard;
+  const seed = `${state.config.seed}:discard:${state.config.matchId}:${state.turn}:${state.eventSeq}:${playerId}:${target}:${salt}`;
+  for (let index = 0; index < target; index += 1) {
+    const available = resources.filter((resource) => player.resources[resource] - discard[resource] > 0);
+    const totalAvailable = available.reduce((sum, resource) => sum + player.resources[resource] - discard[resource], 0);
+    if (totalAvailable <= 0) break;
+    let pick = randomIntAt(seed, index, totalAvailable);
+    for (const resource of available) {
+      const remaining = player.resources[resource] - discard[resource];
+      if (pick < remaining) {
+        discard[resource] += 1;
+        break;
+      }
+      pick -= remaining;
+    }
+  }
+  return discard;
+};
+
 const validThiefHexes = (state: GameState): HexId[] => {
   const hexes = Object.keys(state.board.hexes).sort((left, right) => left.localeCompare(right)) as HexId[];
   return hexes.length <= 1 ? hexes : hexes.filter((hexId) => hexId !== state.thiefHexId);
@@ -686,7 +709,7 @@ export const applyCommand = (
       break;
     }
     case "DISCARD_RESOURCES":
-      events.push({ schemaVersion, seq: seq(0), type: "RESOURCES_DISCARDED", playerId: command.playerId, resources: command.resources });
+      events.push({ schemaVersion, seq: seq(0), type: "RESOURCES_DISCARDED", playerId: command.playerId, resources: command.resources, ...(command.forced ? { forced: true } : {}) });
       break;
     case "MOVE_THIEF": {
       const stolenResource = command.stealFromPlayerId ? stolenResourceFor(state, command.playerId, command.stealFromPlayerId, command.hexId, seq(0)) : undefined;
