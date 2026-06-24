@@ -68,6 +68,14 @@ const waitForClose = (socket: WebSocket): Promise<{ code: number; reason: string
     socket.once("close", (code, reason) => resolve({ code, reason: reason.toString() }));
   });
 
+const waitUntil = async (predicate: () => boolean, timeoutMs = 500): Promise<void> => {
+  const startedAt = Date.now();
+  while (!predicate()) {
+    if (Date.now() - startedAt > timeoutMs) throw new Error("Timed out waiting for condition");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+};
+
 const wsBase = (app: { server: { address(): string | AddressInfo | null } }): string => {
   const address = app.server.address();
   if (!address || typeof address === "string") throw new Error("No server address");
@@ -652,6 +660,7 @@ describe("WebSocket gateway", () => {
 
     const closed = await waitForClose(socket);
     expect(closed).toMatchObject({ code: 4000, reason: "Presence stale" });
+    await waitUntil(() => room.seats.find((seat) => seat.userId === host.userId)?.connected === false);
     expect(room.status).toBe("IN_GAME");
     expect(room.archivedAt).toBeUndefined();
     expect(room.seats.find((seat) => seat.userId === host.userId)).toMatchObject({ connected: false });

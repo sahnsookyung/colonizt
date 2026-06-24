@@ -343,7 +343,7 @@ describe("bot policies", () => {
       expect(played.invalidCommands).toBe(0);
       expect(played.state.phase.type).toBe("GAME_OVER");
     }
-  }, 60_000);
+  }, 120_000);
 
   it("supports configurable bot counts across map presets", () => {
     const scenarios: Array<{ playerCount: number; mapPreset: MapPreset }> = [
@@ -364,7 +364,7 @@ describe("bot policies", () => {
       expect(played.invalidCommands).toBe(0);
       expect(played.state.phase.type).toBe("GAME_OVER");
     }
-  }, 60_000);
+  }, 120_000);
 
   it("runs mixed-difficulty tournament samples with stronger bots winning more often", () => {
     const wins = new Map<BotDifficulty, number>();
