@@ -99,6 +99,8 @@ fi
 echo "==> Starting Colonizt stack"
 remote "cd ${REMOTE_ROOT}/deploy/compose && sudo docker compose --env-file .env -f docker-compose.oci.yml config --quiet"
 remote "cd ${REMOTE_ROOT}/deploy/compose && sudo docker compose --env-file .env -f docker-compose.oci.yml pull"
+remote "cd ${REMOTE_ROOT}/deploy/compose && sudo docker compose --env-file .env -f docker-compose.oci.yml up -d postgres"
+remote "cd ${REMOTE_ROOT}/deploy/compose && sudo docker compose --env-file .env -f docker-compose.oci.yml run --rm server npm --workspace @colonizt/db run migrate"
 remote "cd ${REMOTE_ROOT}/deploy/compose && sudo docker compose --env-file .env -f docker-compose.oci.yml up -d --remove-orphans"
 
 echo "==> Installing Colonizt Caddy site without changing JobScout routes"
