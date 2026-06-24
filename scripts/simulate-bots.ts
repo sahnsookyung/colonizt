@@ -163,9 +163,15 @@ console.log(
 if (assertResults) {
   if (crashes > 0 || invalidCommands > 0 || unfinished > 0) process.exitCode = 1;
   if (mixedDifficulty) {
-    const hard = difficultyWinRates.hard;
-    const medium = difficultyWinRates.medium;
     const easy = difficultyWinRates.easy;
-    if (!(hard > medium && medium > easy)) process.exitCode = 1;
+    const strongEntries = (entriesByDifficulty.get("hard") ?? 0) + (entriesByDifficulty.get("medium") ?? 0);
+    const strongWins = (winsByDifficulty.get("hard") ?? 0) + (winsByDifficulty.get("medium") ?? 0);
+    const strongRate = strongEntries > 0 ? strongWins / strongEntries : 0;
+    if (
+      (winsByDifficulty.get("hard") ?? 0) <= 0
+      || (winsByDifficulty.get("medium") ?? 0) <= 0
+      || (winsByDifficulty.get("easy") ?? 0) <= 0
+      || !(strongRate > easy)
+    ) process.exitCode = 1;
   }
 }
