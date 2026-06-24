@@ -44,7 +44,7 @@ export const createStructuredLogger = (
 };
 
 type CommandOutcome = "accepted" | "rejected" | "replayed";
-type ReplayOutcome = "loaded" | "not_found" | "forbidden";
+type ReplayOutcome = "loaded" | "not_found" | "not_ready" | "forbidden";
 type WebSocketEvent = "connected" | "closed" | "rejected";
 
 const metricLine = (name: string, labels: Record<string, string>, value: number): string => {

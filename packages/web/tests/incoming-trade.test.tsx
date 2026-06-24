@@ -11,11 +11,11 @@ vi.mock("@colonizt/demo-state", async () => {
   return {
     ...actual,
     createDemoGame(seed?: string) {
-      const state = actual.createDemoGame(seed);
+      let state = actual.createDemoGame(seed);
+      state = actual.withResources(state, "p1", { timber: 0, brick: 0, grain: 0, fiber: 0, ore: 1 });
+      state = actual.withResources(state, "p2", { timber: 1, brick: 0, grain: 0, fiber: 0, ore: 0 });
       state.phase = { type: "ACTION_PHASE", activePlayerId: "p2" };
       state.eventSeq = 1;
-      state.players.p1!.resources = { ...core.emptyResources(), ore: 1 };
-      state.players.p2!.resources = { ...core.emptyResources(), timber: 1 };
       state.trades.bot_offer = {
         id: "bot_offer",
         fromPlayerId: "p2",

@@ -162,6 +162,7 @@ export interface GameState {
   board: BoardGraph;
   players: Record<PlayerId, PlayerState>;
   playerOrder: PlayerId[];
+  resourceBank: ResourceBundle;
   phase: Phase;
   turn: number;
   roads: Record<EdgeId, PlayerId>;

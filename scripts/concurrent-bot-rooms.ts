@@ -28,20 +28,19 @@ const maxTurns = Number(process.env.CONCURRENT_BOT_MAX_TURNS ?? 18);
 const tickMs = Number(process.env.CONCURRENT_BOT_TICK_MS ?? 1_000);
 const mapSequence: MapPreset[] = ["standard", "islands", "continent", "standard", "continent"];
 
-const stableStateHash = (state: GameState): string => JSON.stringify({
-  matchId: state.config.matchId,
-  playerOrder: state.playerOrder,
-  phase: state.phase,
-  turn: state.turn,
-  eventSeq: state.eventSeq,
-  roads: state.roads,
-  buildings: state.buildings,
-  scores: Object.fromEntries(state.playerOrder.map((playerId) => [playerId, state.players[playerId]?.score ?? 0])),
-  resourceCounts: Object.fromEntries(state.playerOrder.map((playerId) => [
-    playerId,
-    Object.values(state.players[playerId]?.resources ?? {}).reduce((sum, value) => sum + value, 0),
-  ])),
-});
+const stableStringify = (value: unknown): string => {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${stableStringify(entry)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+};
+
+const stableStateHash = (state: GameState): string => stableStringify(state);
 
 const assertCondition = (condition: unknown, message: string): asserts condition => {
   if (!condition) throw new Error(message);

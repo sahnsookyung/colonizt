@@ -9,7 +9,7 @@ import { PostgresEventStore } from "./event-store.js";
 import { createStructuredLogger, MetricsRegistry, resolveInstanceMode, type StructuredLogger } from "./observability.js";
 import { MemoryRoomOwnershipStore, PostgresRoomOwnershipStore, type RoomOwnershipStore } from "./ownership.js";
 import { createPresenceStore, type PresenceStore } from "./presence.js";
-import { defaultRoomCleanupPolicy, RoomCapacityError, RoomManager, type Room, type RoomCleanupPolicy, type Session } from "./room-manager.js";
+import { defaultRoomCleanupPolicy, RoomCapacityError, RoomManager, type Room, type RoomCleanupPolicy, type RoomSettings, type Session } from "./room-manager.js";
 import { RoomAutomationScheduler } from "./scheduler.js";
 
 export { RoomManager, defaultRoomCleanupPolicy } from "./room-manager.js";
@@ -29,6 +29,8 @@ export interface BuildServerOptions {
   wsTicketTtlMs?: number;
   roomCleanupPolicy?: Partial<RoomCleanupPolicy>;
   roomCleanupIntervalMs?: number;
+  presenceStaleMs?: number;
+  presenceSweepIntervalMs?: number;
   sessionTtlMs?: number;
   roomOwnershipStore?: RoomOwnershipStore;
   roomOwnershipLeaseTtlMs?: number;
@@ -73,6 +75,9 @@ const positiveInt = (value: string | undefined, fallback: number): number => {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 };
+
+const withoutUndefined = <T extends Record<string, unknown>>(input: T): Partial<T> =>
+  Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined)) as Partial<T>;
 
 const sqlStatePattern = /^[0-9A-Z]{5}$/u;
 
@@ -143,6 +148,7 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
   const app = Fastify({ logger: false, bodyLimit: 32_000 });
   const clients = new Set<SocketClient>();
   const clientsByRoom = new Map<string, Set<SocketClient>>();
+  const clientsBySocket = new Map<string, SocketClient>();
   const wsTickets = new Map<string, WsTicket>();
   const requestStartedAt = new WeakMap<object, number>();
   const rateLimitBuckets = new Map<string, number[]>();
@@ -223,8 +229,18 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     for (const client of clientsByRoom.get(roomId) ?? []) send(client, payloadFor(client));
   };
 
+  const detachClientFromRoom = (client: SocketClient, roomId = client.roomId): void => {
+    if (!roomId) return;
+    const roomClients = clientsByRoom.get(roomId);
+    if (roomClients) {
+      roomClients.delete(client);
+      if (roomClients.size === 0) clientsByRoom.delete(roomId);
+    }
+    if (client.roomId === roomId) delete client.roomId;
+  };
+
   const attachClientToRoom = (client: SocketClient, roomId: string): void => {
-    if (client.roomId && client.roomId !== roomId) clientsByRoom.get(client.roomId)?.delete(client);
+    if (client.roomId && client.roomId !== roomId) detachClientFromRoom(client, client.roomId);
     client.roomId = roomId;
     const roomClients = clientsByRoom.get(roomId) ?? new Set<SocketClient>();
     roomClients.add(client);
@@ -254,9 +270,12 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
       send(client, { type: "ERROR", code, message });
       client.socket.close(1000, message);
     }
+    clientsByRoom.delete(roomId);
   };
 
   const cleanupIntervalMs = options.roomCleanupIntervalMs ?? positiveInt(process.env.ROOM_CLEANUP_INTERVAL_MS, 30_000);
+  const presenceStaleMs = options.presenceStaleMs ?? positiveInt(process.env.PRESENCE_STALE_MS, 300_000);
+  const presenceSweepIntervalMs = options.presenceSweepIntervalMs ?? positiveInt(process.env.PRESENCE_SWEEP_INTERVAL_MS, 30_000);
   const scheduler = new RoomAutomationScheduler({
     manager,
     cleanupPolicy,
@@ -271,12 +290,60 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
         snapshot: snapshotFor(roomId, result.state, target),
       }));
     },
+    onAutomationRejected: (roomId, result) => {
+      logger.warn("scheduler.automation_rejected", { roomId, code: result.code, message: result.message });
+    },
     onRoomClosed: (closed) => {
       const code = closed.status === "EXPIRED" ? "ROOM_EXPIRED" : closed.status === "ABANDONED" ? "ROOM_ABANDONED" : "ROOM_CLOSED";
       closeRoomClients(closed.roomId, code, closed.cleanupReason ?? "Room closed");
     },
   });
   scheduler.start();
+
+  const sweepStalePresence = async (): Promise<void> => {
+    const staleSockets = await presence.sweepStale(presenceStaleMs);
+    if (staleSockets.length === 0) return;
+    const affectedRoomIds = new Set<string>();
+    for (const stale of staleSockets) {
+      if (stale.roomId) affectedRoomIds.add(stale.roomId);
+      const client = clientsBySocket.get(stale.socketId);
+      if (!client) continue;
+      clients.delete(client);
+      clientsBySocket.delete(stale.socketId);
+      detachClientFromRoom(client);
+      metrics.recordWebSocket("closed", "presence_stale");
+      client.socket.close(4000, "Presence stale");
+    }
+    for (const roomId of affectedRoomIds) {
+      const room = await manager.syncConnections(roomId, await presence.roomUserIds(roomId));
+      if (room) broadcastRoomState(room);
+    }
+  };
+
+  const presenceSweepTimer = setInterval(() => {
+    void sweepStalePresence().catch((error) => {
+      metrics.recordDbFailure("presence_sweep");
+      logger.error("presence.sweep_failed", { message: error instanceof Error ? error.message : String(error) });
+    });
+  }, presenceSweepIntervalMs);
+  presenceSweepTimer.unref?.();
+
+  const sweepTransientState = (): void => {
+    const now = Date.now();
+    for (const [token, ticket] of wsTickets) {
+      if (ticket.expiresAt <= now || ticket.consumed) wsTickets.delete(token);
+    }
+    for (const [key, timestamps] of rateLimitBuckets) {
+      while (timestamps[0] && timestamps[0] < now - 60_000) timestamps.shift();
+      if (timestamps.length === 0) rateLimitBuckets.delete(key);
+    }
+    for (const [roomId, roomClients] of clientsByRoom) {
+      if (roomClients.size === 0) clientsByRoom.delete(roomId);
+    }
+  };
+
+  const transientSweepTimer = setInterval(sweepTransientState, Math.max(30_000, Math.min(wsTicketTtlMs, 60_000)));
+  transientSweepTimer.unref?.();
 
   app.addHook("onRequest", (request, _reply, done) => {
     requestStartedAt.set(request, Date.now());
@@ -298,6 +365,8 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
   });
 
   app.addHook("onClose", async () => {
+    clearInterval(presenceSweepTimer);
+    clearInterval(transientSweepTimer);
     scheduler.stop();
     await presence.close();
     await pool?.end();
@@ -338,7 +407,8 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     if (!withinNamedLimit(`ip:${clientIp(request)}:sessions`, 20, 60_000)) {
       return reply.status(429).send({ code: "RATE_LIMITED", message: "Too many sessions" });
     }
-    return manager.createSession(request.body.displayName ?? "Guest");
+    const displayName = typeof request.body.displayName === "string" ? request.body.displayName.trim().slice(0, 40) : "";
+    return manager.createSession(displayName || "Guest");
   });
 
   app.post("/ws-tickets", async (request, reply) => {
@@ -421,11 +491,20 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
 
   app.get<{ Params: { replayId: string } }>("/matches/:replayId/replay", async (request, reply) => {
     const session = await requireSession(manager, request);
-    const storedReplay = await manager.getReplayById(request.params.replayId);
-    if (!storedReplay) {
+    const replayResult = await manager.getFinishedReplayById(request.params.replayId);
+    if (replayResult.status === "missing") {
       metrics.recordReplay("not_found");
       return reply.status(404).send({ code: "REPLAY_NOT_FOUND" });
     }
+    if (replayResult.status === "not_finished") {
+      metrics.recordReplay("not_ready");
+      return reply.status(409).send({ code: "REPLAY_NOT_READY", message: "Replay is available after the game is finished" });
+    }
+    if (replayResult.status !== "finished") {
+      metrics.recordReplay("not_found");
+      return reply.status(404).send({ code: "REPLAY_NOT_FOUND" });
+    }
+    const storedReplay = replayResult.replay;
     if (!storedReplay.config.playerOrder.includes(session.userId)) {
       metrics.recordReplay("forbidden");
       return reply.status(403).send({ code: "REPLAY_FORBIDDEN" });
@@ -482,14 +561,16 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     const commandTimes: number[] = [];
     const chatTimes: number[] = [];
     clients.add(client);
+    clientsBySocket.set(socketId, client);
     metrics.recordWebSocket("connected");
     logger.info("websocket.connected", { socketId, userId: session.userId });
     void presence.connect(session, socketId).catch(() => undefined);
     socket.on("close", () => {
-      clients.delete(client);
+      const wasTracked = clients.delete(client);
+      clientsBySocket.delete(socketId);
       const roomId = client.roomId;
-      if (roomId) clientsByRoom.get(roomId)?.delete(client);
-      metrics.recordWebSocket("closed");
+      detachClientFromRoom(client, roomId);
+      if (wasTracked) metrics.recordWebSocket("closed");
       logger.info("websocket.closed", { socketId, userId: session.userId, roomId });
       void (async () => {
         await presence.disconnect(session, socketId, roomId);
@@ -551,8 +632,7 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
             send(client, { type: "ERROR", code: left.code, message: left.message });
             return;
           }
-          clientsByRoom.get(left.room.id)?.delete(client);
-          if (client.roomId === left.room.id) delete client.roomId;
+          detachClientFromRoom(client, left.room.id);
           client.asSpectator = false;
           void presence.disconnect(session, socketId, left.room.id).catch(() => undefined);
           send(client, { type: "ROOM_LEFT", roomId: left.room.id });
@@ -568,6 +648,62 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
           }
           broadcastRoomState(ready.room);
         }).catch((error) => send(client, { type: "ERROR", code: "READY_FAILED", message: error instanceof Error ? error.message : "Ready failed" }));
+        return;
+      }
+      if (message.type === "START_ROOM") {
+        void manager.startRoomByHost(message.roomId, session).then((started) => {
+          if (!started.ok) {
+            send(client, { type: "ERROR", code: started.code, message: started.message });
+            return;
+          }
+          broadcastRoomState(started.room);
+        }).catch((error) => send(client, { type: "ERROR", code: "START_FAILED", message: error instanceof Error ? error.message : "Start failed" }));
+        return;
+      }
+      if (message.type === "ADD_BOT") {
+        void manager.addLobbyBot(message.roomId, session).then((added) => {
+          if (!added.ok) {
+            send(client, { type: "ERROR", code: added.code, message: added.message });
+            return;
+          }
+          broadcastRoomState(added.room);
+        }).catch((error) => send(client, { type: "ERROR", code: "ADD_BOT_FAILED", message: error instanceof Error ? error.message : "Add bot failed" }));
+        return;
+      }
+      if (message.type === "REMOVE_BOT") {
+        void manager.removeLobbyBot(message.roomId, session, message.seatIndex).then((removed) => {
+          if (!removed.ok) {
+            send(client, { type: "ERROR", code: removed.code, message: removed.message });
+            return;
+          }
+          broadcastRoomState(removed.room);
+        }).catch((error) => send(client, { type: "ERROR", code: "REMOVE_BOT_FAILED", message: error instanceof Error ? error.message : "Remove bot failed" }));
+        return;
+      }
+      if (message.type === "UPDATE_ROOM_SETTINGS") {
+        const settings: Partial<Omit<RoomSettings, "mode">> = {};
+        if (message.settings.botFill !== undefined) settings.botFill = message.settings.botFill;
+        if (message.settings.ranked !== undefined) settings.ranked = message.settings.ranked;
+        if (message.settings.minPlayers !== undefined) settings.minPlayers = message.settings.minPlayers;
+        if (message.settings.maxPlayers !== undefined) settings.maxPlayers = message.settings.maxPlayers;
+        if (message.settings.botDifficulty !== undefined) settings.botDifficulty = message.settings.botDifficulty;
+        if (message.settings.rules) settings.rules = withoutUndefined(message.settings.rules);
+        void manager.updateRoomSettings(message.roomId, session, settings).then((updated) => {
+          if (!updated.ok) {
+            send(client, { type: "ERROR", code: updated.code, message: updated.message });
+            return;
+          }
+          broadcastRoomState(updated.room);
+        }).catch((error) => send(client, { type: "ERROR", code: "SETTINGS_FAILED", message: error instanceof Error ? error.message : "Settings update failed" }));
+        return;
+      }
+      if (message.type === "UPDATE_DISPLAY_NAME") {
+        void manager.updateDisplayName(session, message.displayName, client.roomId).then(() => {
+          if (client.roomId) {
+            const room = manager.roomForRef(client.roomId);
+            if (room) broadcastRoomState(room);
+          }
+        }).catch((error) => send(client, { type: "ERROR", code: "NAME_FAILED", message: error instanceof Error ? error.message : "Name update failed" }));
         return;
       }
       if (message.type === "COMMAND") {

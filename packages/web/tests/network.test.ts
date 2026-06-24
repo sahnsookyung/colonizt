@@ -83,6 +83,28 @@ describe("network client", () => {
     });
   });
 
+  it("preserves structured replay load errors", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://replay-bootstrap.example/config") {
+        return new Response(JSON.stringify({
+          apiBaseUrl: "https://replay-api.example",
+          wsBaseUrl: "wss://replay-socket.example",
+        }), { status: 200 });
+      }
+      if (url === "https://replay-api.example/matches/match_1/replay") {
+        return new Response(JSON.stringify({ code: "REPLAY_NOT_READY", message: "Replay is available after the game is finished" }), { status: 409 });
+      }
+      return new Response("not found", { status: 404 });
+    }));
+
+    await expect(createNetworkClient("https://replay-bootstrap.example").loadReplay("match_1", "s1")).rejects.toMatchObject({
+      code: "REPLAY_NOT_READY",
+      message: "Replay is available after the game is finished",
+      status: 409,
+    });
+  });
+
   it("uses advertised runtime WSS config for websocket connections", async () => {
     class FakeWebSocket {
       static readonly OPEN = 1;

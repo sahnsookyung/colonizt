@@ -93,6 +93,29 @@ describe("RoomAutomationScheduler", () => {
     expect(rejected).toEqual([{ roomId: "room_bad", result: { ok: false, code: "BAD_BOT_COMMAND", message: "bad bot command" } }]);
   });
 
+  it("reports rejected turn expiry through the rejection callback", async () => {
+    const manager = new RoomManager();
+    vi.spyOn(manager, "dueAutomationRoomIds").mockReturnValue(["room_bad_timeout"]);
+    vi.spyOn(manager, "expireTurn").mockResolvedValue({ ok: false, code: "BAD_TIMEOUT_COMMAND", message: "bad timeout command" });
+    vi.spyOn(manager, "runDueBotAutomation").mockResolvedValue(undefined);
+    vi.spyOn(manager, "refreshRoomDueWork").mockImplementation(() => undefined);
+    vi.spyOn(manager, "nextAutomationDueAt").mockReturnValue(undefined);
+    const rejected: Array<{ roomId: string; result: Extract<CommandResult, { ok: false }> }> = [];
+    const scheduler = new RoomAutomationScheduler({
+      manager,
+      cleanupPolicy: defaultRoomCleanupPolicy,
+      logger: silentLogger,
+      metrics: new MetricsRegistry("test", "single"),
+      onEvents: () => undefined,
+      onAutomationRejected: (roomId, result) => rejected.push({ roomId, result }),
+      onRoomClosed: () => undefined,
+    });
+
+    await scheduler.tickAutomation();
+
+    expect(rejected).toEqual([{ roomId: "room_bad_timeout", result: { ok: false, code: "BAD_TIMEOUT_COMMAND", message: "bad timeout command" } }]);
+  });
+
   it("reports cleaned rooms through the close callback", async () => {
     const manager = new RoomManager(new MemoryEventStore(), { emptyLobbyTtlMs: 1000 });
     const session = await manager.createSession("Host");

@@ -8,7 +8,10 @@ import {
   resourceCount,
   resourceBundle,
   cityCost,
+  classicResourceBank,
+  classicResourceBankSize,
   defaultSpecialCardCost,
+  normalizedResources,
   randomizedSpecialCardCost,
   roadCost,
   settlementCost,
@@ -126,6 +129,7 @@ export const createGame = (config: GameConfig, board?: GameState["board"]): Game
     board: selectedBoard,
     players,
     playerOrder: [...normalizedConfig.playerOrder],
+    resourceBank: classicResourceBank(),
     phase: { type: "SETUP_PLACEMENT", activePlayerId: firstPlayer, setupIndex: 0 },
     turn: 0,
     roads: {},
@@ -156,6 +160,26 @@ const normalizedCardCount = (player: GameState["players"][PlayerId]): number =>
   player.developmentCards && player.developmentCards.length > 0
     ? player.developmentCards.filter((card) => !card.playedTurn).length
     : player.specialCards;
+
+export const projectedResourceBank = (state: Pick<GameState, "players">): ResourceBundle => {
+  const bank = classicResourceBank();
+  for (const player of Object.values(state.players)) {
+    for (const resource of resources) bank[resource] -= player.resources[resource];
+  }
+  return bank;
+};
+
+const ensureResourceBank = (state: GameState): void => {
+  state.resourceBank = normalizedResources(state.resourceBank ?? projectedResourceBank(state));
+};
+
+const returnToBank = (state: GameState, bundle: Partial<ResourceBundle>): void => {
+  state.resourceBank = addResources(state.resourceBank, bundle);
+};
+
+const takeFromBank = (state: GameState, bundle: Partial<ResourceBundle>): void => {
+  state.resourceBank = subtractResources(state.resourceBank, normalizedResources(bundle));
+};
 
 const cardVictoryPoints = (player: GameState["players"][PlayerId], includeHidden = true): number =>
   (player.developmentCards ?? []).filter((card) => card.type === "VICTORY_POINT" && (includeHidden || card.revealed)).length;
@@ -457,6 +481,22 @@ const resourceGainForRoll = (state: GameState, sum: number, multiplier = 1): Rec
   return gains;
 };
 
+const enforceBankProductionLimit = (state: GameState, gains: Record<PlayerId, Partial<ResourceBundle>>): Record<PlayerId, Partial<ResourceBundle>> => {
+  const totals = emptyResources();
+  for (const gain of Object.values(gains)) {
+    for (const resource of resources) totals[resource] += gain[resource] ?? 0;
+  }
+  const blocked = new Set(resources.filter((resource) => totals[resource] > (state.resourceBank?.[resource] ?? 0)));
+  if (blocked.size === 0) return gains;
+  const filtered: Record<PlayerId, Partial<ResourceBundle>> = {};
+  for (const [playerId, gain] of Object.entries(gains)) {
+    const next = { ...gain };
+    for (const resource of blocked) delete next[resource];
+    if (resources.some((resource) => (next[resource] ?? 0) > 0)) filtered[playerId] = next;
+  }
+  return filtered;
+};
+
 const startingResourcesForVertex = (state: GameState, vertexId: VertexId): Partial<ResourceBundle> => {
   const gains: Partial<ResourceBundle> = {};
   for (const hexId of state.board.vertices[vertexId]?.adjacentHexes ?? []) {
@@ -701,7 +741,7 @@ export const applyCommand = (
           events.push({ schemaVersion, seq: seq(2), type: "DISCARD_REQUIRED", rollerId: command.playerId, pending });
         }
       } else {
-        const gains = resourceGainForRoll(state, sum, doublesMultiplier);
+        const gains = enforceBankProductionLimit(state, resourceGainForRoll(state, sum, doublesMultiplier));
         if (hasAnyGain(gains)) {
           events.push({ schemaVersion, seq: seq(1), type: "RESOURCES_PRODUCED", gains, ...(doublesMultiplier > 1 ? { multiplier: doublesMultiplier } : {}) });
         }
@@ -1061,7 +1101,9 @@ export const validateCommand = (state: GameState, command: GameCommand): Validat
     case "PLAY_YEAR_OF_PLENTY": {
       const cardError = validateDevelopmentCardPlay(state, command.playerId, command.cardId, "YEAR_OF_PLENTY");
       if (cardError) return cardError;
-      return command.resources.every((resource) => resources.includes(resource)) ? null : error("TRADE_NOT_ALLOWED", "Choose valid resources");
+      if (!command.resources.every((resource) => resources.includes(resource))) return error("TRADE_NOT_ALLOWED", "Choose valid resources");
+      const requested = command.resources.reduce<ResourceBundle>((bundle, resource) => addResources(bundle, resourceBundle(resource, 1)), emptyResources());
+      return hasResources(state.resourceBank, requested) ? null : error("INSUFFICIENT_RESOURCES", "Bank does not have the requested resources");
     }
     case "OFFER_TRADE": {
       const activeError = ensureActive(state, command.playerId);
@@ -1093,6 +1135,7 @@ export const validateCommand = (state: GameState, command: GameCommand): Validat
       if (!hasResources(state.players[command.playerId]!.resources, resourceBundle(command.offered, ratio))) {
         return error("INSUFFICIENT_RESOURCES", `Need ${ratio} ${command.offered} for this bank trade`);
       }
+      if ((state.resourceBank[command.requested] ?? 0) < 1) return error("INSUFFICIENT_RESOURCES", `Bank has no ${command.requested}`);
       return null;
     }
     case "CANCEL_TRADE": {
@@ -1165,6 +1208,7 @@ export const applyEvent = (state: GameState, event: GameEvent): GameState => {
   next.developmentDeck ??= createDevelopmentDeck(next.config.seed);
   next.developmentDeckCursor ??= 0;
   next.playedKnightCounts ??= {};
+  ensureResourceBank(next);
   for (const player of Object.values(next.players)) {
     player.developmentCards ??= [];
     player.playedKnights ??= next.playedKnightCounts[player.id] ?? 0;
@@ -1178,6 +1222,7 @@ export const applyEvent = (state: GameState, event: GameEvent): GameState => {
       next.buildings[event.vertexId] = { owner: event.playerId, type: "settlement" };
       next.roads[event.edgeId] = event.playerId;
       next.players[event.playerId]!.resources = addResources(next.players[event.playerId]!.resources, event.startingResources);
+      takeFromBank(next, event.startingResources);
       next.players[event.playerId]!.score += 1;
       refreshLongestRoad(next);
       const setupIndex = next.phase.type === "SETUP_PLACEMENT" ? next.phase.setupIndex + 1 : 0;
@@ -1208,6 +1253,7 @@ export const applyEvent = (state: GameState, event: GameEvent): GameState => {
     }
     case "RESOURCES_DISCARDED": {
       next.players[event.playerId]!.resources = subtractResources(next.players[event.playerId]!.resources, event.resources);
+      returnToBank(next, event.resources);
       if (next.phase.type === "DISCARDING") {
         const submitted = { ...next.phase.submitted, [event.playerId]: event.resources };
         const activeDiscarder = nextPendingDiscardPlayer(next.phase.pending, submitted);
@@ -1230,17 +1276,20 @@ export const applyEvent = (state: GameState, event: GameEvent): GameState => {
     case "RESOURCES_PRODUCED":
       for (const [playerId, gains] of Object.entries(event.gains)) {
         next.players[playerId]!.resources = addResources(next.players[playerId]!.resources, gains);
+        takeFromBank(next, gains);
       }
       break;
     case "ROAD_BUILT":
       next.roads[event.edgeId] = event.playerId;
       next.players[event.playerId]!.resources = subtractResources(next.players[event.playerId]!.resources, event.cost);
+      returnToBank(next, event.cost);
       refreshLongestRoad(next);
       break;
     case "SETTLEMENT_BUILT":
       next.settlements[event.vertexId] = event.playerId;
       next.buildings[event.vertexId] = { owner: event.playerId, type: "settlement" };
       next.players[event.playerId]!.resources = subtractResources(next.players[event.playerId]!.resources, event.cost);
+      returnToBank(next, event.cost);
       next.players[event.playerId]!.score += 1;
       refreshLongestRoad(next);
       break;
@@ -1248,10 +1297,12 @@ export const applyEvent = (state: GameState, event: GameEvent): GameState => {
       next.buildings[event.vertexId] = { owner: event.playerId, type: "city" };
       next.settlements[event.vertexId] = event.playerId;
       next.players[event.playerId]!.resources = subtractResources(next.players[event.playerId]!.resources, event.cost);
+      returnToBank(next, event.cost);
       next.players[event.playerId]!.score += 1;
       break;
     case "SPECIAL_CARD_BOUGHT":
       next.players[event.playerId]!.resources = subtractResources(next.players[event.playerId]!.resources, event.cost);
+      returnToBank(next, event.cost);
       if (event.cardId && event.cardType) {
         next.players[event.playerId]!.developmentCards = [
           ...(next.players[event.playerId]!.developmentCards ?? []),
@@ -1294,12 +1345,12 @@ export const applyEvent = (state: GameState, event: GameEvent): GameState => {
       next.players[event.playerId]!.resources = addResources(next.players[event.playerId]!.resources, resourceBundle(event.resource, total));
       break;
     }
-    case "YEAR_OF_PLENTY_PLAYED":
-      next.players[event.playerId]!.resources = addResources(
-        next.players[event.playerId]!.resources,
-        event.resources.reduce<ResourceBundle>((bundle, resource) => addResources(bundle, resourceBundle(resource, 1)), emptyResources()),
-      );
+    case "YEAR_OF_PLENTY_PLAYED": {
+      const gained = event.resources.reduce<ResourceBundle>((bundle, resource) => addResources(bundle, resourceBundle(resource, 1)), emptyResources());
+      next.players[event.playerId]!.resources = addResources(next.players[event.playerId]!.resources, gained);
+      takeFromBank(next, gained);
       break;
+    }
     case "LARGEST_ARMY_UPDATED":
       refreshLargestArmy(next);
       break;
@@ -1307,7 +1358,9 @@ export const applyEvent = (state: GameState, event: GameEvent): GameState => {
       break;
     case "MARITIME_TRADED":
       next.players[event.playerId]!.resources = subtractResources(next.players[event.playerId]!.resources, resourceBundle(event.offered, event.ratio));
+      returnToBank(next, resourceBundle(event.offered, event.ratio));
       next.players[event.playerId]!.resources = addResources(next.players[event.playerId]!.resources, resourceBundle(event.requested, 1));
+      takeFromBank(next, resourceBundle(event.requested, 1));
       break;
     case "TRADE_OFFERED":
       next.trades[event.trade.id] = event.trade;
@@ -1369,6 +1422,7 @@ export const assertInvariants = (state: GameState): Result<true, ValidationError
   const boardErrors = validateBoard(state.board);
   if (boardErrors.length > 0) return { ok: false, error: error("INVALID_BOARD", boardErrors.join("; ")) };
   if (state.thiefHexId && !state.board.hexes[state.thiefHexId]) return { ok: false, error: error("INVARIANT_VIOLATION", "thief is on an unknown hex") };
+  if (!isNonNegativeBundle(state.resourceBank ?? emptyResources())) return { ok: false, error: error("INVARIANT_VIOLATION", "bank has negative resources") };
   const seenCards = new Set<DevelopmentCardId>();
   for (const player of Object.values(state.players)) {
     if (!isNonNegativeBundle(player.resources)) return { ok: false, error: error("INVARIANT_VIOLATION", `${player.id} has negative resources`) };
@@ -1420,6 +1474,12 @@ export const assertInvariants = (state: GameState): Result<true, ValidationError
     if (countBuildings(state, playerId, "settlement") > maxSettlementsPerPlayer) return { ok: false, error: error("INVARIANT_VIOLATION", `${playerId} has too many settlements`) };
     if (countBuildings(state, playerId, "city") > maxCitiesPerPlayer) return { ok: false, error: error("INVARIANT_VIOLATION", `${playerId} has too many cities`) };
   }
+  for (const resource of resources) {
+    const held = Object.values(state.players).reduce((sum, player) => sum + player.resources[resource], 0);
+    if (held + (state.resourceBank?.[resource] ?? 0) !== classicResourceBankSize) {
+      return { ok: false, error: error("INVARIANT_VIOLATION", `${resource} bank accounting mismatch`) };
+    }
+  }
   if (state.phase.type === "DISCARDING") {
     for (const [playerId, count] of Object.entries(state.phase.pending)) {
       if (!state.players[playerId] || count <= 0) return { ok: false, error: error("INVARIANT_VIOLATION", "invalid discard pending entry") };
@@ -1459,7 +1519,8 @@ export const getLegalActions = (state: GameState, playerId: PlayerId): LegalActi
     const monopolyCards = playableDevelopmentCards(state, playerId, "MONOPOLY").map((card) => card.id);
     if (monopolyCards.length > 0) actions.push({ type: "PLAY_MONOPOLY", cardIds: monopolyCards, resources: [...resources] });
     const plentyCards = playableDevelopmentCards(state, playerId, "YEAR_OF_PLENTY").map((card) => card.id);
-    if (plentyCards.length > 0) actions.push({ type: "PLAY_YEAR_OF_PLENTY", cardIds: plentyCards, resources: [...resources] });
+    const bankedResources = resources.filter((resource) => (state.resourceBank?.[resource] ?? 0) > 0);
+    if (plentyCards.length > 0 && bankedResources.length > 0) actions.push({ type: "PLAY_YEAR_OF_PLENTY", cardIds: plentyCards, resources: bankedResources });
   };
   if (state.phase.type === "WAITING_FOR_ROLL") {
     const actions: LegalAction[] = [{ type: "ROLL_DICE" }];
@@ -1471,7 +1532,7 @@ export const getLegalActions = (state: GameState, playerId: PlayerId): LegalActi
     const ratio = maritimeTradeRatio(state, playerId, offered);
     if (state.players[playerId]!.resources[offered] < ratio) return [];
     return resources
-      .filter((requested) => requested !== offered)
+      .filter((requested) => requested !== offered && (state.resourceBank?.[requested] ?? 0) > 0)
       .map((requested) => ({ offered, requested, ratio }));
   });
   if (maritimeTrades.length > 0) actions.push({ type: "MARITIME_TRADE", trades: maritimeTrades });

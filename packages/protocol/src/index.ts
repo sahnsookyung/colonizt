@@ -59,10 +59,27 @@ export const gameCommandSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("END_TURN"), playerId: z.string() }),
 ]);
 
+export const lobbySettingsUpdateSchema = z.object({
+  botFill: z.boolean().optional(),
+  ranked: z.boolean().optional(),
+  minPlayers: onlinePlayerCountSchema.optional(),
+  maxPlayers: onlinePlayerCountSchema.optional(),
+  botDifficulty: botDifficultySchema.optional(),
+  rules: gameRulesSchema.optional(),
+}).refine(
+  (settings) => settings.minPlayers === undefined || settings.maxPlayers === undefined || settings.minPlayers <= settings.maxPlayers,
+  { path: ["minPlayers"], message: "minPlayers cannot exceed maxPlayers" },
+);
+
 export const wsClientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("JOIN_ROOM"), roomId: z.string(), asSpectator: z.boolean().optional() }),
   z.object({ type: z.literal("LEAVE_ROOM"), roomId: z.string() }),
   z.object({ type: z.literal("READY"), roomId: z.string(), ready: z.boolean() }),
+  z.object({ type: z.literal("START_ROOM"), roomId: z.string() }),
+  z.object({ type: z.literal("ADD_BOT"), roomId: z.string() }),
+  z.object({ type: z.literal("REMOVE_BOT"), roomId: z.string(), seatIndex: z.number().int().min(0).max(3) }),
+  z.object({ type: z.literal("UPDATE_ROOM_SETTINGS"), roomId: z.string(), settings: lobbySettingsUpdateSchema }),
+  z.object({ type: z.literal("UPDATE_DISPLAY_NAME"), displayName: z.string().trim().min(1).max(40) }),
   z.object({ type: z.literal("COMMAND"), roomId: z.string(), clientSeq: z.number().int().nonnegative(), command: gameCommandSchema }),
   z.object({ type: z.literal("CHAT"), roomId: z.string(), message: z.string().min(1).max(300) }),
   z.object({ type: z.literal("RESYNC"), roomId: z.string(), lastSeq: z.number().int().nonnegative() }),
@@ -131,9 +148,40 @@ export interface RoomSeatPayload {
   seatIndex: number;
   userId?: PlayerId;
   botId?: PlayerId;
+  displayName?: string;
   ready: boolean;
   connected: boolean;
 }
+
+export interface LobbyReadiness {
+  readyCount: number;
+  occupiedCount: number;
+  connectedOccupiedCount: number;
+  canStart: boolean;
+}
+
+type LobbySeatLike = Pick<RoomSeatPayload, "userId" | "botId" | "ready" | "connected">;
+
+export const isLobbySeatOccupied = (seat: Pick<LobbySeatLike, "userId" | "botId">): boolean =>
+  Boolean(seat.userId || seat.botId);
+
+export const isLobbySeatConnected = (seat: Pick<LobbySeatLike, "userId" | "botId" | "connected">): boolean =>
+  Boolean(seat.botId || (seat.userId && seat.connected));
+
+export const isLobbySeatReadyToStart = (seat: LobbySeatLike): boolean =>
+  isLobbySeatOccupied(seat) && isLobbySeatConnected(seat) && seat.ready;
+
+export const lobbyReadiness = (seats: readonly LobbySeatLike[], minPlayers: number): LobbyReadiness => {
+  const occupiedSeats = seats.filter(isLobbySeatOccupied);
+  const connectedOccupiedSeats = occupiedSeats.filter(isLobbySeatConnected);
+  const startableSeats = connectedOccupiedSeats.filter((seat) => seat.ready);
+  return {
+    readyCount: startableSeats.length,
+    occupiedCount: occupiedSeats.length,
+    connectedOccupiedCount: connectedOccupiedSeats.length,
+    canStart: startableSeats.length >= minPlayers && connectedOccupiedSeats.every((seat) => seat.ready),
+  };
+};
 
 export interface WsTicketResponse {
   ticket: string;
@@ -175,5 +223,6 @@ export interface PublicRoomPayload {
 export type GameRulesInput = z.input<typeof gameRulesSchema>;
 export type CreateRoomInput = z.input<typeof createRoomSchema>;
 export type CreateRoomSettings = z.output<typeof createRoomSchema>;
+export type LobbySettingsUpdate = z.output<typeof lobbySettingsUpdateSchema>;
 export type AnalyticsEventInput = z.input<typeof analyticsEventSchema>;
 export type WsClientMessage = z.infer<typeof wsClientMessageSchema>;

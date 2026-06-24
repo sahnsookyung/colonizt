@@ -8,6 +8,7 @@ npm run typecheck
 npm run test:unit
 npm run test:property
 npm run test:integration
+npm run simulate:bots:gate
 npm run smoke:network
 npm run simulate:ranked
 npm run simulate:rush

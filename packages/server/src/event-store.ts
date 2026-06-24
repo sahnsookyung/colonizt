@@ -15,6 +15,7 @@ import {
   loadReplayLog,
   loadReplayLogByRoomId,
   markMatchFinished,
+  persistedRoomCodeExists,
   upsertCommandResult,
   upsertSession,
   upsertRoom,
@@ -45,6 +46,7 @@ export interface StoredRoomRecord {
   pausedAt?: string;
   pauseReason?: Room["pauseReason"];
   tradeResponseDeadlines?: Record<string, number>;
+  timer?: Room["timer"];
   archivedAt?: string;
   cleanupReason?: string;
   seats: Room["seats"];
@@ -74,6 +76,7 @@ export interface EventStore {
   listMatches(limit?: number): Promise<StoredMatchSummary[]>;
   loadRooms(limit?: number): Promise<StoredRoomRecord[]>;
   loadRoomByRef?(roomRef: string): Promise<StoredRoomRecord | undefined>;
+  roomCodeExists?(code: string): Promise<boolean>;
   loadSessions(limit?: number): Promise<Session[]>;
   persistCommandResult?(result: StoredCommandResult): Promise<void>;
   loadCommandResult?(roomId: string, userId: string, clientSeq: number): Promise<StoredCommandResult | undefined>;
@@ -112,6 +115,7 @@ export class MemoryEventStore implements EventStore {
   }
 
   async persistMatchStart(room: Room, state: GameState): Promise<void> {
+    this.rooms.set(room.id, room);
     this.replayLogs.set(state.config.matchId, { config: state.config, board: state.board, events: [] });
   }
 
@@ -172,6 +176,11 @@ export class MemoryEventStore implements EventStore {
     return room ? this.storedRecordFromRoom(room) : undefined;
   }
 
+  async roomCodeExists(code: string): Promise<boolean> {
+    const normalizedCode = code.trim().toUpperCase();
+    return [...this.rooms.values()].some((room) => room.code === normalizedCode);
+  }
+
   private storedRecordFromRoom(room: Room): StoredRoomRecord {
     const record: StoredRoomRecord = {
       id: room.id,
@@ -187,6 +196,7 @@ export class MemoryEventStore implements EventStore {
     if (room.pausedAt) record.pausedAt = room.pausedAt;
     if (room.pauseReason) record.pauseReason = room.pauseReason;
     if (room.tradeResponseDeadlines.size > 0) record.tradeResponseDeadlines = Object.fromEntries(room.tradeResponseDeadlines);
+    if (room.timer) record.timer = room.timer;
     if (room.archivedAt) record.archivedAt = room.archivedAt;
     if (room.cleanupReason) record.cleanupReason = room.cleanupReason;
     if (room.game) {
@@ -282,6 +292,7 @@ export class PostgresEventStore implements EventStore {
       ...(room.pausedAt ? { pausedAt: room.pausedAt } : {}),
       ...(room.pauseReason ? { pauseReason: room.pauseReason } : {}),
       ...(room.tradeResponseDeadlines.size > 0 ? { tradeResponseDeadlines: Object.fromEntries(room.tradeResponseDeadlines) } : {}),
+      ...(room.timer ? { timer: room.timer } : {}),
       ...(room.archivedAt ? { archivedAt: room.archivedAt } : {}),
       ...(room.cleanupReason ? { cleanupReason: room.cleanupReason } : {}),
     });
@@ -324,6 +335,7 @@ export class PostgresEventStore implements EventStore {
       ...(room.pausedAt ? { pausedAt: room.pausedAt } : {}),
       ...(room.pauseReason ? { pauseReason: room.pauseReason } : {}),
       ...(room.tradeResponseDeadlines.size > 0 ? { tradeResponseDeadlines: Object.fromEntries(room.tradeResponseDeadlines) } : {}),
+      ...(room.timer ? { timer: room.timer } : {}),
       ...(room.archivedAt ? { archivedAt: room.archivedAt } : {}),
       ...(room.cleanupReason ? { cleanupReason: room.cleanupReason } : {}),
     };
@@ -418,6 +430,7 @@ export class PostgresEventStore implements EventStore {
         ...(record.pausedAt ? { pausedAt: record.pausedAt } : {}),
         ...(record.pauseReason ? { pauseReason: record.pauseReason as Room["pauseReason"] } : {}),
         ...(record.tradeResponseDeadlines ? { tradeResponseDeadlines: record.tradeResponseDeadlines } : {}),
+        ...(record.timer ? { timer: record.timer } : {}),
         ...(record.archivedAt ? { archivedAt: record.archivedAt } : {}),
         ...(record.cleanupReason ? { cleanupReason: record.cleanupReason } : {}),
         seats: record.seats,
@@ -451,6 +464,7 @@ export class PostgresEventStore implements EventStore {
       ...(record.pausedAt ? { pausedAt: record.pausedAt } : {}),
       ...(record.pauseReason ? { pauseReason: record.pauseReason as Room["pauseReason"] } : {}),
       ...(record.tradeResponseDeadlines ? { tradeResponseDeadlines: record.tradeResponseDeadlines } : {}),
+      ...(record.timer ? { timer: record.timer } : {}),
       ...(record.archivedAt ? { archivedAt: record.archivedAt } : {}),
       ...(record.cleanupReason ? { cleanupReason: record.cleanupReason } : {}),
       seats: record.seats,
@@ -466,6 +480,10 @@ export class PostgresEventStore implements EventStore {
       if (record.match.winnerUserId) stored.match.winnerUserId = record.match.winnerUserId;
     }
     return stored;
+  }
+
+  async roomCodeExists(code: string): Promise<boolean> {
+    return persistedRoomCodeExists(this.pool, code);
   }
 
   async loadSessions(limit?: number): Promise<Session[]> {

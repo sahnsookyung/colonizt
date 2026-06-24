@@ -104,14 +104,20 @@ ops/            Caddy/Nginx config and OCI deploy/smoke scripts.
 Colonizt keeps match truth in one authoritative runtime per active room. The browser sends commands through REST/WebSocket interfaces; the server validates them, commits accepted events, broadcasts room-local updates, and can rebuild state from replay logs.
 
 ```mermaid
-flowchart LR
-  web["React web app"] --> protocol["Shared Zod protocol"]
+flowchart TB
+  browser["Browser<br/>desktop or mobile"] --> web["React web app<br/>local play, lobby, online game, replay"]
+  web --> protocol["Shared protocol<br/>schemas, payloads, lobby readiness"]
+  web --> core["Deterministic game-core<br/>maps, rules, replay, viewer serialization"]
+  web --> bots["Bots<br/>local automation"]
   protocol --> server["Fastify REST + WebSocket server"]
-  server --> manager["RoomManager / automation"]
-  manager --> core["Deterministic game-core"]
-  core --> events["Accepted events"]
-  events --> postgres["PostgreSQL event store"]
-  server -. optional .-> redis["Redis presence/fanout"]
+  server --> manager["RoomManager<br/>rooms, seats, commands, timers"]
+  server --> scheduler["RoomAutomationScheduler<br/>bots, deadlines, cleanup"]
+  manager --> core
+  manager --> bots
+  manager --> store["EventStore<br/>memory or PostgreSQL"]
+  scheduler --> manager
+  store --> postgres["PostgreSQL<br/>rooms, leases, matches, events, command results"]
+  server -. optional .-> redis["Redis<br/>ephemeral presence only"]
 ```
 
 Current production mode is intentionally single-node authoritative room ownership. PostgreSQL is replay truth; Redis is never match truth.

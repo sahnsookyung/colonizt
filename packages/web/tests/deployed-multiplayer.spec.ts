@@ -3,8 +3,8 @@ import { expect, test } from "@playwright/test";
 test.describe("deployed multiplayer smoke", () => {
   test.skip(!process.env.PUBLIC_WEB_URL, "PUBLIC_WEB_URL is required for deployed browser smoke");
 
-  test("four browser clients join, ready, act, and reconnect through the public app", async ({ browser }) => {
-    const contexts = await Promise.all(Array.from({ length: 4 }, () => browser.newContext()));
+  test("two browser clients join, ready, go, act, and reconnect through the public app", async ({ browser }) => {
+    const contexts = await Promise.all(Array.from({ length: 2 }, () => browser.newContext()));
     const pages = await Promise.all(contexts.map((context) => context.newPage()));
     const pageA = pages[0]!;
     const peerPages = pages.slice(1);
@@ -24,10 +24,16 @@ test.describe("deployed multiplayer smoke", () => {
 
       await pageA.getByRole("button", { name: "Ready" }).click();
       for (const page of peerPages) await page.getByRole("button", { name: "Ready" }).click();
+      await expect(pageA.getByRole("button", { name: "Go" })).toBeEnabled();
+      await pageA.getByRole("button", { name: "Go" }).click();
       for (const page of pages) await expect(page.getByLabel("Game board and actions")).toBeVisible();
 
-      await pageA.getByRole("button", { name: /Place setup settlement at corner/ }).first().click();
-      await pageA.getByRole("button", { name: /Build road here/ }).first().click();
+      const setupPage = await Promise.any(pages.map(async (page) => {
+        await expect(page.getByRole("button", { name: /Place setup settlement at corner/ }).first()).toBeVisible({ timeout: 5000 });
+        return page;
+      }));
+      await setupPage.getByRole("button", { name: /Place setup settlement at corner/ }).first().click();
+      await setupPage.getByRole("button", { name: /Build road here/ }).first().click();
       for (const page of pages) await expect(page.getByLabel("Gameplay log")).toContainText(/placed/i);
 
       await peerPages[0]!.reload();

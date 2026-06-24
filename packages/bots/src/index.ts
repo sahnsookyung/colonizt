@@ -11,6 +11,8 @@ import {
   getLegalActions,
   hasResources,
   maritimeTradeRatio,
+  classicResourceBankSize,
+  normalizedResources,
   randomFloatAt,
   resourceCount,
   resources,
@@ -112,6 +114,44 @@ const estimatedDevelopmentDeckForBot = (state: GameState, botId: PlayerId): Deve
 const bundleKey = (bundle: ResourceBundle): string =>
   resources.map((resource) => `${resource}:${bundle[resource] ?? 0}`).join(",");
 
+const viewerResourceBundles = (viewer: ViewerState): { resourcesByPlayer: Record<PlayerId, ResourceBundle>; resourceBank: ResourceBundle } => {
+  const resourcesByPlayer: Record<PlayerId, ResourceBundle> = {};
+  const visibleHeld = emptyResources();
+  const hiddenPlayers: Array<{ id: PlayerId; count: number }> = [];
+
+  for (const player of viewer.players) {
+    if (player.resources) {
+      const bundle = normalizedResources(player.resources);
+      resourcesByPlayer[player.id] = bundle;
+      for (const resource of resources) visibleHeld[resource] += bundle[resource];
+    } else {
+      hiddenPlayers.push({ id: player.id, count: Math.max(0, Math.floor(player.resourceCount)) });
+    }
+  }
+
+  const remainingByResource = emptyResources();
+  for (const resource of resources) {
+    remainingByResource[resource] = Math.max(0, classicResourceBankSize - (viewer.resourceBank?.[resource] ?? 0) - visibleHeld[resource]);
+  }
+
+  for (const hidden of hiddenPlayers) {
+    const bundle = emptyResources();
+    let remainingCards = hidden.count;
+    while (remainingCards > 0) {
+      const resource = [...resources]
+        .sort((left, right) => remainingByResource[right] - remainingByResource[left] || left.localeCompare(right))
+        .find((candidate) => remainingByResource[candidate] > 0);
+      if (!resource) break;
+      bundle[resource] += 1;
+      remainingByResource[resource] -= 1;
+      remainingCards -= 1;
+    }
+    resourcesByPlayer[hidden.id] = bundle;
+  }
+
+  return { resourcesByPlayer, resourceBank: normalizedResources(viewer.resourceBank ?? emptyResources()) };
+};
+
 export const botStateFingerprint = (state: GameState, botId: PlayerId): string => {
   const playerKeys = state.playerOrder.map((playerId) => {
     const player = state.players[playerId];
@@ -146,58 +186,62 @@ export const botStateFingerprint = (state: GameState, botId: PlayerId): string =
   ].join("||");
 };
 
-const viewerToBotState = (viewer: ViewerState, seed: string, difficulty: BotDifficulty, rules: GameState["config"]["rules"]): GameState => ({
-  schemaVersion: 3,
-  config: {
-    matchId: `bot-view-${seed}`,
-    seed,
-    victoryPoints: viewer.config.victoryPoints,
-    maxPlayers: viewer.config.maxPlayers,
-    turnSeconds: viewer.config.turnSeconds,
-    playerOrder: viewer.config.playerOrder,
-    playerNames: viewer.config.playerNames,
-    playerColors: viewer.config.playerColors,
-    botDifficulty: difficulty ?? viewer.config.botDifficulty,
-    rules: {
-      ...viewer.config.rules,
-      ...rules,
-    },
-  },
-  board: viewer.board,
-  players: Object.fromEntries(viewer.players.map((player) => [
-    player.id,
-      {
-        id: player.id,
-        name: player.name,
-        color: player.color,
-        score: player.score,
-        resources: player.resources ?? emptyResources(),
-        specialCards: player.specialCards,
-        developmentCards: player.developmentCards ?? [],
-        longestRoadLength: player.longestRoadLength,
-        hasLongestRoad: player.hasLongestRoad,
-        playedKnights: player.playedKnights,
-        hasLargestArmy: player.hasLargestArmy,
-        ...(player.playedDevelopmentCardTurn !== undefined ? { playedDevelopmentCardTurn: player.playedDevelopmentCardTurn } : {}),
+const viewerToBotState = (viewer: ViewerState, seed: string, difficulty: BotDifficulty, rules: GameState["config"]["rules"]): GameState => {
+  const { resourcesByPlayer, resourceBank } = viewerResourceBundles(viewer);
+  return {
+    schemaVersion: 3,
+    config: {
+      matchId: `bot-view-${seed}`,
+      seed,
+      victoryPoints: viewer.config.victoryPoints,
+      maxPlayers: viewer.config.maxPlayers,
+      turnSeconds: viewer.config.turnSeconds,
+      playerOrder: viewer.config.playerOrder,
+      playerNames: viewer.config.playerNames,
+      playerColors: viewer.config.playerColors,
+      botDifficulty: difficulty ?? viewer.config.botDifficulty,
+      rules: {
+        ...viewer.config.rules,
+        ...rules,
       },
-  ])),
-  playerOrder: viewer.playerOrder,
-  phase: viewer.phase,
-  turn: viewer.turn,
-  roads: viewer.roads,
-  settlements: viewer.settlements,
-  buildings: viewer.buildings,
-  developmentDeck: [],
-  developmentDeckCursor: 0,
-  playedKnightCounts: Object.fromEntries(viewer.players.map((player) => [player.id, player.playedKnights])),
-  trades: Object.fromEntries(viewer.trades.map((trade) => [trade.id, trade])),
-  eventSeq: viewer.eventSeq,
-  rng: { seed, index: 0, policy: "SEEDED_DETERMINISTIC" },
-  ...(viewer.lastRoll ? { lastRoll: viewer.lastRoll } : {}),
-  ...(viewer.longestRoadOwner ? { longestRoadOwner: viewer.longestRoadOwner } : {}),
-  ...(viewer.largestArmyOwner ? { largestArmyOwner: viewer.largestArmyOwner } : {}),
-  ...(viewer.thiefHexId ? { thiefHexId: viewer.thiefHexId } : {}),
-});
+    },
+    board: viewer.board,
+    players: Object.fromEntries(viewer.players.map((player) => [
+      player.id,
+        {
+          id: player.id,
+          name: player.name,
+          color: player.color,
+          score: player.score,
+          resources: resourcesByPlayer[player.id] ?? emptyResources(),
+          specialCards: player.specialCards,
+          developmentCards: player.developmentCards ?? [],
+          longestRoadLength: player.longestRoadLength,
+          hasLongestRoad: player.hasLongestRoad,
+          playedKnights: player.playedKnights,
+          hasLargestArmy: player.hasLargestArmy,
+          ...(player.playedDevelopmentCardTurn !== undefined ? { playedDevelopmentCardTurn: player.playedDevelopmentCardTurn } : {}),
+        },
+    ])),
+    playerOrder: viewer.playerOrder,
+    resourceBank,
+    phase: viewer.phase,
+    turn: viewer.turn,
+    roads: viewer.roads,
+    settlements: viewer.settlements,
+    buildings: viewer.buildings,
+    developmentDeck: [],
+    developmentDeckCursor: 0,
+    playedKnightCounts: Object.fromEntries(viewer.players.map((player) => [player.id, player.playedKnights])),
+    trades: Object.fromEntries(viewer.trades.map((trade) => [trade.id, trade])),
+    eventSeq: viewer.eventSeq,
+    rng: { seed, index: 0, policy: "SEEDED_DETERMINISTIC" },
+    ...(viewer.lastRoll ? { lastRoll: viewer.lastRoll } : {}),
+    ...(viewer.longestRoadOwner ? { longestRoadOwner: viewer.longestRoadOwner } : {}),
+    ...(viewer.largestArmyOwner ? { largestArmyOwner: viewer.largestArmyOwner } : {}),
+    ...(viewer.thiefHexId ? { thiefHexId: viewer.thiefHexId } : {}),
+  };
+};
 
 export const createBotView = (state: GameState, botId: PlayerId, profile?: BotProfile, difficulty: BotDifficulty = state.config.botDifficulty ?? "medium"): BotView => {
   const viewer = serializeForViewer(state, botId);

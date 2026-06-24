@@ -1,14 +1,27 @@
-import { canViewerSeeTrade, publicVictoryPoints } from "./engine.js";
+import { canViewerSeeTrade, projectedResourceBank, publicVictoryPoints } from "./engine.js";
 import { emptyResources, resourceCount } from "./resources.js";
 import type { DevelopmentCard, GameEvent, GameState, PlayerId, ResourceBundle, TradeOffer, ViewerPublicConfig } from "./types.js";
+
+export interface VictoryPointBreakdown {
+  settlements: number;
+  cities: number;
+  longestRoad: number;
+  largestArmy: number;
+  otherPublic: number;
+  secret: number;
+  publicTotal: number;
+  total: number;
+}
 
 export interface SerializedPlayer {
   id: PlayerId;
   name: string;
   color: string;
   score: number;
+  publicVictoryPoints: number;
   secretVictoryPoints: number;
   visibleVictoryPoints: number;
+  victoryPointBreakdown: VictoryPointBreakdown;
   specialCards: number;
   developmentCardCount: number;
   developmentCards?: DevelopmentCard[];
@@ -40,6 +53,7 @@ export interface ViewerState {
   eventSeq: number;
   lastRoll: GameState["lastRoll"];
   developmentDeckRemaining: number;
+  resourceBank: ResourceBundle;
   tradeResponseDeadlines?: Record<string, number>;
 }
 
@@ -55,6 +69,30 @@ const withoutResponses = (trade: TradeOffer): TradeOffer => {
 const serializeTradeForViewer = (trade: TradeOffer, viewerId: PlayerId | "spectator", knownPlayerIds?: readonly PlayerId[]): TradeOffer => {
   if (canViewerSeeTradeResources(trade, viewerId, knownPlayerIds)) return trade;
   return withoutResponses({ ...trade, offered: emptyResources(), requested: emptyResources() });
+};
+
+const bankResourcesForState = (state: GameState): ResourceBundle => state.resourceBank ?? projectedResourceBank(state);
+
+const victoryBreakdownFor = (state: GameState, playerId: PlayerId, visibleSecretVictoryPoints: number): VictoryPointBreakdown => {
+  const player = state.players[playerId];
+  const buildings = Object.values(state.buildings).filter((building) => building.owner === playerId);
+  const settlements = buildings.filter((building) => building.type === "settlement").length;
+  const cities = buildings.filter((building) => building.type === "city").length * 2;
+  const longestRoad = player?.hasLongestRoad ? 2 : 0;
+  const largestArmy = player?.hasLargestArmy ? 2 : 0;
+  const knownPublic = settlements + cities + longestRoad + largestArmy;
+  const publicTotal = player?.score ?? 0;
+  const otherPublic = Math.max(0, publicTotal - knownPublic);
+  return {
+    settlements,
+    cities,
+    longestRoad,
+    largestArmy,
+    otherPublic,
+    secret: visibleSecretVictoryPoints,
+    publicTotal,
+    total: publicTotal + visibleSecretVictoryPoints,
+  };
 };
 
 export const serializeForViewer = (state: GameState, viewerId: PlayerId | "spectator"): ViewerState => ({
@@ -76,13 +114,16 @@ export const serializeForViewer = (state: GameState, viewerId: PlayerId | "spect
     const publicScore = publicVictoryPoints(state, player.id);
     const victoryPointCards = (player.developmentCards ?? []).filter((card) => card.type === "VICTORY_POINT").length;
     const visibleSecretVictoryPoints = viewerId === playerId || state.phase.type === "GAME_OVER" ? victoryPointCards : 0;
+    const publicTotal = player.score;
     return {
       id: player.id,
       name: player.name,
       color: player.color,
       score: publicScore,
+      publicVictoryPoints: publicTotal,
       secretVictoryPoints: visibleSecretVictoryPoints,
-      visibleVictoryPoints: player.score + visibleSecretVictoryPoints,
+      visibleVictoryPoints: publicTotal + visibleSecretVictoryPoints,
+      victoryPointBreakdown: victoryBreakdownFor(state, player.id, visibleSecretVictoryPoints),
       specialCards: player.specialCards,
       developmentCardCount: player.developmentCards?.filter((card) => !card.playedTurn).length ?? player.specialCards,
       ...((viewerId === playerId || state.phase.type === "GAME_OVER") ? { developmentCards: player.developmentCards ?? [] } : {}),
@@ -108,6 +149,7 @@ export const serializeForViewer = (state: GameState, viewerId: PlayerId | "spect
   eventSeq: state.eventSeq,
   lastRoll: state.lastRoll,
   developmentDeckRemaining: Math.max(0, state.developmentDeck.length - state.developmentDeckCursor),
+  resourceBank: bankResourcesForState(state),
 });
 
 export const serializeEventForViewer = (event: GameEvent, viewerId: PlayerId | "spectator", knownPlayerIds?: readonly PlayerId[], gameOver = false): GameEvent => {

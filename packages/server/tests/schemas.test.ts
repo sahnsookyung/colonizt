@@ -15,6 +15,20 @@ describe("WebSocket schemas", () => {
     expect(wsClientMessageSchema.safeParse({ type: "LEAVE_ROOM", roomId: "ABC123" }).success).toBe(true);
   });
 
+  it("accepts explicit lobby control messages", () => {
+    expect(wsClientMessageSchema.safeParse({ type: "START_ROOM", roomId: "ABC123" }).success).toBe(true);
+    expect(wsClientMessageSchema.safeParse({ type: "ADD_BOT", roomId: "ABC123" }).success).toBe(true);
+    expect(wsClientMessageSchema.safeParse({ type: "REMOVE_BOT", roomId: "ABC123", seatIndex: 2 }).success).toBe(true);
+    expect(wsClientMessageSchema.safeParse({ type: "REMOVE_BOT", roomId: "ABC123", seatIndex: -1 }).success).toBe(false);
+    expect(wsClientMessageSchema.safeParse({ type: "UPDATE_DISPLAY_NAME", displayName: "Ada" }).success).toBe(true);
+    expect(wsClientMessageSchema.safeParse({
+      type: "UPDATE_ROOM_SETTINGS",
+      roomId: "ABC123",
+      settings: { minPlayers: 2, maxPlayers: 4, botDifficulty: "hard", rules: { mapPreset: "islands" } },
+    }).success).toBe(true);
+    expect(wsClientMessageSchema.safeParse({ type: "UPDATE_ROOM_SETTINGS", roomId: "ABC123", settings: { minPlayers: 4, maxPlayers: 2 } }).success).toBe(false);
+  });
+
   it("accepts bot difficulty and optional rule room settings", () => {
     const parsed = createRoomSchema.safeParse({
       mode: "CLASSIC",

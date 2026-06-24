@@ -165,7 +165,7 @@ describe("REST routes", () => {
     expect(store.analytics[1]).toMatchObject({ eventName: "authenticated_event", userId: session.userId });
   });
 
-  it("lists match history and serves replay by room id or match id", async () => {
+  it("lists match history and withholds replay until the game is finished", async () => {
     const manager = new RoomManager();
     const session = await manager.createSession("Host");
     const room = await manager.createRoom(session, { mode: "CLASSIC", botFill: true, ranked: false });
@@ -184,10 +184,10 @@ describe("REST routes", () => {
     expect(matchResponse.statusCode).toBe(200);
     expect(matchResponse.json()).toMatchObject({ id: `match_${room.id}`, roomId: room.id });
     expect(unauthenticatedReplayResponse.statusCode).toBe(401);
-    expect(byRoomResponse.statusCode).toBe(200);
-    expect(byRoomResponse.json()).toMatchObject({ config: { matchId: `match_${room.id}` }, events: [] });
-    expect(byMatchResponse.statusCode).toBe(200);
-    expect(byMatchResponse.json()).toMatchObject({ config: { matchId: `match_${room.id}` }, events: [] });
+    expect(byRoomResponse.statusCode).toBe(409);
+    expect(byRoomResponse.json()).toMatchObject({ code: "REPLAY_NOT_READY" });
+    expect(byMatchResponse.statusCode).toBe(409);
+    expect(byMatchResponse.json()).toMatchObject({ code: "REPLAY_NOT_READY" });
   });
 
   it("creates moderation reports for seated users", async () => {
@@ -373,7 +373,7 @@ describe("REST routes", () => {
     expect(response.json()).toMatchObject({ code: "ROOM_EXPIRED", status: "EXPIRED" });
   });
 
-  it("keeps classic player rooms human-only until all four occupied seats are ready", async () => {
+  it("keeps classic player rooms human-only until all occupied seats are ready and the host starts", async () => {
     const manager = new RoomManager();
     const sessions = await Promise.all(["Host", "Guest 1", "Guest 2", "Guest 3"].map((name) => manager.createSession(name)));
     const [host, guestOne, guestTwo, guestThree] = sessions;
@@ -398,6 +398,9 @@ describe("REST routes", () => {
     const fourthReady = await manager.setReady(room.id, guestThree, true);
     expect(fourthReady.ok).toBe(true);
 
+    expect(room.status).toBe("LOBBY");
+    const started = await manager.startRoomByHost(room.id, host);
+    expect(started.ok).toBe(true);
     expect(room.status).toBe("IN_GAME");
     expect(room.game?.playerOrder).toEqual(sessions.map((session) => session.userId));
     expect(room.seats.some((seat) => seat.botId)).toBe(false);

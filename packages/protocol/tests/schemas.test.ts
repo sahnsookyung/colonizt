@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createRoomSchema, protocolVersion, wsClientMessageSchema, websocketAuthMode } from "../src/index.js";
+import { createRoomSchema, lobbyReadiness, protocolVersion, wsClientMessageSchema, websocketAuthMode } from "../src/index.js";
 
 describe("protocol schemas", () => {
   it("keeps protocol constants explicit", () => {
@@ -16,6 +16,20 @@ describe("protocol schemas", () => {
     expect(wsClientMessageSchema.safeParse({ type: "COMMAND", roomId: "r", clientSeq: 1, command: { type: "ROLL_DICE", playerId: "p1" } }).success).toBe(true);
     expect(wsClientMessageSchema.safeParse({ type: "COMMAND", roomId: "r", clientSeq: 2, command: { type: "MOVE_THIEF", playerId: "p1", hexId: "h1" } }).success).toBe(true);
     expect(wsClientMessageSchema.safeParse({ type: "COMMAND", roomId: "r", clientSeq: 3, command: { type: "PLAY_YEAR_OF_PLENTY", playerId: "p1", cardId: "c1", resources: ["grain", "ore"] } }).success).toBe(true);
+  });
+
+  it("accepts lobby control websocket messages", () => {
+    expect(wsClientMessageSchema.safeParse({ type: "START_ROOM", roomId: "ABC123" }).success).toBe(true);
+    expect(wsClientMessageSchema.safeParse({ type: "ADD_BOT", roomId: "ABC123" }).success).toBe(true);
+    expect(wsClientMessageSchema.safeParse({ type: "REMOVE_BOT", roomId: "ABC123", seatIndex: 2 }).success).toBe(true);
+    expect(wsClientMessageSchema.safeParse({ type: "REMOVE_BOT", roomId: "ABC123", seatIndex: 4 }).success).toBe(false);
+    expect(wsClientMessageSchema.safeParse({ type: "UPDATE_DISPLAY_NAME", displayName: "Ada" }).success).toBe(true);
+    expect(wsClientMessageSchema.safeParse({
+      type: "UPDATE_ROOM_SETTINGS",
+      roomId: "ABC123",
+      settings: { minPlayers: 2, maxPlayers: 4, botDifficulty: "hard", rules: { mapPreset: "continent" } },
+    }).success).toBe(true);
+    expect(wsClientMessageSchema.safeParse({ type: "UPDATE_ROOM_SETTINGS", roomId: "ABC123", settings: { minPlayers: 4, maxPlayers: 2 } }).success).toBe(false);
   });
 
   it("accepts bot difficulty and optional rule room settings", () => {
@@ -46,5 +60,22 @@ describe("protocol schemas", () => {
   it("rejects impossible player-room start thresholds", () => {
     expect(createRoomSchema.safeParse({ mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 1 }).success).toBe(false);
     expect(createRoomSchema.safeParse({ mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 5 }).success).toBe(false);
+  });
+
+  it("computes lobby readiness from connected ready humans and bots", () => {
+    const seats = [
+      { seatIndex: 0, userId: "u1", ready: true, connected: true },
+      { seatIndex: 1, userId: "u2", ready: true, connected: true },
+      { seatIndex: 2, botId: "bot_3", ready: true, connected: true },
+      { seatIndex: 3, userId: "u4", ready: false, connected: false },
+    ];
+
+    expect(lobbyReadiness(seats, 2)).toMatchObject({
+      readyCount: 3,
+      occupiedCount: 4,
+      connectedOccupiedCount: 3,
+      canStart: true,
+    });
+    expect(lobbyReadiness([{ ...seats[0]!, ready: true }, { ...seats[1]!, ready: false }], 2).canStart).toBe(false);
   });
 });

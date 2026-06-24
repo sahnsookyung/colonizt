@@ -2,6 +2,7 @@ import {
   applyCommand,
   activeCollectingTradeForPlayer,
   canBuildRoad,
+  classicResourceBankSize,
   createGame,
   createBoardForRules,
   deterministicDiscard,
@@ -114,7 +115,20 @@ const chooseSetupPlacement = (state: GameState, playerId: PlayerId): { vertexId:
 
 export const withResources = (state: GameState, playerId: PlayerId, bundle: Partial<ResourceBundle>): GameState => {
   const next = structuredClone(state) as GameState;
-  next.players[playerId]!.resources = { ...emptyResources(), ...next.players[playerId]!.resources, ...bundle };
+  next.resourceBank ??= emptyResources();
+  const player = next.players[playerId]!;
+  for (const resource of resources) {
+    if (bundle[resource] === undefined) continue;
+    const heldByOthers = Object.values(next.players).reduce((sum, candidate) => (
+      candidate.id === playerId ? sum : sum + candidate.resources[resource]
+    ), 0);
+    const previous = player.resources[resource];
+    const requested = Math.max(0, Math.floor(bundle[resource] ?? 0));
+    const capped = Math.min(requested, Math.max(0, classicResourceBankSize - heldByOthers));
+    player.resources[resource] = capped;
+    next.resourceBank[resource] = classicResourceBankSize - heldByOthers - capped;
+    if (previous === capped) continue;
+  }
   return next;
 };
 

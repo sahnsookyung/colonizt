@@ -1,12 +1,22 @@
 import { seededShuffle } from "./rng.js";
 import { resources, type GameRules, type Resource, type ResourceBundle } from "./types.js";
 
+export const classicResourceBankSize = 19;
+
 export const emptyResources = (): ResourceBundle => ({
   timber: 0,
   brick: 0,
   grain: 0,
   fiber: 0,
   ore: 0,
+});
+
+export const classicResourceBank = (): ResourceBundle => ({
+  timber: classicResourceBankSize,
+  brick: classicResourceBankSize,
+  grain: classicResourceBankSize,
+  fiber: classicResourceBankSize,
+  ore: classicResourceBankSize,
 });
 
 export const roadCost = (): ResourceBundle => ({
@@ -69,6 +79,11 @@ export const subtractResources = (left: ResourceBundle, right: ResourceBundle): 
   }
   return next;
 };
+
+export const normalizedResources = (bundle?: Partial<ResourceBundle>): ResourceBundle => ({
+  ...emptyResources(),
+  ...(bundle ?? {}),
+});
 
 export const hasResources = (left: ResourceBundle, right: ResourceBundle): boolean =>
   resources.every((resource) => left[resource] >= right[resource]);

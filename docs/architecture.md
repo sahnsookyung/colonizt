@@ -1,118 +1,282 @@
 # Architecture
 
-Colonizt is a TypeScript npm workspace for a browser-first multiplayer board game. The main split is:
+Colonizt is a TypeScript npm workspace for a browser-first multiplayer board game. The current architecture keeps the deterministic game rules independent from UI, transport, persistence, and bot scheduling, while the server owns online room authority.
 
-- `packages/game-core`: pure deterministic domain model.
-- `packages/protocol`: shared REST/WebSocket schemas, protocol constants, and public payload types.
-- `packages/server`: Fastify REST and WebSocket gateway plus authoritative room orchestration.
-- `packages/web`: React/Vite client for local play, network play, and replay viewing.
-- `packages/db`: PostgreSQL migrations and persistence helpers.
-- `packages/bots`, `packages/demo-state`, and `packages/test-utils`: reusable automation, fixtures, and simulations.
+The main packages are:
+
+- `packages/game-core`: pure deterministic domain model, board/map generation, commands, events, reducers, replay, resource bank rules, and viewer-safe serialization.
+- `packages/protocol`: shared REST/WebSocket Zod schemas, protocol constants, public payload types, and lobby readiness helpers used by both server and web.
+- `packages/server`: Fastify REST and WebSocket gateway, authoritative room orchestration, lobby state, command idempotency, automation, presence, observability, and persistence adapters.
+- `packages/web`: React/Vite client for local bot play, online lobby/gameplay, replay-after-game-over viewing, mobile UI, sounds, and local automation.
+- `packages/db`: PostgreSQL migrations and SQL helpers for sessions, rooms, leases, matches, events, command results, chat, reports, analytics, and leaderboard data.
+- `packages/bots`, `packages/demo-state`, and `packages/test-utils`: bot controllers, local/demo fixtures, deterministic scenario runners, and test helpers.
 
 ## Runtime Topology
 
 ```mermaid
-flowchart TB
-  browser["Browser player or spectator"]
-  web["packages/web<br/>React app<br/>local play, network play, replay UI"]
-  network["network.ts<br/>runtime config, REST client, ticketed WebSocket client"]
-  analytics["analytics.ts<br/>localStorage plus best-effort beacon"]
+flowchart LR
+  browser["Browser"]
 
-  server["packages/server<br/>Fastify app"]
-  routes["REST routes<br/>/config, /sessions, /rooms, /matches, /leaderboard, /analytics"]
-  ws["WebSocket route<br/>/ws?ticket=..."]
-  schemas["schemas.ts<br/>Zod input validation"]
-  protocol["packages/protocol<br/>wire schemas and protocol constants"]
-  roomManager["RoomManager<br/>sessions, rooms, seats, timers, cleanup, idempotency"]
-  scheduler["RoomAutomationScheduler<br/>turn expiry, bot ticks, cleanup lifecycle"]
-  observability["observability.ts<br/>structured logs and Prometheus metrics"]
-  presence["PresenceStore<br/>memory by default<br/>Redis when REDIS_URL is set"]
-  eventStore["EventStore interface<br/>MemoryEventStore or PostgresEventStore"]
+  subgraph client["packages/web"]
+    web["React client"]
+    localBots["Local bots"]
+  end
 
-  gameCore["packages/game-core<br/>commands, events, reducers, replay, viewer serialization"]
-  bots["packages/bots<br/>random, greedy, planner controllers"]
-  demoState["packages/demo-state<br/>demo games and bot-game fixtures"]
-  db["packages/db<br/>pg pool, migrations, SQL helpers"]
-  postgres[("PostgreSQL<br/>sessions, rooms, matches, events, command results, chat, reports, analytics")]
-  redis[("Redis optional<br/>ephemeral socket and room presence only")]
+  subgraph shared["shared packages"]
+    protocol["protocol"]
+    core["game-core"]
+    bots["bots"]
+    demo["demo-state"]
+  end
+
+  subgraph online["packages/server"]
+    server["Fastify API"]
+    rooms["RoomManager"]
+    automation["Automation"]
+  end
+
+  subgraph data["state stores"]
+    postgres[("PostgreSQL")]
+    redis[("Redis presence")]
+  end
 
   browser --> web
-  web --> network
-  web --> analytics
-  web --> gameCore
-  web --> bots
-  web --> demoState
-  network --> protocol
-  network -->|"GET /config<br/>REST: sessions, rooms, matches, replay<br/>POST /ws-tickets"| routes
-  network -->|"WebSocket: JOIN_ROOM, READY, COMMAND, CHAT, RESYNC, PING"| ws
-  analytics -->|"POST /analytics<br/>best effort"| routes
+  web --> protocol
+  web --> core
+  web --> demo
+  web --> localBots
+  localBots --> bots
+  bots --> core
 
-  server --> routes
-  server --> ws
-  routes --> schemas
-  ws --> schemas
-  schemas --> protocol
-  routes --> observability
-  ws --> observability
-  routes --> roomManager
-  ws --> roomManager
-  ws --> presence
-  scheduler --> roomManager
-  scheduler --> observability
+  web -->|"REST + WS"| server
+  server --> protocol
+  server --> rooms
+  rooms --> core
+  rooms --> bots
+  automation --> rooms
 
-  roomManager --> gameCore
-  roomManager --> bots
-  roomManager --> eventStore
-  eventStore --> db
-  db --> postgres
-  presence -. when configured .-> redis
-
-  demoState --> gameCore
-  demoState --> bots
-  bots --> gameCore
+  rooms --> postgres
+  server -. optional .-> redis
 ```
+
+This top-level diagram is intentionally coarse. The detailed module relationships are split below so generated Mermaid images stay readable instead of routing every edge through one dense canvas.
+
+## Web Client Detail
+
+```mermaid
+flowchart TB
+  app["App controller"]
+
+  subgraph ui["UI components"]
+    lobbyScreen["Lobby screen"]
+    gameUi["Game UI"]
+    options["Match options"]
+  end
+
+  subgraph network["online client"]
+    client["REST client"]
+    socket["WebSocket hook"]
+    resume["Resume state"]
+  end
+
+  subgraph local["local play"]
+    localAutomation["Local automation"]
+    replayUi["Replay projection"]
+  end
+
+  subgraph sharedClient["shared domain"]
+    protocol["protocol schemas"]
+    core["game-core"]
+    bots["bots"]
+    demo["demo-state"]
+  end
+
+  app --> lobbyScreen
+  app --> gameUi
+  app --> options
+  app --> client
+  app --> socket
+  app --> localAutomation
+  app --> replayUi
+
+  client --> protocol
+  socket --> protocol
+  lobbyScreen --> protocol
+  gameUi --> core
+  replayUi --> core
+  localAutomation --> bots
+  localAutomation --> core
+  demo --> core
+  demo --> bots
+```
+
+The web package owns screen state, local bot games, online lobby/gameplay, trade and special-card overlays, mobile HUD layout, post-game replay viewing, sounds, and analytics. It uses `protocol` for wire contracts and `game-core` for deterministic local projections; online rooms still treat the server as authoritative.
+
+## Server Runtime Detail
+
+```mermaid
+flowchart TB
+  subgraph ingress["ingress"]
+    rest["REST routes"]
+    ws["WebSocket route"]
+    tickets["WS tickets"]
+  end
+
+  subgraph authority["room authority"]
+    manager["RoomManager"]
+    lobby["lobby helpers"]
+    scheduler["Scheduler"]
+    due["DueWorkIndex"]
+    security["idempotency"]
+  end
+
+  subgraph domainServer["domain"]
+    core["game-core"]
+    bots["bots"]
+    protocol["protocol"]
+  end
+
+  subgraph stores["stores"]
+    events["EventStore"]
+    presence["PresenceStore"]
+    leases["RoomOwnership"]
+    metrics["observability"]
+  end
+
+  postgres[("PostgreSQL")]
+  redis[("Redis")]
+
+  rest --> tickets
+  rest --> manager
+  ws --> manager
+  ws --> presence
+  rest --> protocol
+  ws --> protocol
+
+  manager --> lobby
+  manager --> security
+  manager --> core
+  manager --> bots
+  manager --> events
+  manager --> leases
+  scheduler --> manager
+  scheduler --> due
+  scheduler --> metrics
+
+  events --> postgres
+  leases --> postgres
+  presence -. optional .-> redis
+```
+
+`RoomManager` owns online room authority: seats, host actions, spectators, chat, reports, accepted commands, timers, persistence, and viewer-safe broadcasts. `RoomAutomationScheduler` drives due bot actions, trade deadlines, turn expiry, and cleanup callbacks without scanning every room blindly.
 
 ## Package Dependencies
 
 ```mermaid
-flowchart LR
-  gameCore["@colonizt/game-core<br/>pure engine"]
-  protocol["@colonizt/protocol<br/>wire contracts"]
-  bots["@colonizt/bots"]
-  demoState["@colonizt/demo-state"]
-  testUtils["@colonizt/test-utils"]
-  db["@colonizt/db"]
-  server["@colonizt/server"]
-  web["@colonizt/web"]
-  scripts["scripts/*.ts<br/>smokes, simulations, replay fixtures, load tests"]
-  tests["Vitest and Playwright tests"]
+flowchart TB
+  subgraph domain["domain layer"]
+    core["@colonizt/game-core"]
+    protocol["@colonizt/protocol"]
+    bots["@colonizt/bots"]
+    demo["@colonizt/demo-state"]
+  end
 
-  protocol --> gameCore
-  bots --> gameCore
-  demoState --> gameCore
-  demoState --> bots
-  testUtils --> gameCore
-  testUtils --> bots
-  testUtils --> demoState
-  server --> gameCore
+  subgraph runtime["runtime layer"]
+    server["@colonizt/server"]
+    web["@colonizt/web"]
+    db["@colonizt/db"]
+  end
+
+  subgraph validation["validation layer"]
+    tests["Vitest and Playwright"]
+    scripts["smokes and simulations"]
+    testUtils["@colonizt/test-utils"]
+  end
+
+  protocol --> core
+  bots --> core
+  demo --> core
+  demo --> bots
+
   server --> protocol
+  server --> core
   server --> bots
   server --> db
-  web --> gameCore
+
   web --> protocol
+  web --> core
   web --> bots
-  web --> demoState
-  scripts --> gameCore
-  scripts --> testUtils
-  scripts --> db
-  scripts --> server
-  tests --> gameCore
+  web --> demo
+
+  testUtils --> core
+  testUtils --> bots
   tests --> testUtils
   tests --> server
   tests --> web
+  scripts --> testUtils
+  scripts --> server
+  scripts --> db
 ```
 
-`game-core` is the domain dependency root. It imports only local pure modules and has no React, HTTP, WebSocket, database, filesystem, wall-clock, or ambient-randomness dependencies. `protocol` depends on `game-core` for public payload types and owns the shared wire schemas used by server validation and client network code.
+`game-core` is the domain dependency root. It imports only local pure modules and has no React, HTTP, WebSocket, database, filesystem, wall-clock, or ambient-randomness dependencies. `protocol` depends on `game-core` for public payload types and owns shared schemas plus lobby readiness logic. `server` and `web` both depend on `protocol`, which keeps room settings, `mapPreset`, lobby messages, and public payload shapes aligned.
+
+## Online Lobby Lifecycle
+
+```mermaid
+sequenceDiagram
+  participant Host as Host browser
+  participant Guest as Guest browser
+  participant API as Fastify REST
+  participant WS as WebSocket gateway
+  participant Manager as RoomManager
+  participant Lobby as lobby helpers
+  participant Store as EventStore
+
+  Host->>API: POST /sessions
+  Host->>API: POST /rooms<br/>minPlayers, maxPlayers, rules, botFill false
+  API->>Manager: createRoom
+  Manager->>Store: persistRoom with short room code
+  API-->>Host: PublicRoomPayload and invite URL
+
+  Host->>API: POST /ws-tickets
+  Host->>WS: connect /ws?ticket=...
+  Host->>WS: JOIN_ROOM by public code
+  WS->>Manager: joinRoom
+  WS-->>Host: ROOM_STATE lobby with seats, settings, code
+
+  Guest->>API: POST /sessions
+  Guest->>API: POST /ws-tickets
+  Guest->>WS: JOIN_ROOM by public code
+  WS->>Manager: joinRoom
+  WS-->>Host: ROOM_STATE guest seated
+  WS-->>Guest: ROOM_STATE guest seated
+
+  Host->>WS: UPDATE_DISPLAY_NAME or UPDATE_ROOM_SETTINGS
+  WS->>Manager: update display name or settings
+  Manager->>Lobby: validate seat counts, map rules, readiness resets
+  Manager->>Store: persistRoom
+  WS-->>Host: ROOM_STATE
+  WS-->>Guest: ROOM_STATE
+
+  Host->>WS: ADD_BOT or REMOVE_BOT
+  WS->>Manager: add/remove host-controlled lobby bot
+  Manager->>Lobby: bots are connected ready seats
+  Manager->>Store: persistRoom
+  WS-->>Host: ROOM_STATE
+  WS-->>Guest: ROOM_STATE
+
+  Host->>WS: READY
+  Guest->>WS: READY
+  Host->>WS: START_ROOM Go
+  WS->>Manager: startRoomByHost
+  Manager->>Lobby: canStartLobby with connected ready humans and bots
+  Manager->>Manager: startable seats only
+  Manager->>Store: persistMatchStart
+  WS-->>Host: ROOM_STATE with viewer-safe game
+  WS-->>Guest: ROOM_STATE with viewer-safe game
+```
+
+Online rooms are still bounded to 2-4 public seats. The host can start from two connected ready players without filling every open seat, or can add lobby bots before starting. Bots added in the lobby are server-side automation seats and are not exposed as a separate public room-creation mode.
 
 ## Authoritative Command Flow
 
@@ -121,71 +285,99 @@ sequenceDiagram
   participant Client as React client
   participant API as Fastify REST
   participant Socket as Fastify WebSocket
+  participant Presence as PresenceStore
   participant Manager as RoomManager
-  participant Scheduler as RoomAutomationScheduler
   participant Core as game-core
   participant Store as EventStore
+  participant Scheduler as RoomAutomationScheduler
+  participant Bots as bot controllers
   participant DB as PostgreSQL
 
-  Client->>API: POST /sessions
-  API->>Manager: createSession(displayName)
-  Manager->>Store: persistSession
-  Store->>DB: upsert hashed session token
-  API-->>Client: session token and userId
-
-  Client->>API: POST /rooms
-  API->>Manager: createRoom(session, settings)
-  Manager->>Store: persistRoom
-  Store->>DB: upsert room and seats
-  API-->>Client: room id, code, invite URL
-
-  Client->>API: POST /ws-tickets
-  API-->>Client: short-lived single-use ticket
+  Client->>API: GET /config
+  API-->>Client: protocol version, auth mode, API/WS URLs
+  Client->>API: POST /ws-tickets with session token
+  API-->>Client: short-lived single-use WebSocket ticket
   Client->>Socket: connect /ws?ticket=...
-  Client->>Socket: JOIN_ROOM then READY
-  Socket->>Manager: joinRoom / setReady
-  Manager->>Core: createGame and create board when room can start
-  Manager->>Store: persistMatchStart
-  Store->>DB: insert match, players, room state
-  Socket-->>Client: ROOM_STATE
+  Socket->>Presence: connect and refresh socket presence
 
-  Client->>Socket: COMMAND with clientSeq
-  Socket->>Manager: submitCommand
-  Manager->>Manager: dedupe by room/user/clientSeq and command hash
+  Client->>Socket: COMMAND with clientSeq and GameCommand
+  Socket->>Manager: submitCommand(roomRef, session, clientSeq, command)
+  Manager->>Manager: claim room lease and enqueue per-room work
+  Manager->>Manager: hash command and dedupe by room, user, clientSeq
   Manager->>Core: applyCommand(previousState, command)
-  Core-->>Manager: accepted events and next state
+  Core-->>Manager: accepted GameEvent list and next GameState
   Manager->>Store: appendEvents and persistCommandResult
-  Store->>DB: insert match_events and command result
-  Manager->>Core: serializeEventsForViewer / serializeForViewer
-  Socket-->>Client: viewer-safe EVENTS plus snapshot
+  Store->>DB: insert match_events and command_results
+  Manager->>Core: serializeEventsForViewer and serializeForViewer
+  Socket-->>Client: viewer-safe EVENTS and snapshot
 
-  Scheduler->>Manager: expire turns, run due bots, cleanup rooms
-  Scheduler-->>Socket: callbacks broadcast events or close abandoned rooms
+  Scheduler->>Manager: due trade deadlines, turn expiry, bot automation, cleanup
+  Manager->>Bots: choose bot command from viewer-safe bot view
+  Bots-->>Manager: command candidate
+  Manager->>Core: applyCommand for accepted automation command
+  Manager->>Store: appendEvents
+  Scheduler-->>Socket: callback broadcasts room-local events
 ```
 
-Rejected commands are persisted with their `clientSeq` and command hash when the backing store supports command results. Replayed duplicate commands return `COMMAND_ACK`; conflicting reuse of the same sequence returns `CLIENT_SEQ_CONFLICT`.
+Rejected commands are persisted with their `clientSeq` and command hash when the backing store supports command results. Replayed duplicate commands return `COMMAND_ACK`; conflicting reuse of the same sequence returns `CLIENT_SEQ_CONFLICT`. The server serializes per room, so simultaneous rooms can progress without sharing command state or broadcasts.
+
+## Game-Core Responsibilities
+
+```mermaid
+flowchart TB
+  seed["match seed and rules"]
+  resolver["createBoardForRules<br/>standard, islands, continent"]
+  board["BoardGraph<br/>hexes, vertices, edges, ports"]
+  commands["GameCommand"]
+  reducer["applyCommand"]
+  events["GameEvent log"]
+  state["GameState"]
+  replay["replay"]
+  viewer["serializeForViewer<br/>secret resources and secret VP filtering"]
+  bank["resource bank<br/>authoritative production supply"]
+
+  seed --> resolver --> board
+  board --> state
+  commands --> reducer
+  state --> reducer
+  reducer --> events
+  reducer --> state
+  reducer --> bank
+  events --> replay --> state
+  state --> viewer
+```
+
+`game-core` owns deterministic map generation and validation for `standard`, `islands`, and `continent`, resource-bank production constraints, discard/robber/special-card rules, hidden victory-point accounting, and replay reconstruction. Online and local play both run through the same command/event model.
 
 ## Replay And Recovery
 
 ```mermaid
 flowchart TB
-  command["Accepted game commands"]
+  accepted["Accepted commands"]
   reducer["game-core applyCommand"]
   events["Ordered GameEvent log"]
-  replay["game-core replay(log)"]
-  viewer["serializeForViewer <br /> and serializeEventsForViewer"]
-  ui["React replay UI"]
-  hydrate["server startup hydrateFromStore"]
-  activeRooms["active RoomManager rooms"]
+  commandResults["command_results<br/>idempotency"]
+  roomRows["rooms<br/>code, seats, timers"]
+  snapshots["viewer snapshots"]
+  replay["game-core replay(config, board, events)"]
+  viewer["viewer-safe serialization"]
+  replayUi["React replay UI"]
+  hydrate["RoomManager hydrateFromStore"]
+  activeRooms["active in-memory rooms"]
+  leases["room_leases"]
   postgres[("PostgreSQL replay truth")]
 
-  command --> reducer --> events --> postgres
-  postgres -->|"loadReplay / loadReplayByRoomId"| replay --> viewer --> ui
-  postgres -->|"loadSessions and loadRooms"| hydrate --> activeRooms
-  events -->|"in-memory active room log"| activeRooms
+  accepted --> reducer --> events --> postgres
+  accepted --> commandResults --> postgres
+  activeRooms --> roomRows --> postgres
+  events --> snapshots
+  postgres --> replay --> viewer --> replayUi
+  postgres --> hydrate --> activeRooms
+  postgres --> leases --> activeRooms
+  events --> activeRooms
 ```
 
-PostgreSQL is durable match truth when `DATABASE_URL` is configured. The server runs migrations on startup, hydrates recent sessions and rooms, and reconstructs room game state from persisted config, board, and events. Snapshots and active room state are conveniences; ordered events remain the replay source of truth.
+PostgreSQL is durable match truth when `DATABASE_URL` is configured. The server runs migrations on startup, hydrates recent sessions and rooms, preserves public room codes, lobby seats, trade deadlines, and active turn timers, and reconstructs game state from persisted config, board, and events. Snapshots and active room state are conveniences; ordered events remain the replay source of truth.
 
 ## Persistence Model
 
@@ -195,52 +387,63 @@ erDiagram
   USERS ||--o{ ROOM_SEATS : occupies
   ROOMS ||--o{ ROOM_SEATS : has
   ROOMS ||--o| MATCHES : starts
+  ROOMS ||--o| ROOM_LEASES : claims
   MATCHES ||--o{ MATCH_PLAYERS : includes
   MATCHES ||--o{ MATCH_EVENTS : records
+  MATCHES ||--o{ MATCH_SNAPSHOTS : snapshots
   MATCHES ||--o{ COMMAND_RESULTS : dedupes
   MATCHES ||--o{ CHAT_MESSAGES : contains
   MATCHES ||--o{ REPORTS : receives
   MATCHES ||--o{ ANALYTICS_EVENTS : annotates
 ```
 
-The migrations in `packages/db/migrations` define the concrete schema. `PostgresEventStore` is the server adapter that translates room/session/match operations into the SQL helpers exported from `@colonizt/db`. `MemoryEventStore` implements the same interface for tests and no-database local runs.
+The migrations in `packages/db/migrations` define the concrete schema. `PostgresEventStore` is the server adapter that translates room/session/match operations into SQL helpers exported from `@colonizt/db`. `MemoryEventStore` implements the same interface for tests and no-database local runs. Redis presence is intentionally absent from this model because it is ephemeral socket membership, not match truth.
 
 ## Deployment Shape
 
 ```mermaid
 flowchart LR
-  subgraph Build
+  subgraph Build["Build artifacts"]
     npm["npm workspace build<br/>tsc -b plus Vite build"]
-    dockerServer["Dockerfile.server<br/>Node 22 runtime"]
-    dockerWeb["Dockerfile.web<br/>Nginx static web runtime"]
+    dockerServer["Dockerfile.server<br/>Node runtime"]
+    dockerWeb["Dockerfile.web<br/>static web runtime"]
   end
 
-  subgraph Runtime
+  subgraph Runtime["Runtime services"]
+    browser["Browser<br/>loads static app"]
     webContainer["web container<br/>serves packages/web/dist"]
     serverContainer["server container<br/>Fastify on SERVER_PORT"]
     pg[("postgres:16<br/>DATABASE_URL")]
-    optionalRedis[("redis:7 optional<br/>REDIS_URL")]
-    caddy["Caddy site snippet<br/>ops/caddy/colonizt.Caddyfile"]
+    optionalRedis[("redis optional<br/>REDIS_URL")]
+    caddy["Caddy reverse proxy<br/>ops/caddy/colonizt.Caddyfile"]
+    nginx["Nginx static config<br/>ops/nginx/default.conf"]
   end
 
   npm --> dockerServer --> serverContainer
   npm --> dockerWeb --> webContainer
-  webContainer -->|"browser requests<br /> API and WS using<br /> /config<br /> VITE fallback only"| serverContainer
-  serverContainer --> pg
-  serverContainer -. optional presence adapter .-> optionalRedis
   caddy --> webContainer
   caddy --> serverContainer
+  nginx --> webContainer
+  browser --> webContainer
+  browser -->|"GET /config<br/>REST and WS URLs"| serverContainer
+  browser -->|"WebSocket ticket then /ws"| serverContainer
+  serverContainer --> pg
+  serverContainer -. optional presence adapter .-> optionalRedis
 ```
 
-Local production-style compose starts PostgreSQL, the Fastify server, and the static web build. Redis is optional and must not be treated as authoritative match history. `INSTANCE_MODE` must be `single`; horizontal scaling active rooms would need sticky sessions or room routing because active room authority currently lives inside one `RoomManager` instance.
+Local production-style compose starts PostgreSQL, the Fastify server, and the static web build. Redis is optional and must not be treated as authoritative match history. `INSTANCE_MODE` must be `single`; active room authority currently lives inside one `RoomManager` owner guarded by memory or Postgres room leases.
 
 ## Boundary Notes
 
-- The browser can run a complete local game because `packages/web` imports `game-core`, `bots`, and `demo-state`; network rooms still use the server as the authority.
+- The browser can run a complete local bot game because `packages/web` imports `game-core`, `bots`, and `demo-state`; network rooms still use the server as the authority.
 - The server accepts player intent as commands and broadcasts only accepted, viewer-safe events and snapshots.
-- `RoomManager` owns authoritative room state: seats, spectators, pause/resume, chat, reports, command idempotency, and persistence decisions.
-- `RoomAutomationScheduler` owns recurring work: turn expiry, due bot actions, and room cleanup callbacks.
-- `observability.ts` owns structured logs, metrics counters, and the enforced single-node instance-mode guard.
+- `packages/protocol` owns shared wire contracts and lobby readiness math. Server and web should not duplicate startability rules.
+- `RoomManager` owns authoritative room state: seats, host actions, spectators, pause/resume, chat, reports, command idempotency, automation progress, and persistence decisions.
+- `lobby.ts` owns lobby settings transforms and startability; public online rooms remain bounded to 2-4 seats.
+- `RoomAutomationScheduler` owns recurring work: turn expiry, staged trade deadlines, due bot actions, and room cleanup callbacks.
+- `DueWorkIndex` keeps scheduler work scoped to due rooms rather than scanning every room blindly.
+- `observability.ts` owns structured logs, metrics counters, admin-gated metrics/leaderboard support, and the enforced single-node instance-mode guard.
 - `PresenceStore` tracks sockets and room membership only. The memory adapter is default; the Redis adapter is optional and ephemeral.
+- `RoomOwnershipStore` guards active-room ownership. Memory is used for local/no-database runs; PostgreSQL leases are used when `DATABASE_URL` is configured.
 - `packages/db` knows PostgreSQL tables but does not know Fastify, WebSocket sockets, React, or game rules.
 - `packages/test-utils` re-exports bots and demo state so tests and scripts can build deterministic scenarios without depending on the UI or server internals.

@@ -24,6 +24,8 @@ This starts PostgreSQL, the Fastify server on `http://127.0.0.1:8787`, and the s
 - `EMPTY_LOBBY_TTL_MS`: empty lobby expiry window, default `600000`.
 - `EMPTY_GAME_TTL_MS`: empty in-progress game abandonment window, default `1800000`.
 - `FINISHED_ROOM_UNLOAD_MS`: finished-room memory unload window after everyone disconnects, default `300000`.
+- `PRESENCE_STALE_MS`: socket heartbeat stale window before a player is marked disconnected, default `120000`.
+- `PRESENCE_SWEEP_INTERVAL_MS`: stale-presence sweep cadence, default `30000`.
 
 ## Operations Notes
 

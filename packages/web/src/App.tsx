@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import {
   applyCommand,
   applyEvents,
@@ -34,35 +34,46 @@ import {
   type HexId,
 } from "@colonizt/game-core";
 import { createDemoGame } from "@colonizt/demo-state";
+import type { PublicRoomPayload } from "@colonizt/protocol";
 import { platform, track } from "./analytics.js";
 import {
   BoardHousePiece,
   BoardIcon,
+  BotSymbol,
+  CardsSymbol,
+  DevelopmentCardIcon,
   DicePanel,
   EndTurnSymbol,
   EventLine,
   HouseSymbol,
+  HumanSymbol,
+  KnightStatSymbol,
   ResourceCard,
+  RobberSymbol,
   RoadSymbol,
+  RoadStatSymbol,
   SpecialSymbol,
   TradeBundle,
   TradeResourceButton,
   TradeSymbol,
+  VictoryPointStatSymbol,
   formatCost,
   formatTimer,
   resourceLabels,
   terrainLabels,
 } from "./components/game-ui.js";
+import { LobbyScreen, type LobbySettingsInput } from "./components/lobby-screen.js";
 import { useLocalAutomation } from "./hooks/useLocalAutomation.js";
 import { useNetworkRoom } from "./hooks/useNetworkRoom.js";
 import { useSyncedRef } from "./hooks/useSyncedRef.js";
 import { useTradeDraft } from "./hooks/useTradeDraft.js";
 import { useTurnTimer } from "./hooks/useTurnTimer.js";
+import { defaultMatchOptions, mapPresetLabels, onlineRoomCapacityText, toPlayerCount, type MatchOptions } from "./match-options.js";
 import { createNetworkClient } from "./network.js";
+import { replayAtIndex, type ReplayLogState } from "./replay-state.js";
 import { clearResumeState, readResumeState, writeResumeState } from "./resume.js";
 import { playSound, playSoundForEvents } from "./sounds.js";
 import { normalizeTradeDraft, type TradeDraft } from "./trade-draft.js";
-import type { PublicRoomPayload } from "@colonizt/protocol";
 
 const diceAnimationMs = 820;
 const rollDeadlineMs = 60_000;
@@ -70,41 +81,12 @@ const actionDeadlineMs = 240_000;
 
 type BuildMode = "road" | "settlement" | "city";
 type AppScreen = "setup" | "localGame" | "onlineLobby" | "onlineGame";
+type GameOverTab = "overview" | "dice" | "resources" | "development";
 type SpecialBoardMode =
   | { type: "roadBuilding"; cardId: string }
-  | { type: "knight"; cardId: string };
-
-interface MatchOptions {
-  botDifficulty: BotDifficulty;
-  playerCount: 2 | 3 | 4;
-  rules: {
-    diceDoubles: boolean;
-    plight: boolean;
-    plightTurn: number;
-    mapRandomized: boolean;
-    mapPreset: MapPreset;
-    specialCardCostRandomized: boolean;
-  };
-}
-
-const defaultMatchOptions: MatchOptions = {
-  botDifficulty: "medium",
-  playerCount: 4,
-  rules: {
-    diceDoubles: false,
-    plight: false,
-    plightTurn: 20,
-    mapRandomized: true,
-    mapPreset: "standard",
-    specialCardCostRandomized: false,
-  },
-};
-
-const mapPresetLabels: Record<MapPreset, string> = {
-  standard: "Standard",
-  islands: "Islands",
-  continent: "Continent",
-};
+  | { type: "knight"; cardId: string }
+  | { type: "monopoly"; cardId: string }
+  | { type: "yearOfPlenty"; cardId: string };
 
 const developmentCardLabels: Record<DevelopmentCard["type"], string> = {
   KNIGHT: "Knight",
@@ -114,12 +96,38 @@ const developmentCardLabels: Record<DevelopmentCard["type"], string> = {
   VICTORY_POINT: "Victory Point",
 };
 
+const developmentCardShortLabels: Record<DevelopmentCard["type"], string> = {
+  KNIGHT: "Knight",
+  ROAD_BUILDING: "Roads",
+  MONOPOLY: "Monopoly",
+  YEAR_OF_PLENTY: "Plenty",
+  VICTORY_POINT: "+1 VP",
+};
+
+const developmentCardTypes: DevelopmentCard["type"][] = ["KNIGHT", "VICTORY_POINT", "MONOPOLY", "YEAR_OF_PLENTY", "ROAD_BUILDING"];
+
+const gameOverTabs: Array<{ id: GameOverTab; label: string }> = [
+  { id: "overview", label: "Overview" },
+  { id: "dice", label: "Dice Stats" },
+  { id: "resources", label: "Resource Cards" },
+  { id: "development", label: "Development Cards" },
+];
+
+const confettiColors = ["#22c55e", "#f97316", "#f43f5e", "#3b82f6", "#facc15", "#14b8a6", "#8b5cf6"];
+const confettiPieces = Array.from({ length: 42 }, (_, index) => ({
+  left: `${(index * 23 + 7) % 100}%`,
+  delay: `${-(index % 11) * 0.22}s`,
+  duration: `${2.4 + (index % 6) * 0.22}s`,
+  rotate: `${(index * 31) % 360}deg`,
+  color: confettiColors[index % confettiColors.length]!,
+}));
+
 const victoryPointText = (player: ViewerState["players"][number], compact = false): string => {
   const secret = player.secretVictoryPoints ?? 0;
   const total = player.visibleVictoryPoints ?? player.score;
-  if (secret <= 0) return compact ? `${total}VP` : `${total} VP`;
-  const publicPoints = Math.max(0, total - secret);
-  return compact ? `(${publicPoints}+${secret})VP` : `(${publicPoints}+${secret}) VP`;
+  const publicPoints = player.publicVictoryPoints ?? Math.max(0, total - secret);
+  if (secret <= 0 || total === publicPoints) return compact ? `${total}VP` : `${total} VP`;
+  return compact ? `${publicPoints}(${total})VP` : `${publicPoints} (${total}) VP`;
 };
 
 const victoryPointAria = (player: ViewerState["players"][number]): string => {
@@ -193,7 +201,7 @@ const viewerToGameState = (viewer: ViewerState, seed: string, configOverrides: P
         id: player.id,
         name: player.name,
         color: player.color,
-        score: player.score,
+        score: player.publicVictoryPoints ?? player.score,
         resources: player.resources ?? emptyResources(),
         specialCards: player.specialCards,
         developmentCards: player.developmentCards ?? [],
@@ -205,6 +213,7 @@ const viewerToGameState = (viewer: ViewerState, seed: string, configOverrides: P
       },
     ])),
     playerOrder: viewer.playerOrder,
+    resourceBank: viewer.resourceBank,
     phase: viewer.phase,
     turn: viewer.turn,
     roads: viewer.roads,
@@ -269,6 +278,7 @@ const applyEventsToViewer = (
   const projected = serializeForViewer(applyEvents(viewerToGameState(viewer, seed, configOverrides), events), viewerId);
   return {
     ...projected,
+    resourceBank: viewer.resourceBank ?? projected.resourceBank,
     players: projected.players.map((player) => {
       if (player.resources) return player;
       const previous = viewer.players.find((candidate) => candidate.id === player.id);
@@ -293,17 +303,27 @@ const networkErrorMessage = (input: unknown): string => {
       return "Room is full";
     case "ROOM_PAUSED":
       return "Room is paused";
+    case "REPLAY_NOT_READY":
+      return "Replay is available after the game is finished";
+    case "REPLAY_FORBIDDEN":
+      return "Replay is only available to players in this match";
+    case "REPLAY_NOT_FOUND":
+      return "Replay not found";
     case "RATE_LIMITED":
       return "Too many attempts. Try again shortly.";
     case "UNAUTHORIZED":
       return "Session expired";
     default:
-      return input instanceof Error ? input.message : code || "Online action failed";
+      if (input instanceof Error) return input.message;
+      if (typeof input === "object" && input && "message" in input && typeof (input as { message?: unknown }).message === "string") {
+        return (input as { message: string }).message;
+      }
+      return code || "Online action failed";
   }
 };
 
 export const App = () => {
-  const [state, setState] = useState<GameState>(() => createDemoGame("web-local"));
+  const [liveState, setLiveState] = useState<GameState>(() => createDemoGame("web-local"));
   const [events, setEvents] = useState<GameEvent[]>([]);
   const [serverViewer, setServerViewer] = useState<ViewerState | null>(null);
   const [appScreen, setAppScreen] = useState<AppScreen>("setup");
@@ -311,8 +331,11 @@ export const App = () => {
   const [selectedVertex, setSelectedVertex] = useState<VertexId | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [joinCode, setJoinCode] = useState("");
+  const [playerDisplayName, setPlayerDisplayName] = useState("Player");
+  const [replayLog, setReplayLog] = useState<ReplayLogState | null>(null);
+  const [replayIndex, setReplayIndex] = useState<number | null>(null);
   const [networkRoom, setNetworkRoom] = useState<PublicRoomPayload | null>(null);
-  const [lobbyReadyPending, setLobbyReadyPending] = useState(false);
+  const [lobbyPending, setLobbyPending] = useState({ ready: false, settings: false, start: false, name: false });
   const [networkSocketOpen, setNetworkSocketOpen] = useState(false);
   const { tradeOffer, setTradeOffer, tradeRequest, setTradeRequest, tradeOpen, setTradeOpen, setTradeDraft, clearTradeDraft } = useTradeDraft();
   const [selectedTradeResponder, setSelectedTradeResponder] = useState<PlayerId | null>(null);
@@ -321,7 +344,9 @@ export const App = () => {
   const [discardDraft, setDiscardDraft] = useState<ResourceBundle>(() => emptyResources());
   const [roadBuildingDraft, setRoadBuildingDraft] = useState<{ cardId: string; edgeIds: EdgeId[] }>(() => ({ cardId: "", edgeIds: [] }));
   const [specialBoardMode, setSpecialBoardMode] = useState<SpecialBoardMode | null>(null);
+  const [robberTargetHexId, setRobberTargetHexId] = useState<HexId | null>(null);
   const [yearOfPlentyDraft, setYearOfPlentyDraft] = useState<[Resource, Resource]>(["grain", "ore"]);
+  const [gameOverTab, setGameOverTab] = useState<GameOverTab>("overview");
   const [matchOptions, setMatchOptions] = useState<MatchOptions>(defaultMatchOptions);
   const [pendingSetupVertex, setPendingSetupVertex] = useState<VertexId | null>(null);
   const [diceAnimating, setDiceAnimating] = useState(false);
@@ -348,15 +373,36 @@ export const App = () => {
   } = useNetworkRoom();
   const matchMenuOpen = appScreen === "setup";
   const isPlayableScreen = appScreen === "localGame" || appScreen === "onlineGame";
-  const stateRef = useSyncedRef(state);
+  const isReplaying = replayIndex !== null && replayLog !== null;
+  const replayState = useMemo(
+    () => (isReplaying && replayLog ? replayAtIndex(replayLog, replayIndex ?? replayLog.events.length) : null),
+    [isReplaying, replayIndex, replayLog],
+  );
+  const state = replayState ?? liveState;
+  const visibleEvents = replayLog && replayIndex !== null ? replayLog.events.slice(0, replayIndex) : events;
+  const stateRef = useSyncedRef(liveState);
   const eventsRef = useSyncedRef(events);
   const networkRoomInfoRef = useSyncedRef(networkRoomInfo);
   const initialOnlineConnectRef = useRef(false);
   const networkGenerationRef = useRef(0);
-  const soundCursorRef = useRef<{ matchId: string; seq: number; initialized: boolean }>({ matchId: state.config.matchId, seq: 0, initialized: false });
+  const hydratedFinishedReplayRef = useRef<string | null>(null);
+  const soundCursorRef = useRef<{ matchId: string; seq: number; initialized: boolean }>({ matchId: liveState.config.matchId, seq: 0, initialized: false });
 
   const humanPlayerId = networkSession?.userId ?? "p1";
-  const viewer = serverViewer ?? serializeForViewer(state, humanPlayerId);
+  const liveViewer = serverViewer ?? serializeForViewer(liveState, humanPlayerId);
+  const viewer = replayState ? serializeForViewer(replayState, humanPlayerId) : liveViewer;
+  const botPlayerIds = useMemo(() => {
+    const ids = new Set<PlayerId>();
+    for (const seat of networkRoom?.seats ?? []) {
+      if (seat.botId) ids.add(seat.botId);
+    }
+    if (appScreen === "localGame") {
+      for (const playerId of state.config.playerOrder) {
+        if (playerId !== humanPlayerId) ids.add(playerId);
+      }
+    }
+    return ids;
+  }, [appScreen, humanPlayerId, networkRoom?.seats, state.config.playerOrder]);
   const legal = getLegalActions(state, humanPlayerId);
   const setupVertices = new Set(legal.find((action) => action.type === "PLACE_SETUP")?.vertices ?? []);
   const setupRoadEdges = pendingSetupVertex && state.phase.type === "SETUP_PLACEMENT"
@@ -378,7 +424,7 @@ export const App = () => {
   const selectedMaritimeTrade = bankOfferResource && bankRequestResource
     ? maritimeTrades.find((trade) => trade.offered === bankOfferResource && trade.requested === bankRequestResource)
     : undefined;
-  const latestRollEvent = [...events].reverse().find((event) => event.type === "DICE_ROLLED");
+  const latestRollEvent = [...visibleEvents].reverse().find((event) => event.type === "DICE_ROLLED");
   const latestRollKey = latestRollEvent?.type === "DICE_ROLLED"
     ? `${latestRollEvent.seq}:${latestRollEvent.dice.join("-")}`
     : state.lastRoll
@@ -396,6 +442,25 @@ export const App = () => {
   const playRoadBuildingAction = legal.find((action) => action.type === "PLAY_ROAD_BUILDING");
   const playMonopolyAction = legal.find((action) => action.type === "PLAY_MONOPOLY");
   const playYearOfPlentyAction = legal.find((action) => action.type === "PLAY_YEAR_OF_PLENTY");
+  const settlementVerticesAvailable = legal.find((action) => action.type === "BUILD_SETTLEMENT")?.vertices ?? [];
+  const cityVerticesAvailable = legal.find((action) => action.type === "UPGRADE_CITY")?.vertices ?? [];
+  const yearOfPlentyResources = playYearOfPlentyAction?.type === "PLAY_YEAR_OF_PLENTY" ? playYearOfPlentyAction.resources : [];
+  const yearOfPlentyOptions = (otherPick?: Resource): Resource[] =>
+    yearOfPlentyResources.filter((resource) => (state.resourceBank?.[resource] ?? 0) > (otherPick === resource ? 1 : 0));
+  const yearOfPlentyFirstOptions = yearOfPlentyResources;
+  const selectedYearOfPlentyFirst = yearOfPlentyFirstOptions.includes(yearOfPlentyDraft[0])
+    ? yearOfPlentyDraft[0]
+    : yearOfPlentyFirstOptions[0] ?? yearOfPlentyResources[0] ?? "timber";
+  const yearOfPlentySecondOptions = yearOfPlentyOptions(selectedYearOfPlentyFirst);
+  const selectedYearOfPlentySecond = yearOfPlentySecondOptions.includes(yearOfPlentyDraft[1])
+    ? yearOfPlentyDraft[1]
+    : yearOfPlentySecondOptions[0] ?? yearOfPlentyResources[0] ?? "timber";
+  const selectedYearOfPlentyDraft: [Resource, Resource] = [selectedYearOfPlentyFirst, selectedYearOfPlentySecond];
+  const canTakeYearOfPlenty = yearOfPlentyResources.length > 0 && hasResources(state.resourceBank, {
+    ...emptyResources(),
+    [selectedYearOfPlentyFirst]: (selectedYearOfPlentyFirst === selectedYearOfPlentySecond ? 2 : 1),
+    [selectedYearOfPlentySecond]: selectedYearOfPlentyFirst === selectedYearOfPlentySecond ? 2 : 1,
+  });
   const roadBuildingOptions = playRoadBuildingAction?.type === "PLAY_ROAD_BUILDING" ? playRoadBuildingAction.options : [];
   const roadBuildingRequiredCount = playRoadBuildingAction?.type === "PLAY_ROAD_BUILDING" ? playRoadBuildingAction.requiredRoadCount : 0;
   const activeRoadBuildingCardId = specialBoardMode?.type === "roadBuilding"
@@ -410,6 +475,16 @@ export const App = () => {
   const activeKnightCardId = specialBoardMode?.type === "knight"
     && playKnightAction?.type === "PLAY_KNIGHT"
     && playKnightAction.cardIds.includes(specialBoardMode.cardId)
+    ? specialBoardMode.cardId
+    : undefined;
+  const activeMonopolyCardId = specialBoardMode?.type === "monopoly"
+    && playMonopolyAction?.type === "PLAY_MONOPOLY"
+    && playMonopolyAction.cardIds.includes(specialBoardMode.cardId)
+    ? specialBoardMode.cardId
+    : undefined;
+  const activeYearOfPlentyCardId = specialBoardMode?.type === "yearOfPlenty"
+    && playYearOfPlentyAction?.type === "PLAY_YEAR_OF_PLENTY"
+    && playYearOfPlentyAction.cardIds.includes(specialBoardMode.cardId)
     ? specialBoardMode.cardId
     : undefined;
   const viewerPlayer = (playerId: PlayerId) => viewer.players.find((player) => player.id === playerId);
@@ -432,12 +507,14 @@ export const App = () => {
     ...(moveThiefAction?.type === "MOVE_THIEF" ? moveThiefAction.hexes : []),
     ...(activeKnightCardId && playKnightAction?.type === "PLAY_KNIGHT" ? playKnightAction.hexes : []),
   ]);
+  const selectedRobberHex = robberTargetHexId && legalThiefHexes.has(robberTargetHexId) ? state.board.hexes[robberTargetHexId] : undefined;
+  const selectedRobberTargets = selectedRobberHex ? visibleStealTargets(selectedRobberHex.id) : [];
   const legalRoads = new Set(state.phase.type === "SETUP_PLACEMENT" ? setupRoadEdges : activeRoadBuildingCardId ? roadBuildingCandidateEdges : buildMode === "road" ? actionRoadEdges : []);
   const legalSettlements = new Set([
     ...(state.phase.type === "SETUP_PLACEMENT" && !pendingSetupVertex ? [...setupVertices] : []),
-    ...(state.phase.type === "ACTION_PHASE" && buildMode === "settlement" ? legal.find((action) => action.type === "BUILD_SETTLEMENT")?.vertices ?? [] : []),
+    ...(state.phase.type === "ACTION_PHASE" && buildMode === "settlement" ? settlementVerticesAvailable : []),
   ]);
-  const legalCities = new Set(state.phase.type === "ACTION_PHASE" && buildMode === "city" ? legal.find((action) => action.type === "UPGRADE_CITY")?.vertices ?? [] : []);
+  const legalCities = new Set(state.phase.type === "ACTION_PHASE" && buildMode === "city" ? cityVerticesAvailable : []);
   const ownDevelopmentCards = humanPlayer?.developmentCards ?? [];
   const canSubmitDiscard = discardAction?.type === "DISCARD_RESOURCES"
     && resourceCount(discardDraft) === discardAction.count
@@ -451,6 +528,80 @@ export const App = () => {
     state.config.rules?.plight ? `Plight turn ${state.config.rules.plightTurn ?? 20}` : undefined,
     state.config.rules?.specialCardCostRandomized ? "Random special cost" : undefined,
   ].filter((rule): rule is string => Boolean(rule));
+  const displayPlayers = useMemo(() => viewer.players.map((player) => {
+    if (player.id === humanPlayerId || state.phase.type === "GAME_OVER") return player;
+    const publicPoints = player.publicVictoryPoints ?? Math.max(0, (player.visibleVictoryPoints ?? player.score) - (player.secretVictoryPoints ?? 0));
+    return {
+      ...player,
+      score: publicPoints,
+      secretVictoryPoints: 0,
+      visibleVictoryPoints: publicPoints,
+      victoryPointBreakdown: {
+        ...player.victoryPointBreakdown,
+        secret: 0,
+        total: publicPoints,
+      },
+    };
+  }), [humanPlayerId, state.phase.type, viewer.players]);
+  const rankedPlayers = useMemo(
+    () => [...displayPlayers].sort((left, right) =>
+      (right.visibleVictoryPoints ?? right.score) - (left.visibleVictoryPoints ?? left.score)
+      || state.playerOrder.indexOf(left.id) - state.playerOrder.indexOf(right.id),
+    ),
+    [displayPlayers, state.playerOrder],
+  );
+  const victoryCategoryMaxima = useMemo(() => {
+    const maxima = { settlements: 0, cities: 0, longestRoad: 0, largestArmy: 0, secret: 0, otherPublic: 0 };
+    for (const player of rankedPlayers) {
+      const breakdown = player.victoryPointBreakdown;
+      maxima.settlements = Math.max(maxima.settlements, breakdown?.settlements ?? 0);
+      maxima.cities = Math.max(maxima.cities, breakdown?.cities ?? 0);
+      maxima.longestRoad = Math.max(maxima.longestRoad, breakdown?.longestRoad ?? 0);
+      maxima.largestArmy = Math.max(maxima.largestArmy, breakdown?.largestArmy ?? 0);
+      maxima.secret = Math.max(maxima.secret, breakdown?.secret ?? 0);
+      maxima.otherPublic = Math.max(maxima.otherPublic, breakdown?.otherPublic ?? 0);
+    }
+    return maxima;
+  }, [rankedPlayers]);
+  const diceStats = useMemo(() => {
+    const counts = Object.fromEntries(Array.from({ length: 11 }, (_, index) => [index + 2, 0])) as Record<number, number>;
+    for (const event of visibleEvents) {
+      if (event.type === "DICE_ROLLED") counts[event.sum] = (counts[event.sum] ?? 0) + 1;
+    }
+    return Object.entries(counts).map(([sum, count]) => ({ sum: Number(sum), count }));
+  }, [visibleEvents]);
+  const resourceDrawStats = useMemo(() => {
+    const totals = emptyResources();
+    const add = (bundle?: Partial<ResourceBundle>) => {
+      if (!bundle) return;
+      for (const resource of resources) totals[resource] += bundle[resource] ?? 0;
+    };
+    for (const event of visibleEvents) {
+      if (event.type === "RESOURCES_PRODUCED") Object.values(event.gains).forEach(add);
+      if (event.type === "SETUP_PLACED") add(event.startingResources);
+      if (event.type === "YEAR_OF_PLENTY_PLAYED") {
+        for (const resource of event.resources) totals[resource] += 1;
+      }
+      if (event.type === "MONOPOLY_PLAYED") totals[event.resource] += Object.values(event.collected).reduce((sum, count) => sum + count, 0);
+      if (event.type === "MARITIME_TRADED") totals[event.requested] += 1;
+      if (event.type === "TRADE_ACCEPTED") {
+        add(event.offered);
+        add(event.requested);
+      }
+      if (event.type === "THIEF_MOVED" && event.stolenResource) totals[event.stolenResource] += 1;
+    }
+    return resources.map((resource) => ({ resource, count: totals[resource] }));
+  }, [visibleEvents]);
+  const developmentDrawStats = useMemo(() => {
+    const counts = Object.fromEntries(developmentCardTypes.map((type) => [type, 0])) as Record<DevelopmentCard["type"], number>;
+    for (const event of visibleEvents) {
+      if (event.type === "SPECIAL_CARD_BOUGHT" && event.cardType && event.cardType in counts) counts[event.cardType] += 1;
+    }
+    return developmentCardTypes.map((type) => ({ type, count: counts[type] }));
+  }, [visibleEvents]);
+  const maxDiceCount = Math.max(1, ...diceStats.map((stat) => stat.count));
+  const maxResourceDrawCount = Math.max(1, ...resourceDrawStats.map((stat) => stat.count));
+  const maxDevelopmentDrawCount = Math.max(1, ...developmentDrawStats.map((stat) => stat.count));
   const stagedTrades = Object.values(state.trades)
     .filter((trade) => trade.status === "COLLECTING_RESPONSES")
     .filter((trade) => trade.fromPlayerId === humanPlayerId || trade.recipients === "ANY" || trade.recipients.includes(humanPlayerId));
@@ -468,13 +619,32 @@ export const App = () => {
     activeStagedTrade
     && selectedTradeResponder
     && activeStagedTrade.responses?.[selectedTradeResponder]?.status === "WANTS_ACCEPT"
-    && hasResources(state.players[selectedTradeResponder]?.resources ?? emptyResources(), activeStagedTrade.requested)
+    && (appScreen === "onlineGame" || hasResources(state.players[selectedTradeResponder]?.resources ?? emptyResources(), activeStagedTrade.requested))
     && hasResources(state.players[activeStagedTrade.fromPlayerId]?.resources ?? emptyResources(), activeStagedTrade.offered),
   );
   const showTradePanel = (tradeOpen && discardAction?.type !== "DISCARD_RESOURCES") || Boolean(activeStagedTrade);
-  const canUpgradeCity = legalCities.size > 0;
-  const canBuildSettlement = (legal.find((action) => action.type === "BUILD_SETTLEMENT")?.vertices.length ?? 0) > 0;
+  const canUpgradeCity = cityVerticesAvailable.length > 0;
+  const canBuildSettlement = settlementVerticesAvailable.length > 0;
   const canBuildRoadAction = actionRoadEdges.length > 0;
+  const actionBuildReason = (mode: BuildMode): string | undefined => {
+    if (state.phase.type === "GAME_OVER") return "The game is over.";
+    if (state.phase.type !== "ACTION_PHASE") return "Available during your action phase.";
+    if (!isHumanActive) return `${activeName ?? "Another player"} is taking a turn.`;
+    if (!humanPlayer) return "Player hand is unavailable.";
+    if (mode === "road") {
+      if (!hasResources(humanPlayer.resources, roadCost())) return `Need ${formatCost(roadCost())}.`;
+      return "No legal road edges. Build from your road network.";
+    }
+    if (mode === "settlement") {
+      if (!hasResources(humanPlayer.resources, settlementCost())) return `Need ${formatCost(settlementCost())}.`;
+      return "No legal settlement corners. Keep distance from other houses and connect to your road.";
+    }
+    if (!hasResources(humanPlayer.resources, cityCost())) return `Need ${formatCost(cityCost())}.`;
+    if (!Object.values(state.buildings).some((building) => building.owner === humanPlayerId && building.type === "settlement")) {
+      return "No settlements available to upgrade.";
+    }
+    return "No legal city upgrades are currently available.";
+  };
   const isWaitingForHumanTurn = state.phase.type !== "GAME_OVER" && !isHumanActive;
   const endTurnButtonLabel = isWaitingForHumanTurn ? "Waiting" : "End Turn";
   const setupSettlementActive = state.phase.type === "SETUP_PLACEMENT" && isHumanActive && !pendingSetupVertex;
@@ -484,8 +654,10 @@ export const App = () => {
     if (state.phase.type === "DISCARDING") return { title: "Discard", detail: `Choose ${discardAction?.type === "DISCARD_RESOURCES" ? discardAction.count : 0} resources.` };
     if (state.phase.type === "MOVING_THIEF") return { title: "Move robber", detail: "Choose a destination and steal target if available." };
     if (!isHumanActive) return { title: "Waiting", detail: `${activeName ?? "Opponent"} is taking a turn.` };
-    if (activeKnightCardId) return { title: "Play Knight", detail: "Choose a robber destination, then select a victim badge if available." };
+    if (activeKnightCardId) return { title: "Play Knight", detail: "Choose a robber destination, then choose who to steal from if available." };
     if (activeRoadBuildingCardId) return { title: "Road Building", detail: `Choose ${roadBuildingRequiredCount - roadBuildingSelectedEdges.length} free road${roadBuildingRequiredCount - roadBuildingSelectedEdges.length === 1 ? "" : "s"} on glowing edges.` };
+    if (activeMonopolyCardId) return { title: "Monopoly", detail: "Choose one resource type to collect from every opponent." };
+    if (activeYearOfPlentyCardId) return { title: "Year of Plenty", detail: "Choose two resources from the bank." };
     if (activeStagedTrade?.fromPlayerId === humanPlayerId) return { title: "Choose trade partner", detail: "Pick a player who wants to accept, or cancel the offer." };
     if (activeStagedTrade) return { title: "Answer trade", detail: "Mark whether you want to accept before the offer expires." };
     if (state.phase.type === "SETUP_PLACEMENT" && pendingSetupVertex) return { title: "Place setup road", detail: "Pick a glowing brown edge attached to the new settlement." };
@@ -502,6 +674,19 @@ export const App = () => {
     const player = targetState.players[humanPlayerId];
     return normalizeTradeDraft({ offer, request }, player?.resources ?? emptyResources(), bankRatiosForState(targetState, humanPlayerId));
   };
+
+  useEffect(() => {
+    if (state.phase.type !== "ACTION_PHASE") return;
+    if (buildMode === "city" && !canUpgradeCity) {
+      setSelectedVertex(null);
+      setBuildMode(canBuildRoadAction ? "road" : canBuildSettlement ? "settlement" : "road");
+    } else if (buildMode === "settlement" && !canBuildSettlement) {
+      setSelectedVertex(null);
+      setBuildMode(canBuildRoadAction ? "road" : canUpgradeCity ? "city" : "road");
+    } else if (buildMode === "road" && !canBuildRoadAction) {
+      setSelectedEdge(null);
+    }
+  }, [buildMode, canBuildRoadAction, canBuildSettlement, canUpgradeCity, state.phase.type]);
 
   const setBotDifficulty = (botDifficulty: BotDifficulty) => {
     setMatchOptions((current) => ({ ...current, botDifficulty }));
@@ -539,7 +724,7 @@ export const App = () => {
       return result;
     }
     stateRef.current = result.state;
-    setState(result.state);
+      setLiveState(result.state);
     setServerViewer(null);
     const nextEvents = [...eventsRef.current, ...result.events];
     eventsRef.current = nextEvents;
@@ -549,6 +734,7 @@ export const App = () => {
     if (command.type === "PLAY_ROAD_BUILDING" || command.type === "PLAY_KNIGHT" || command.type === "MOVE_THIEF") {
       setSpecialBoardMode(null);
       setRoadBuildingDraft({ cardId: "", edgeIds: [] });
+      setRobberTargetHexId(null);
     }
     if (command.type === "MARITIME_TRADE" || command.type === "OFFER_TRADE") {
       clearTradeDraft();
@@ -561,8 +747,8 @@ export const App = () => {
 
   const applyLocalCommandRef = useSyncedRef(applyLocalCommand);
   const { clearAutomationTimers } = useLocalAutomation({
-    enabled: appScreen === "localGame" && !networkRoomId,
-    state,
+    enabled: appScreen === "localGame" && !networkRoomId && !isReplaying,
+    state: liveState,
     events,
     activePlayer,
     humanPlayerId,
@@ -576,6 +762,10 @@ export const App = () => {
 
   const commit = (command: GameCommand) => {
     const started = performance.now();
+    if (isReplaying) {
+      setError("Exit replay before taking game actions");
+      return;
+    }
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN && networkRoomId) {
       createNetworkClient().sendCommand(socketRef.current, networkRoomId, clientSeqRef.current, command);
       markCommandPending();
@@ -585,6 +775,7 @@ export const App = () => {
       if (command.type === "PLAY_ROAD_BUILDING" || command.type === "PLAY_KNIGHT" || command.type === "MOVE_THIEF") {
         setSpecialBoardMode(null);
         setRoadBuildingDraft({ cardId: "", edgeIds: [] });
+        setRobberTargetHexId(null);
       }
       if (command.type === "MARITIME_TRADE" || command.type === "OFFER_TRADE") {
         clearTradeDraft();
@@ -599,9 +790,9 @@ export const App = () => {
   };
 
   const { nowMs, turnDeadline } = useTurnTimer({
-    state,
+    state: liveState,
     activePlayer,
-    paused: !isPlayableScreen,
+    paused: !isPlayableScreen || isReplaying,
     networkRoomId,
     serverTimer: networkRoom?.timer ?? networkRoomInfo?.timer ?? null,
     rollDeadlineMs,
@@ -652,6 +843,7 @@ export const App = () => {
 
   const handleBoardClick = () => {
     if (pendingSetupVertex) cancelPendingSetupPlacement();
+    if (robberTargetHexId) setRobberTargetHexId(null);
   };
 
   const handleVertex = (vertexId: VertexId) => {
@@ -737,7 +929,7 @@ export const App = () => {
     setNetworkRoomId(null);
     setNetworkRoomInfo(null);
     setNetworkRoom(null);
-    setLobbyReadyPending(false);
+    setLobbyPending({ ready: false, settings: false, start: false, name: false });
     setNetworkSocketOpen(false);
     clientSeqRef.current = 1;
     lastServerSeqRef.current = 0;
@@ -745,6 +937,8 @@ export const App = () => {
   };
 
   const resetPlayUi = () => {
+    setReplayLog(null);
+    setReplayIndex(null);
     setServerViewer(null);
     setEvents([]);
     setPendingSetupVertex(null);
@@ -759,7 +953,9 @@ export const App = () => {
     setDiscardDraft(emptyResources());
     setRoadBuildingDraft({ cardId: "", edgeIds: [] });
     setSpecialBoardMode(null);
+    setRobberTargetHexId(null);
     setYearOfPlentyDraft(["grain", "ore"]);
+    hydratedFinishedReplayRef.current = null;
     setError(null);
   };
 
@@ -778,7 +974,9 @@ export const App = () => {
     clearInviteUrl();
     clearAutomationTimers();
     const next = createDemoGame(`web-bot-${Date.now()}`, matchOptions);
-    setState(next);
+    next.config.playerNames.p1 = "Player";
+    next.players.p1!.name = "Player";
+    setLiveState(next);
     resetPlayUi();
     setNetworkStatus("Bot match");
     setAppScreen("localGame");
@@ -795,15 +993,101 @@ export const App = () => {
 
   const activeRoomRef = (): string | undefined => networkRoom?.code ?? networkRoomInfo?.code ?? networkRoomId ?? undefined;
 
+  const sendLobbySettings = (settings: LobbySettingsInput) => {
+    const roomRef = activeRoomRef();
+    if (!roomRef || socketRef.current?.readyState !== WebSocket.OPEN) {
+      setError("Online room is not connected yet");
+      return;
+    }
+    setLobbyPending((current) => ({ ...current, settings: true }));
+    socketRef.current.send(JSON.stringify({ type: "UPDATE_ROOM_SETTINGS", roomId: roomRef, settings }));
+  };
+
   const sendLobbyReady = (ready: boolean) => {
     const roomRef = activeRoomRef();
     if (!roomRef || socketRef.current?.readyState !== WebSocket.OPEN) {
       setError("Online room is not connected yet");
       return;
     }
-    setLobbyReadyPending(true);
+    setLobbyPending((current) => ({ ...current, ready: true }));
     socketRef.current.send(JSON.stringify({ type: "READY", roomId: roomRef, ready }));
     setNetworkStatus(`${ready ? "Ready" : "Not ready"} in ${roomRef}`);
+  };
+
+  const sendLobbyStart = () => {
+    const roomRef = activeRoomRef();
+    if (!roomRef || socketRef.current?.readyState !== WebSocket.OPEN) {
+      setError("Online room is not connected yet");
+      return;
+    }
+    setLobbyPending((current) => ({ ...current, start: true }));
+    socketRef.current.send(JSON.stringify({ type: "START_ROOM", roomId: roomRef }));
+    setNetworkStatus(`Starting ${roomRef}`);
+  };
+
+  const sendLobbyAddBot = () => {
+    const roomRef = activeRoomRef();
+    if (!roomRef || socketRef.current?.readyState !== WebSocket.OPEN) {
+      setError("Online room is not connected yet");
+      return;
+    }
+    setLobbyPending((current) => ({ ...current, settings: true }));
+    socketRef.current.send(JSON.stringify({ type: "ADD_BOT", roomId: roomRef }));
+    setNetworkStatus(`Adding bot to ${roomRef}`);
+  };
+
+  const sendLobbyRemoveBot = (seatIndex: number) => {
+    const roomRef = activeRoomRef();
+    if (!roomRef || socketRef.current?.readyState !== WebSocket.OPEN) {
+      setError("Online room is not connected yet");
+      return;
+    }
+    setLobbyPending((current) => ({ ...current, settings: true }));
+    socketRef.current.send(JSON.stringify({ type: "REMOVE_BOT", roomId: roomRef, seatIndex }));
+    setNetworkStatus(`Removing bot from ${roomRef}`);
+  };
+
+  const saveLobbyDisplayName = () => {
+    if (socketRef.current?.readyState !== WebSocket.OPEN) {
+      setError("Online room is not connected yet");
+      return;
+    }
+    const nextName = playerDisplayName.trim().slice(0, 40);
+    if (!nextName) {
+      setError("Name cannot be empty");
+      return;
+    }
+    setPlayerDisplayName(nextName);
+    setLobbyPending((current) => ({ ...current, name: true }));
+    socketRef.current.send(JSON.stringify({ type: "UPDATE_DISPLAY_NAME", displayName: nextName }));
+    setNetworkStatus("Name saved");
+  };
+
+  const startReplay = async () => {
+    if (liveState.phase.type !== "GAME_OVER") return;
+    try {
+      const log = networkRoomId && networkSession
+        ? await createNetworkClient().loadReplay(networkRoomInfo?.id ?? networkRoomId, networkSession.token)
+        : { config: liveState.config, board: liveState.board, events };
+      setReplayLog(log);
+      setReplayIndex(log.events.length);
+      setNetworkStatus("Replay");
+    } catch (input) {
+      setError(networkErrorMessage(input));
+    }
+  };
+
+  const stepReplay = (delta: number) => {
+    if (!replayLog || replayIndex === null) return;
+    const nextIndex = Math.max(0, Math.min(replayLog.events.length, replayIndex + delta));
+    setReplayIndex(nextIndex);
+  };
+
+  const exitReplay = () => {
+    if (!replayLog) return;
+    setReplayLog(null);
+    setReplayIndex(null);
+    setNetworkStatus(networkRoomId ? "Online game" : "Bot match");
   };
 
   const roll = () => {
@@ -822,6 +1106,7 @@ export const App = () => {
     playSound("select");
     setSpecialBoardMode({ type: "roadBuilding", cardId });
     setRoadBuildingDraft({ cardId, edgeIds: [] });
+    setRobberTargetHexId(null);
     setBuildMode("road");
     setTradeOpen(false);
     setSelectedEdge(null);
@@ -857,6 +1142,7 @@ export const App = () => {
     playSound("select");
     setSpecialBoardMode(null);
     setRoadBuildingDraft({ cardId: "", edgeIds: [] });
+    setRobberTargetHexId(null);
   };
   const incrementDiscard = (resource: Resource) => {
     if (!humanPlayer || humanPlayer.resources[resource] <= discardDraft[resource]) return;
@@ -875,24 +1161,43 @@ export const App = () => {
   };
   const moveThief = (hexId: HexId, stealFromPlayerId?: PlayerId) => {
     playSound("select");
+    setRobberTargetHexId(null);
     commit({ type: "MOVE_THIEF", playerId: humanPlayerId, hexId, ...(stealFromPlayerId ? { stealFromPlayerId } : {}) });
   };
   const playKnight = (cardId: string, hexId: HexId, stealFromPlayerId?: PlayerId) => {
     playSound("select");
+    setRobberTargetHexId(null);
     commit({ type: "PLAY_KNIGHT", playerId: humanPlayerId, cardId, hexId, ...(stealFromPlayerId ? { stealFromPlayerId } : {}) });
   };
   const startKnightTargeting = (cardId: string) => {
     playSound("select");
     setSpecialBoardMode({ type: "knight", cardId });
+    setRobberTargetHexId(null);
+    setTradeOpen(false);
+  };
+  const startMonopolyChoice = (cardId: string) => {
+    playSound("select");
+    setSpecialBoardMode({ type: "monopoly", cardId });
+    setRobberTargetHexId(null);
+    setRoadBuildingDraft({ cardId: "", edgeIds: [] });
+    setTradeOpen(false);
+  };
+  const startYearOfPlentyChoice = (cardId: string) => {
+    playSound("select");
+    setSpecialBoardMode({ type: "yearOfPlenty", cardId });
+    setRobberTargetHexId(null);
+    setRoadBuildingDraft({ cardId: "", edgeIds: [] });
     setTradeOpen(false);
   };
   const playMonopoly = (cardId: string, resource: Resource) => {
     playSound("select");
     commit({ type: "PLAY_MONOPOLY", playerId: humanPlayerId, cardId, resource });
+    setSpecialBoardMode(null);
   };
   const playYearOfPlenty = (cardId: string, picked: [Resource, Resource]) => {
     playSound("select");
     commit({ type: "PLAY_YEAR_OF_PLENTY", playerId: humanPlayerId, cardId, resources: picked });
+    setSpecialBoardMode(null);
   };
   const setYearOfPlentyResource = (index: 0 | 1, resource: Resource) => {
     setYearOfPlentyDraft((current) => index === 0 ? [resource, current[1]] : [current[0], resource]);
@@ -900,7 +1205,11 @@ export const App = () => {
   const handleHex = (hexId: HexId) => {
     if (!legalThiefHexes.has(hexId)) return;
     const targets = visibleStealTargets(hexId);
-    if (targets.length > 0) return;
+    if (targets.length > 0) {
+      playSound("select");
+      setRobberTargetHexId(hexId);
+      return;
+    }
     selectRobberTarget(hexId);
   };
   const selectRobberTarget = (hexId: HexId, stealFromPlayerId?: PlayerId) => {
@@ -915,7 +1224,7 @@ export const App = () => {
   const openTradePanel = () => {
     if (!canOfferTrade && !activeStagedTrade) return;
     playSound("select");
-    setTradeOpen(true);
+    setTradeOpen((current) => !current);
     track("trade_panel_opened", { mode: socketRef.current ? "network" : "local", platform: platform(), source: "action_button" });
   };
   const chooseBuildMode = (mode: BuildMode) => {
@@ -923,10 +1232,40 @@ export const App = () => {
     playSound("select");
     setSpecialBoardMode(null);
     setRoadBuildingDraft({ cardId: "", edgeIds: [] });
+    setRobberTargetHexId(null);
     setBuildMode(mode);
     setTradeOpen(false);
     if (mode !== "road") setSelectedEdge(null);
     if (mode !== "settlement" && mode !== "city") setSelectedVertex(null);
+  };
+  const isDevelopmentCardPlayable = (card: DevelopmentCard): boolean => {
+    if (card.type === "VICTORY_POINT") return false;
+    if (card.playedTurn || card.boughtTurn === state.turn || state.phase.type === "DISCARDING" || state.phase.type === "MOVING_THIEF") return false;
+    if (card.type === "KNIGHT") return playKnightAction?.type === "PLAY_KNIGHT" && playKnightAction.cardIds.includes(card.id);
+    if (card.type === "ROAD_BUILDING") return playRoadBuildingAction?.type === "PLAY_ROAD_BUILDING" && playRoadBuildingAction.cardIds.includes(card.id);
+    if (card.type === "MONOPOLY") return playMonopolyAction?.type === "PLAY_MONOPOLY" && playMonopolyAction.cardIds.includes(card.id);
+    return playYearOfPlentyAction?.type === "PLAY_YEAR_OF_PLENTY" && playYearOfPlentyAction.cardIds.includes(card.id);
+  };
+  const developmentCardStatus = (card: DevelopmentCard): string => {
+    if (card.type === "VICTORY_POINT") return "Secret +1 VP";
+    if (card.playedTurn) return "Played";
+    if (card.boughtTurn === state.turn) return "New";
+    return isDevelopmentCardPlayable(card) ? "Ready" : "Waiting";
+  };
+  const activeDevelopmentCardStatus = (card: DevelopmentCard): string => {
+    if (activeKnightCardId === card.id) return "Choosing target";
+    if (activeRoadBuildingCardId === card.id) return `${roadBuildingSelectedEdges.length}/${roadBuildingRequiredCount} roads`;
+    if (activeMonopolyCardId === card.id) return "Choosing resource";
+    if (activeYearOfPlentyCardId === card.id) return "Choosing resources";
+    return developmentCardStatus(card);
+  };
+  const developmentCardTooltip = (card: DevelopmentCard): string => `${developmentCardLabels[card.type]}: ${developmentCardStatus(card)}`;
+  const activateDevelopmentCard = (card: DevelopmentCard) => {
+    if (!isDevelopmentCardPlayable(card)) return;
+    if (card.type === "KNIGHT") startKnightTargeting(card.id);
+    else if (card.type === "ROAD_BUILDING") startRoadBuilding(card.id);
+    else if (card.type === "MONOPOLY") startMonopolyChoice(card.id);
+    else if (card.type === "YEAR_OF_PLENTY") startYearOfPlentyChoice(card.id);
   };
   const constructionActions: Array<{
     mode: BuildMode;
@@ -941,8 +1280,8 @@ export const App = () => {
       mode: "road",
       label: "Road",
       ariaLabel: "Build road",
-      tooltip: `Road: build on a glowing edge connected to your network. Cost: ${formatCost(roadCost())}.`,
-      selected: state.phase.type === "SETUP_PLACEMENT" ? setupRoadActive : buildMode === "road",
+      tooltip: canBuildRoadAction || setupRoadActive ? `Road: build on a glowing edge connected to your network. Cost: ${formatCost(roadCost())}.` : actionBuildReason("road") ?? `Road cost: ${formatCost(roadCost())}.`,
+      selected: state.phase.type === "SETUP_PLACEMENT" ? setupRoadActive : state.phase.type === "ACTION_PHASE" && buildMode === "road" && canBuildRoadAction,
       disabled: state.phase.type === "SETUP_PLACEMENT" ? !setupRoadActive : state.phase.type !== "ACTION_PHASE" || !canBuildRoadAction,
       icon: <RoadSymbol />,
     },
@@ -950,8 +1289,8 @@ export const App = () => {
       mode: "settlement",
       label: "Settlement",
       ariaLabel: "Build settlement",
-      tooltip: `Settlement: build a house on a glowing corner at least two edges away from other houses. Cost: ${formatCost(settlementCost())}.`,
-      selected: state.phase.type === "SETUP_PLACEMENT" ? setupSettlementActive : buildMode === "settlement",
+      tooltip: canBuildSettlement || setupSettlementActive ? `Settlement: build a house on a glowing corner at least two edges away from other houses. Cost: ${formatCost(settlementCost())}.` : actionBuildReason("settlement") ?? `Settlement cost: ${formatCost(settlementCost())}.`,
+      selected: state.phase.type === "SETUP_PLACEMENT" ? setupSettlementActive : state.phase.type === "ACTION_PHASE" && buildMode === "settlement" && canBuildSettlement,
       disabled: state.phase.type === "SETUP_PLACEMENT" ? !setupSettlementActive : state.phase.type !== "ACTION_PHASE" || !canBuildSettlement,
       icon: <HouseSymbol />,
     },
@@ -959,8 +1298,8 @@ export const App = () => {
       mode: "city",
       label: "City",
       ariaLabel: "Upgrade city",
-      tooltip: `City: upgrade one of your settlements for another point and double production. Cost: ${formatCost(cityCost())}.`,
-      selected: state.phase.type === "ACTION_PHASE" && buildMode === "city",
+      tooltip: canUpgradeCity ? `City: upgrade one of your settlements for another point and double production. Cost: ${formatCost(cityCost())}.` : actionBuildReason("city") ?? `City cost: ${formatCost(cityCost())}.`,
+      selected: state.phase.type === "ACTION_PHASE" && buildMode === "city" && canUpgradeCity,
       disabled: state.phase.type !== "ACTION_PHASE" || !canUpgradeCity,
       icon: <HouseSymbol city />,
     },
@@ -1051,6 +1390,23 @@ export const App = () => {
     });
   };
 
+  const hydrateFinishedReplayEvents = async (
+    roomRef: string | undefined,
+    session: { token: string },
+    generation: number,
+  ): Promise<void> => {
+    if (!roomRef || hydratedFinishedReplayRef.current === roomRef) return;
+    hydratedFinishedReplayRef.current = roomRef;
+    try {
+      const log = await createNetworkClient().loadReplay(roomRef, session.token);
+      if (!isNetworkGeneration(generation)) return;
+      setEvents(log.events);
+      setReplayLog((current) => current ? log : current);
+    } catch {
+      if (hydratedFinishedReplayRef.current === roomRef) hydratedFinishedReplayRef.current = null;
+    }
+  };
+
   const connectOnlineSession = (session: { token: string; userId: PlayerId }, roomId: string, ready: boolean, generation = networkGenerationRef.current) => {
     if (!isNetworkGeneration(generation)) return;
     setNetworkSocketOpen(false);
@@ -1083,15 +1439,20 @@ export const App = () => {
           setEvents((current) => [...current, ...incomingEvents]);
           if (!snapshot) {
             setServerViewer((current) => current ? applyEventsToViewer(current, incomingEvents, canonicalRoomId, current.viewerId, currentConfigOptions()) : null);
-            setState((current) => applyEvents(current, incomingEvents));
+            setLiveState((current) => applyEvents(current, incomingEvents));
+          }
+          if (incomingEvents.some((event) => event.type === "GAME_OVER")) {
+            void hydrateFinishedReplayEvents(canonicalRoomId, session, generation);
           }
         }
         if (snapshot) {
-          setState(viewerToGameState(snapshot, canonicalRoomId, currentConfigOptions()));
+          const projectedState = viewerToGameState(snapshot, canonicalRoomId, currentConfigOptions());
+          setLiveState(projectedState);
           setServerViewer(snapshot);
           lastServerSeqRef.current = Math.max(lastServerSeqRef.current, snapshot.eventSeq);
           if (incomingEvents.length === 0) setEvents([]);
           setAppScreen("onlineGame");
+          if (projectedState.phase.type === "GAME_OVER") void hydrateFinishedReplayEvents(canonicalRoomId, session, generation);
         }
         writeNetworkResume(session, canonicalRoomId, roomInfo?.code ?? (roomId.startsWith("room_") ? undefined : roomId));
         setNetworkStatus(`Online ${roomInfo?.code ?? roomId}`);
@@ -1099,8 +1460,25 @@ export const App = () => {
       onRoom: (incomingRoom) => {
         if (!isNetworkGeneration(generation)) return;
         const publicRoom = incomingRoom as PublicRoomPayload;
-        setLobbyReadyPending(false);
+        setLobbyPending({ ready: false, settings: false, start: false, name: false });
         setNetworkRoom(publicRoom);
+        if (publicRoom.settings) {
+          setMatchOptions((current) => ({
+            ...current,
+            playerCount: toPlayerCount(publicRoom.settings?.maxPlayers, current.playerCount),
+            botDifficulty: publicRoom.settings?.botDifficulty ?? current.botDifficulty,
+            rules: {
+              diceDoubles: publicRoom.settings?.rules?.diceDoubles ?? current.rules.diceDoubles,
+              plight: publicRoom.settings?.rules?.plight ?? current.rules.plight,
+              plightTurn: publicRoom.settings?.rules?.plightTurn ?? current.rules.plightTurn,
+              mapRandomized: publicRoom.settings?.rules?.mapRandomized ?? current.rules.mapRandomized,
+              mapPreset: publicRoom.settings?.rules?.mapPreset ?? current.rules.mapPreset,
+              specialCardCostRandomized: publicRoom.settings?.rules?.specialCardCostRandomized ?? current.rules.specialCardCostRandomized,
+            },
+          }));
+        }
+        const ownPayloadSeat = publicRoom.seats?.find((seat) => seat.userId === session.userId);
+        if (ownPayloadSeat?.displayName) setPlayerDisplayName(ownPayloadSeat.displayName);
         setEvents(publicRoom.events ?? []);
         const roomConfigOptions: Partial<Pick<GameConfig, "botDifficulty" | "rules">> = {
           botDifficulty: publicRoom.settings?.botDifficulty ?? currentConfigOptions().botDifficulty,
@@ -1110,10 +1488,12 @@ export const App = () => {
           },
         };
         if (publicRoom.game) {
-          setState(viewerToGameState(publicRoom.game, publicRoom.id, roomConfigOptions));
+          const projectedState = viewerToGameState(publicRoom.game, publicRoom.id, roomConfigOptions);
+          setLiveState(projectedState);
           setServerViewer(publicRoom.game);
           lastServerSeqRef.current = Math.max(lastServerSeqRef.current, publicRoom.game.eventSeq, ...(publicRoom.events ?? []).map((event) => event.seq));
           setAppScreen("onlineGame");
+          if (projectedState.phase.type === "GAME_OVER") void hydrateFinishedReplayEvents(publicRoom.id, session, generation);
         } else {
           setServerViewer(null);
           lastServerSeqRef.current = 0;
@@ -1132,7 +1512,7 @@ export const App = () => {
       onError: (incomingError) => {
         if (!isNetworkGeneration(generation)) return;
         clearPendingCommands();
-        setLobbyReadyPending(false);
+        setLobbyPending({ ready: false, settings: false, start: false, name: false });
         const code = typeof incomingError === "object" && incomingError && "code" in incomingError ? String((incomingError as { code?: unknown }).code) : "";
         if (code === "ROOM_EXPIRED" || code === "ROOM_ABANDONED" || code === "ROOM_CLOSED") {
           resetNetworkSession();
@@ -1177,10 +1557,10 @@ export const App = () => {
     try {
       setNetworkStatus("Creating online room...");
       const client = createNetworkClient();
-      const session = await client.createSession("Browser Host");
+      const session = await client.createSession(playerDisplayName.trim() || "Player");
       if (!isNetworkGeneration(generation)) return;
       const { playerCount, ...roomOptions } = matchOptions;
-      const room = await client.createRoom(session.token, { ...roomOptions, mode: "CLASSIC", botFill: false, ranked: false, minPlayers: playerCount, maxPlayers: playerCount });
+      const room = await client.createRoom(session.token, { ...roomOptions, mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: playerCount });
       if (!isNetworkGeneration(generation)) return;
       setNetworkSession({ token: session.token, userId: session.userId });
       setNetworkRoom(room);
@@ -1223,7 +1603,7 @@ export const App = () => {
         return;
       }
       setNetworkStatus("Joining online room...");
-      const session = await client.createSession("Browser Player");
+      const session = await client.createSession(playerDisplayName.trim() || "Player");
       if (!isNetworkGeneration(generation)) return;
       setNetworkSession({ token: session.token, userId: session.userId });
       setNetworkRoom(lookup.room);
@@ -1278,7 +1658,7 @@ export const App = () => {
   }, []);
 
   useEffect(() => {
-    const matchId = state.config.matchId;
+    const matchId = liveState.config.matchId;
     const maxSeq = events.reduce((current, event) => Math.max(current, event.seq), 0);
     const cursor = soundCursorRef.current;
 
@@ -1297,14 +1677,14 @@ export const App = () => {
       .sort((left, right) => left.seq - right.seq);
     playSoundForEvents(freshEvents, humanPlayerId);
     soundCursorRef.current = { matchId, seq: maxSeq, initialized: true };
-  }, [events, humanPlayerId, isPlayableScreen, state.config.matchId]);
+  }, [events, humanPlayerId, isPlayableScreen, liveState.config.matchId]);
 
   useEffect(() => {
-    const normalized = normalizeDraftForState(state);
+    const normalized = normalizeDraftForState(liveState);
     if (!bundlesEqual(normalized.offer, tradeOffer) || !bundlesEqual(normalized.request, tradeRequest)) {
       setTradeDraft(normalized);
     }
-  }, [state.eventSeq, humanPlayerId]);
+  }, [liveState.eventSeq, humanPlayerId]);
 
   useEffect(() => {
     if (latestRollKey === "none") return undefined;
@@ -1319,12 +1699,16 @@ export const App = () => {
   }, [selectedResponderCanFinalize, selectedTradeResponder]);
 
   useEffect(() => {
+    if (state.phase.type !== "GAME_OVER" && gameOverTab !== "overview") setGameOverTab("overview");
+  }, [gameOverTab, state.phase.type]);
+
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (!keyboardShortcutsEnabled) return;
       if (event.repeat || event.isComposing || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
       const target = event.target as HTMLElement | null;
       if (target && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))) return;
-      if (!isPlayableScreen || state.phase.type === "GAME_OVER" || !isHumanActive) return;
+      if (!isPlayableScreen || isReplaying || state.phase.type === "GAME_OVER" || !isHumanActive) return;
       if (event.key === "Escape" && pendingSetupVertex) {
         event.preventDefault();
         cancelPendingSetupPlacement();
@@ -1341,7 +1725,7 @@ export const App = () => {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [canEndTurn, canRoll, isHumanActive, isPlayableScreen, keyboardShortcutsEnabled, pendingSetupVertex, state.phase.type]);
+  }, [canEndTurn, canRoll, isHumanActive, isPlayableScreen, isReplaying, keyboardShortcutsEnabled, pendingSetupVertex, state.phase.type]);
 
   useEffect(() => {
     if (state.phase.type !== "SETUP_PLACEMENT" || activePlayer !== humanPlayerId) {
@@ -1374,7 +1758,7 @@ export const App = () => {
                   <RoadSymbol />
                 </span>
                 <strong>Player Match</strong>
-                <span>{matchOptions.playerCount} player online room</span>
+                <span>{onlineRoomCapacityText(matchOptions.playerCount)}</span>
                 <span className="match-cta">Host</span>
               </button>
             </div>
@@ -1480,90 +1864,36 @@ export const App = () => {
   }
 
   if (appScreen === "onlineLobby") {
-    const roomCode = networkRoom?.code ?? networkRoomInfo?.code ?? networkRoomInfo?.id ?? "------";
-    const lobbySeats = networkRoom?.seats ?? [];
-    const ownSeat = lobbySeats.find((seat) => seat.userId === humanPlayerId);
-    const neededPlayers = networkRoom?.settings?.minPlayers ?? matchOptions.playerCount;
-    const totalSeats = networkRoom?.settings?.maxPlayers ?? Math.max(neededPlayers, lobbySeats.length);
-    const readyCount = lobbySeats.filter((seat) => seat.ready && (seat.userId || seat.botId)).length;
-    const occupiedCount = lobbySeats.filter((seat) => seat.userId || seat.botId).length;
-    const lobbyRules = [
-      `Players ${neededPlayers}`,
-      `Map ${mapPresetLabels[networkRoom?.settings?.rules?.mapPreset ?? matchOptions.rules.mapPreset]}`,
-      `Difficulty ${networkRoom?.settings?.botDifficulty ?? matchOptions.botDifficulty}`,
-      networkRoom?.settings?.rules?.diceDoubles ? "Doubles x2" : undefined,
-      networkRoom?.settings?.rules?.plight ? `Plight turn ${networkRoom.settings.rules.plightTurn ?? 20}` : undefined,
-      networkRoom?.settings?.rules?.specialCardCostRandomized ? "Random special cost" : undefined,
-    ].filter((rule): rule is string => Boolean(rule));
     return (
-      <main className="app-shell lobby-app">
-        <section className="online-lobby" aria-label="Online lobby">
-          <header className="topbar">
-            <div className="brand-block">
-              <h1>Colonizt</h1>
-              <p>
-                Room {roomCode} · <span className="phase-code">{networkRoom?.status ?? "LOBBY"}</span>
-              </p>
-            </div>
-            <div className="topbar-actions">
-              <button type="button" onClick={returnToSetup}>New Match</button>
-            </div>
-          </header>
-          <div className="lobby-layout">
-            <div className="lobby-panel">
-              <div className="lobby-code-card">
-                <span>Room Code</span>
-                <strong>{roomCode}</strong>
-                <button type="button" onClick={copyInvite} disabled={!networkRoomInfo}>Copy Invite</button>
-              </div>
-              <div className="lobby-status-card" aria-live="polite">
-                <span>{networkStatus}</span>
-                <strong>{readyCount}/{neededPlayers} ready · {occupiedCount}/{totalSeats} seats</strong>
-                {pendingCommandCount > 0 ? <small>{pendingCommandCount} pending</small> : null}
-                {reconnectRetryAt ? <small>Retry {Math.max(0, Math.ceil((reconnectRetryAt - nowMs) / 1000))}s</small> : null}
-                {error ? <em>{error}</em> : null}
-              </div>
-              <div className="lobby-actions">
-                <button type="button" onClick={() => sendLobbyReady(!ownSeat?.ready)} disabled={!ownSeat || lobbyReadyPending || !networkSocketOpen}>
-                  {!networkSocketOpen ? "Connecting..." : lobbyReadyPending ? "Saving..." : ownSeat?.ready ? "Unready" : "Ready"}
-                </button>
-                <button type="button" onClick={retryOnlineNow} disabled={!reconnectRetryAt}>Retry</button>
-                <button type="button" onClick={returnToSetup}>Leave</button>
-              </div>
-            </div>
-            <aside className="lobby-side" aria-label="Lobby seats and rules">
-              <div className="phase-card">
-                <div className="panel-title">
-                  <strong>Seats</strong>
-                  <span>{occupiedCount}/{totalSeats}</span>
-                </div>
-                <div className="lobby-seats">
-                  {Array.from({ length: totalSeats }, (_, index) => lobbySeats[index] ?? { seatIndex: index, ready: false, connected: false }).map((seat) => {
-                    const occupant = seat.userId ?? seat.botId;
-                    const isYou = seat.userId === humanPlayerId;
-                    return (
-                      <article key={seat.seatIndex} className={`lobby-seat ${seat.ready ? "ready" : ""} ${isYou ? "you" : ""}`}>
-                        <span>Seat {seat.seatIndex + 1}</span>
-                        <strong>{occupant ? isYou ? "You" : seat.botId ? `Bot ${seat.seatIndex + 1}` : occupant : "Open"}</strong>
-                        <small>{occupant ? seat.ready ? "Ready" : "Not ready" : "Waiting"}</small>
-                      </article>
-                    );
-                  })}
-                </div>
-              </div>
-              <div className="phase-card">
-                <div className="panel-title">
-                  <strong>Rules</strong>
-                  <span>{networkRoom?.settings?.mode ?? "CLASSIC"}</span>
-                </div>
-                <div className="lobby-rules">
-                  {lobbyRules.map((rule) => <span key={rule}>{rule}</span>)}
-                </div>
-              </div>
-            </aside>
-          </div>
-        </section>
-      </main>
+      <LobbyScreen
+        networkRoom={networkRoom}
+        roomCodeFallback={networkRoomInfo?.code ?? networkRoomInfo?.id}
+        canCopyInvite={Boolean(networkRoomInfo)}
+        humanPlayerId={humanPlayerId}
+        matchOptions={matchOptions}
+        networkStatus={networkStatus}
+        error={error}
+        pendingCommandCount={pendingCommandCount}
+        reconnectRetryAt={reconnectRetryAt}
+        nowMs={nowMs}
+        networkSocketOpen={networkSocketOpen}
+        lobbyPending={lobbyPending}
+        playerDisplayName={playerDisplayName}
+        onPlayerDisplayNameChange={setPlayerDisplayName}
+        onSaveDisplayName={saveLobbyDisplayName}
+        onReturnToSetup={returnToSetup}
+        onCopyInvite={copyInvite}
+        onRetryNow={retryOnlineNow}
+        onReady={sendLobbyReady}
+        onStart={sendLobbyStart}
+        onUpdateSettings={sendLobbySettings}
+        onSetPlayerCount={setPlayerCount}
+        onSetMapPreset={setMapPreset}
+        onSetBotDifficulty={setBotDifficulty}
+        onSetRuleEnabled={setRuleEnabled}
+        onAddBot={sendLobbyAddBot}
+        onRemoveBot={sendLobbyRemoveBot}
+      />
     );
   }
 
@@ -1578,6 +1908,16 @@ export const App = () => {
             </p>
           </div>
           <div className="topbar-actions">
+            {isReplaying && replayLog ? (
+              <div className="replay-controls" aria-label="Replay controls">
+                <button type="button" onClick={() => stepReplay(-1)} disabled={replayIndex === 0}>Prev</button>
+                <span>{replayIndex ?? 0}/{replayLog.events.length}</span>
+                <button type="button" onClick={() => stepReplay(1)} disabled={replayIndex === replayLog.events.length}>Next</button>
+                <button type="button" onClick={exitReplay}>Live</button>
+              </div>
+            ) : state.phase.type === "GAME_OVER" ? (
+              <button type="button" onClick={() => void startReplay()}>Replay</button>
+            ) : null}
             <button type="button" onClick={returnToSetup}>New Match</button>
           </div>
         </header>
@@ -1669,22 +2009,23 @@ export const App = () => {
                 const thiefHere = state.thiefHexId === hex.id;
                 const legalThiefDestination = legalThiefHexes.has(hex.id);
                 const stealTargets = legalThiefDestination ? visibleStealTargets(hex.id) : [];
-                const canMoveWithoutStealing = legalThiefDestination && stealTargets.length === 0;
+                const canSelectThiefDestination = legalThiefDestination && !thiefHere;
+                const robberSelected = robberTargetHexId === hex.id;
                 return (
                   <g
                     key={hex.id}
-                    className={`${thiefHere ? "thief-hex" : ""} ${legalThiefDestination ? "legal-thief-hex" : ""} ${stealTargets.length > 0 ? "has-steal-targets" : ""}`}
+                    className={`${thiefHere ? "thief-hex" : ""} ${legalThiefDestination ? "legal-thief-hex" : ""} ${robberSelected ? "selected-thief-hex" : ""} ${stealTargets.length > 0 ? "has-steal-targets" : ""}`}
                     filter="url(#softShadow)"
-                    role={canMoveWithoutStealing ? "button" : undefined}
-                    tabIndex={canMoveWithoutStealing ? 0 : undefined}
-                    aria-label={canMoveWithoutStealing ? `Move robber to ${terrainLabels[hex.resource]} hex without stealing` : undefined}
+                    role={canSelectThiefDestination ? "button" : undefined}
+                    tabIndex={canSelectThiefDestination ? 0 : undefined}
+                    aria-label={canSelectThiefDestination ? stealTargets.length > 0 ? `Select robber destination on ${terrainLabels[hex.resource]} hex with steal targets` : `Move robber to ${terrainLabels[hex.resource]} hex without stealing` : undefined}
                     onClick={(event) => {
-                      if (!canMoveWithoutStealing) return;
+                      if (!canSelectThiefDestination) return;
                       event.stopPropagation();
                       handleHex(hex.id);
                     }}
                     onKeyDown={(event) => {
-                      if (!canMoveWithoutStealing || (event.key !== "Enter" && event.key !== " ")) return;
+                      if (!canSelectThiefDestination || (event.key !== "Enter" && event.key !== " ")) return;
                       event.preventDefault();
                       event.stopPropagation();
                       handleHex(hex.id);
@@ -1704,35 +2045,12 @@ export const App = () => {
                         <path d="M-0.32 0h0.14M0.18 0h0.14M0 -0.32v0.14M0 0.18v0.14" />
                       </g>
                     ) : null}
-                    {stealTargets.map((targetId, targetIndex) => {
-                      const targetName = state.players[targetId]?.name ?? targetId;
-                      const badgeX = center.x + (targetIndex - (stealTargets.length - 1) / 2) * 0.38;
-                      const badgeY = center.y - 0.52;
-                      return (
-                        <g
-                          key={`${hex.id}-${targetId}`}
-                          className="robber-victim-badge"
-                          style={{ color: state.players[targetId]?.color ?? "#172033" }}
-                          transform={`translate(${badgeX} ${badgeY})`}
-                          role="button"
-                          tabIndex={0}
-                          aria-label={`Move robber to ${terrainLabels[hex.resource]} hex and steal from ${targetName}`}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            selectRobberTarget(hex.id, targetId);
-                          }}
-                          onKeyDown={(event) => {
-                            if (event.key !== "Enter" && event.key !== " ") return;
-                            event.preventDefault();
-                            event.stopPropagation();
-                            selectRobberTarget(hex.id, targetId);
-                          }}
-                        >
-                          <circle r="0.18" />
-                          <text y="0.055">{targetName.slice(0, 1).toUpperCase()}</text>
-                        </g>
-                      );
-                    })}
+                    {stealTargets.length > 0 ? (
+                      <g className="robber-victim-count-badge" transform={`translate(${center.x} ${center.y - 0.54})`} aria-hidden="true">
+                        <circle r="0.18" />
+                        <text y="0.055">{stealTargets.length}</text>
+                      </g>
+                    ) : null}
                     {hex.token ? (
                       <g className={`token token-${hex.token}`} transform={`translate(${center.x} ${center.y + 0.36})`}>
                         <circle r="0.2" />
@@ -1753,6 +2071,7 @@ export const App = () => {
                         <path className="robber-scarf" d="M-0.15 0.15h0.3" />
                       </g>
                     ) : null}
+                    {canSelectThiefDestination ? <polygon className="thief-tile-hit-target" points={points} aria-hidden="true" /> : null}
                   </g>
                 );
               })}
@@ -1972,26 +2291,160 @@ export const App = () => {
             </div>
 
             <div className="hand-rack" aria-label="Your resources">
-              {resources.map((resource) => {
-                const discardSelected = discardDraft[resource] ?? 0;
-                const isDiscardSelection = discardAction?.type === "DISCARD_RESOURCES";
-                const owned = humanPlayer?.resources[resource] ?? 0;
-                const discardFull = isDiscardSelection && resourceCount(discardDraft) >= discardAction.count;
-                const canPickDiscard = isDiscardSelection && owned > discardSelected && !discardFull;
-                return (
-                  <ResourceCard
-                    key={resource}
-                    resource={resource}
-                    count={owned}
-                    onClick={() => isDiscardSelection ? incrementDiscard(resource) : openTradeFromResource(resource)}
-                    buttonLabel={isDiscardSelection ? `Select ${resourceLabels[resource]} to discard` : `Open trade with ${resourceLabels[resource]}`}
-                    selected={isDiscardSelection ? discardSelected > 0 : tradeOffer[resource] > 0}
-                    selectedCount={isDiscardSelection ? discardSelected : 0}
-                    disabled={isDiscardSelection ? !canPickDiscard : false}
-                  />
-                );
-              })}
+              <div className="resource-hand" aria-label="Resource cards">
+                {resources.map((resource) => {
+                  const discardSelected = discardDraft[resource] ?? 0;
+                  const isDiscardSelection = discardAction?.type === "DISCARD_RESOURCES";
+                  const owned = humanPlayer?.resources[resource] ?? 0;
+                  const discardFull = isDiscardSelection && resourceCount(discardDraft) >= discardAction.count;
+                  const canPickDiscard = isDiscardSelection && owned > discardSelected && !discardFull;
+                  return (
+                    <ResourceCard
+                      key={resource}
+                      resource={resource}
+                      count={owned}
+                      compact
+                      onClick={() => isDiscardSelection ? incrementDiscard(resource) : openTradeFromResource(resource)}
+                      buttonLabel={isDiscardSelection ? `Select ${resourceLabels[resource]} to discard` : `Open trade with ${resourceLabels[resource]}`}
+                      selected={isDiscardSelection ? discardSelected > 0 : tradeOffer[resource] > 0}
+                      selectedCount={isDiscardSelection ? discardSelected : 0}
+                      disabled={isDiscardSelection ? !canPickDiscard : false}
+                    />
+                  );
+                })}
+              </div>
+              {ownDevelopmentCards.some((card) => !card.playedTurn) ? (
+                <div className="dev-hand" aria-label="Your development cards in hand">
+                  {ownDevelopmentCards.filter((card) => !card.playedTurn).map((card) => {
+                    const playable = isDevelopmentCardPlayable(card);
+                    const active = activeKnightCardId === card.id
+                      || activeRoadBuildingCardId === card.id
+                      || activeMonopolyCardId === card.id
+                      || activeYearOfPlentyCardId === card.id;
+                    const status = activeDevelopmentCardStatus(card);
+                    const label = `${developmentCardLabels[card.type]}: ${status}`;
+                    return (
+                      <button
+                        key={card.id}
+                        type="button"
+                        className={`dev-hand-card ${active ? "selected" : ""} ${!playable ? "is-disabled" : ""} ${card.type === "VICTORY_POINT" ? "secret-vp-card" : ""}`}
+                        onClick={() => activateDevelopmentCard(card)}
+                        aria-disabled={!playable}
+                        aria-label={label}
+                        title={developmentCardTooltip(card)}
+                      >
+                        <DevelopmentCardIcon type={card.type} />
+                        <small>{developmentCardShortLabels[card.type]}</small>
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : null}
             </div>
+
+            {selectedRobberHex ? (
+              <div className="robber-choice-overlay" aria-label="Choose player to rob">
+                <div className="robber-choice-heading">
+                  <div className="robber-large-symbol" aria-hidden="true">
+                    <RobberSymbol />
+                  </div>
+                  <div>
+                    <strong>Robber</strong>
+                    <span>{terrainLabels[selectedRobberHex.resource]}</span>
+                  </div>
+                  <button type="button" className="icon-button" onClick={() => setRobberTargetHexId(null)} aria-label="Close robber chooser">x</button>
+                </div>
+                <div className="robber-victim-list">
+                  {selectedRobberTargets.map((playerId) => {
+                    const player = state.players[playerId];
+                    const isBot = networkRoom?.seats?.some((seat) => seat.botId === playerId) ?? (appScreen === "localGame" && playerId !== humanPlayerId);
+                    return (
+                      <button
+                        key={playerId}
+                        type="button"
+                        className="robber-victim-choice"
+                        onClick={() => selectRobberTarget(selectedRobberHex.id, playerId)}
+                        aria-label={`Steal from ${player?.name ?? playerId}`}
+                      >
+                        <span className="player-kind" style={{ color: player?.color ?? "#172033" }}>
+                          {isBot ? <BotSymbol /> : <HumanSymbol />}
+                        </span>
+                        <strong>{player?.name ?? playerId}</strong>
+                        <small>{visiblePlayerResourceCount(playerId)} cards</small>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
+
+            {activeMonopolyCardId ? (
+              <div className="special-card-choice-overlay" aria-label="Monopoly card choice">
+                <div className="special-choice-heading">
+                  <DevelopmentCardIcon type="MONOPOLY" />
+                  <div>
+                    <strong>Monopoly</strong>
+                    <span>Choose one resource to collect</span>
+                  </div>
+                  <button type="button" className="icon-button" onClick={() => setSpecialBoardMode(null)} aria-label="Close Monopoly chooser">x</button>
+                </div>
+                <div className="special-resource-grid">
+                  {resources.map((resource) => (
+                    <ResourceCard
+                      key={resource}
+                      resource={resource}
+                      count={viewer.resourceBank?.[resource] ?? state.resourceBank?.[resource] ?? 0}
+                      onClick={() => playMonopoly(activeMonopolyCardId, resource)}
+                      buttonLabel={`Choose ${resourceLabels[resource]} for Monopoly`}
+                    />
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
+            {activeYearOfPlentyCardId ? (
+              <div className="special-card-choice-overlay" aria-label="Year of Plenty card choice">
+                <div className="special-choice-heading">
+                  <DevelopmentCardIcon type="YEAR_OF_PLENTY" />
+                  <div>
+                    <strong>Year of Plenty</strong>
+                    <span>Choose two bank resources</span>
+                  </div>
+                  <button type="button" className="icon-button" onClick={() => setSpecialBoardMode(null)} aria-label="Close Year of Plenty chooser">x</button>
+                </div>
+                <div className="year-choice-section">
+                  <strong>First</strong>
+                  <div className="special-resource-grid">
+                    {yearOfPlentyFirstOptions.map((resource) => (
+                      <ResourceCard
+                        key={resource}
+                        resource={resource}
+                        count={state.resourceBank?.[resource] ?? 0}
+                        selected={selectedYearOfPlentyFirst === resource}
+                        onClick={() => setYearOfPlentyResource(0, resource)}
+                        buttonLabel={`Choose ${resourceLabels[resource]} as first Year of Plenty resource`}
+                      />
+                    ))}
+                  </div>
+                </div>
+                <div className="year-choice-section">
+                  <strong>Second</strong>
+                  <div className="special-resource-grid">
+                    {yearOfPlentySecondOptions.map((resource) => (
+                      <ResourceCard
+                        key={resource}
+                        resource={resource}
+                        count={state.resourceBank?.[resource] ?? 0}
+                        selected={selectedYearOfPlentySecond === resource}
+                        onClick={() => setYearOfPlentyResource(1, resource)}
+                        buttonLabel={`Choose ${resourceLabels[resource]} as second Year of Plenty resource`}
+                      />
+                    ))}
+                  </div>
+                </div>
+                <button type="button" className="primary-wide" onClick={() => playYearOfPlenty(activeYearOfPlentyCardId, selectedYearOfPlentyDraft)} disabled={!canTakeYearOfPlenty}>Take resources</button>
+              </div>
+            ) : null}
 
             {showTradePanel ? (
               <div className="trade-panel trade-overlay" aria-label="Trade interface">
@@ -2016,7 +2469,7 @@ export const App = () => {
                         <div className="trade-response-list" aria-live="polite">
                           {stagedRecipientIds.map((playerId) => {
                             const response = activeStagedTrade.responses?.[playerId]?.status ?? "PENDING";
-                            const canAfford = hasResources(state.players[playerId]?.resources ?? emptyResources(), activeStagedTrade.requested);
+                            const canAfford = appScreen === "onlineGame" || hasResources(state.players[playerId]?.resources ?? emptyResources(), activeStagedTrade.requested);
                             const canChoose = response === "WANTS_ACCEPT" && canAfford;
                             return (
                               <button
@@ -2104,6 +2557,140 @@ export const App = () => {
                 )}
               </div>
             ) : null}
+
+            {state.phase.type === "GAME_OVER" ? (
+              <div className="game-over-overlay" aria-label="Victory analysis">
+                <div className="confetti-layer" aria-hidden="true">
+                  {confettiPieces.map((piece, index) => (
+                    <span
+                      key={index}
+                      style={{
+                        "--confetti-left": piece.left,
+                        "--confetti-delay": piece.delay,
+                        "--confetti-duration": piece.duration,
+                        "--confetti-rotate": piece.rotate,
+                        "--confetti-color": piece.color,
+                      } as CSSProperties}
+                    />
+                  ))}
+                </div>
+                <div className="game-over-title">
+                  <strong>{state.players[state.phase.winnerId]?.name ?? state.phase.winnerId} wins</strong>
+                  <span>Turn {state.turn + 1}</span>
+                </div>
+                <div className="analysis-tabs" role="tablist" aria-label="Game analysis sections">
+                  {gameOverTabs.map((tab) => (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      role="tab"
+                      aria-selected={gameOverTab === tab.id}
+                      className={gameOverTab === tab.id ? "selected" : ""}
+                      onClick={() => setGameOverTab(tab.id)}
+                    >
+                      {tab.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="analysis-panel">
+                  {gameOverTab === "overview" ? (
+                    <div className="victory-breakdown-list">
+                      {rankedPlayers.map((player, index) => {
+                        const breakdown = player.victoryPointBreakdown;
+                        const parts = [
+                          { key: "settlements", label: "Settlements", value: breakdown?.settlements ?? 0, icon: <HouseSymbol /> },
+                          { key: "cities", label: "Cities", value: breakdown?.cities ?? 0, icon: <HouseSymbol city /> },
+                          { key: "longestRoad", label: "Longest Road", value: breakdown?.longestRoad ?? 0, icon: <RoadStatSymbol /> },
+                          { key: "largestArmy", label: "Largest Army", value: breakdown?.largestArmy ?? 0, icon: <KnightStatSymbol /> },
+                          { key: "secret", label: "Secret VP", value: breakdown?.secret ?? 0, icon: <DevelopmentCardIcon type="VICTORY_POINT" /> },
+                          { key: "otherPublic", label: "Other", value: breakdown?.otherPublic ?? 0, icon: <VictoryPointStatSymbol /> },
+                        ].filter((part) => part.value > 0);
+                        return (
+                          <article key={player.id} className="victory-breakdown-row" style={{ borderColor: player.color }}>
+                            <div className="victory-rank">{index + 1}</div>
+                            <div className="victory-player">
+                              <span className="player-kind" style={{ color: player.color }}>{botPlayerIds.has(player.id) ? <BotSymbol /> : <HumanSymbol />}</span>
+                              <strong>{player.name}</strong>
+                              <span className={player.secretVictoryPoints ? "vp-secret" : ""}>{victoryPointText(player)}</span>
+                            </div>
+                            <div className="victory-parts">
+                              {parts.map((part) => {
+                                const best = part.value > 0 && part.value === victoryCategoryMaxima[part.key as keyof typeof victoryCategoryMaxima];
+                                return (
+                                  <span key={part.key} className={`victory-part ${best ? "best" : ""}`} title={part.label}>
+                                    {part.icon}
+                                    <span>{part.value}</span>
+                                  </span>
+                                );
+                              })}
+                            </div>
+                          </article>
+                        );
+                      })}
+                    </div>
+                  ) : null}
+                  {gameOverTab === "dice" ? (
+                    <div className="analysis-chart dice-chart" aria-label="Dice roll counts">
+                      <h2>Dice Rolls</h2>
+                      <div className="chart-bars">
+                        {diceStats.map((stat) => (
+                          <div key={stat.sum} className={`chart-bar-item ${stat.count === maxDiceCount && stat.count > 0 ? "best" : ""}`}>
+                            <span
+                              className="chart-bar"
+                              style={{ "--bar-height": `${Math.max(6, (stat.count / maxDiceCount) * 100)}%` } as CSSProperties}
+                            >
+                              <strong>{stat.count}</strong>
+                            </span>
+                            <small>{stat.sum}</small>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                  {gameOverTab === "resources" ? (
+                    <div className="analysis-chart resource-chart" aria-label="Resource cards drawn">
+                      <h2>Resource Cards Drawn</h2>
+                      <div className="chart-bars resource-bars">
+                        {resourceDrawStats.map((stat) => (
+                          <div key={stat.resource} className={`chart-bar-item ${stat.count === maxResourceDrawCount && stat.count > 0 ? "best" : ""}`}>
+                            <span
+                              className="chart-bar"
+                              style={{ "--bar-height": `${Math.max(6, (stat.count / maxResourceDrawCount) * 100)}%` } as CSSProperties}
+                            >
+                              <strong>{stat.count}</strong>
+                            </span>
+                            <ResourceCard resource={stat.resource} count={stat.count} compact />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                  {gameOverTab === "development" ? (
+                    <div className="analysis-chart development-chart" aria-label="Development cards drawn">
+                      <h2>Development Cards Drawn</h2>
+                      <div className="chart-bars development-bars">
+                        {developmentDrawStats.map((stat) => (
+                          <div key={stat.type} className={`chart-bar-item ${stat.count === maxDevelopmentDrawCount && stat.count > 0 ? "best" : ""}`}>
+                            <span
+                              className="chart-bar"
+                              style={{ "--bar-height": `${Math.max(6, (stat.count / maxDevelopmentDrawCount) * 100)}%` } as CSSProperties}
+                            >
+                              <strong>{stat.count}</strong>
+                            </span>
+                            <DevelopmentCardIcon type={stat.type} />
+                            <small>{developmentCardShortLabels[stat.type]}</small>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+                <div className="game-over-actions">
+                  <button type="button" aria-label="Open replay" onClick={() => void startReplay()}>Replay</button>
+                  <button type="button" onClick={returnToSetup}>New Match</button>
+                </div>
+              </div>
+            ) : null}
           </div>
 
           <aside className="side-panel" aria-label="Players and controls">
@@ -2121,18 +2708,17 @@ export const App = () => {
               </div>
             ) : null}
 
-            {moveThiefAction?.type === "MOVE_THIEF" ? (
-              <div className="phase-card modal-control-card" aria-label="Move robber">
-                <div className="panel-title">
-                  <strong>Move Robber</strong>
-                  <span>{moveThiefAction.hexes.length} hexes</span>
-                </div>
-                <div className="robber-target-summary">
-                  <span>Use the highlighted board tiles.</span>
-                  <span>Select a player badge to steal, or an empty highlighted tile to move without stealing.</span>
-                </div>
+            <div className="phase-card bank-panel" aria-label="Bank holdings">
+              <div className="panel-title">
+                <strong>Bank</strong>
+                <span>{viewer.developmentDeckRemaining} dev</span>
               </div>
-            ) : null}
+              <div className="bank-resource-row">
+                {resources.map((resource) => (
+                  <ResourceCard key={resource} resource={resource} count={viewer.resourceBank?.[resource] ?? 0} compact />
+                ))}
+              </div>
+            </div>
 
             <div className={`phase-card dev-card-panel ${ownDevelopmentCards.length === 0 ? "empty" : ""}`} aria-label="Development cards">
               <div className="panel-title">
@@ -2144,19 +2730,14 @@ export const App = () => {
               ) : (
                 <div className="dev-card-list">
                   {ownDevelopmentCards.map((card) => {
-                    const playable = !card.playedTurn && card.boughtTurn !== state.turn && state.phase.type !== "DISCARDING" && state.phase.type !== "MOVING_THIEF";
-                    const cardStatus = card.type === "VICTORY_POINT"
-                      ? "Secret +1 VP"
-                      : card.playedTurn
-                        ? "played"
-                        : card.boughtTurn === state.turn
-                          ? "new"
-                          : "ready";
+                    const playable = isDevelopmentCardPlayable(card);
+                    const cardStatus = developmentCardStatus(card);
                     const roadBuildingActive = activeRoadBuildingCardId === card.id;
                     const roadBuildingSelections = roadBuildingActive ? roadBuildingSelectedEdges.length : 0;
                     return (
                       <div key={card.id} className={`dev-card-row ${card.playedTurn ? "played" : ""}`}>
-                        <span>{developmentCardLabels[card.type]}</span>
+                        <DevelopmentCardIcon type={card.type} />
+                        <span className="dev-card-copy">{developmentCardLabels[card.type]}</span>
                         <small>{cardStatus}</small>
                         {card.type === "KNIGHT" && playKnightAction?.type === "PLAY_KNIGHT" && playable ? (
                           <div className="dev-card-actions">
@@ -2176,20 +2757,18 @@ export const App = () => {
                         ) : null}
                         {card.type === "MONOPOLY" && playMonopolyAction?.type === "PLAY_MONOPOLY" && playable ? (
                           <div className="dev-card-actions">
-                            {resources.map((resource) => (
-                              <button key={resource} type="button" onClick={() => playMonopoly(card.id, resource)}>{resourceLabels[resource]}</button>
-                            ))}
+                            <button type="button" className={activeMonopolyCardId === card.id ? "selected" : ""} onClick={() => startMonopolyChoice(card.id)}>
+                              {activeMonopolyCardId === card.id ? "Choosing resource" : "Use"}
+                            </button>
+                            {activeMonopolyCardId === card.id ? <button type="button" onClick={() => setSpecialBoardMode(null)}>Cancel</button> : null}
                           </div>
                         ) : null}
                         {card.type === "YEAR_OF_PLENTY" && playYearOfPlentyAction?.type === "PLAY_YEAR_OF_PLENTY" && playable ? (
                           <div className="dev-card-actions dev-card-picker">
-                            <select aria-label="Year of Plenty first resource" value={yearOfPlentyDraft[0]} onChange={(event) => setYearOfPlentyResource(0, event.target.value as Resource)}>
-                              {resources.map((resource) => <option key={resource} value={resource}>{resourceLabels[resource]}</option>)}
-                            </select>
-                            <select aria-label="Year of Plenty second resource" value={yearOfPlentyDraft[1]} onChange={(event) => setYearOfPlentyResource(1, event.target.value as Resource)}>
-                              {resources.map((resource) => <option key={resource} value={resource}>{resourceLabels[resource]}</option>)}
-                            </select>
-                            <button type="button" onClick={() => playYearOfPlenty(card.id, yearOfPlentyDraft)}>Take</button>
+                            <button type="button" className={activeYearOfPlentyCardId === card.id ? "selected" : ""} onClick={() => startYearOfPlentyChoice(card.id)}>
+                              {activeYearOfPlentyCardId === card.id ? "Choosing resources" : "Use"}
+                            </button>
+                            {activeYearOfPlentyCardId === card.id ? <button type="button" onClick={() => setSpecialBoardMode(null)}>Cancel</button> : null}
                           </div>
                         ) : null}
                       </div>
@@ -2202,10 +2781,10 @@ export const App = () => {
             <div className="game-log-panel" aria-label="Gameplay log">
               <div className="panel-title">
                 <strong>Gameplay Log</strong>
-                <span>{events.length} events</span>
+                <span>{visibleEvents.length} events</span>
               </div>
               <ol>
-                {events.slice(-18).map((event) => <EventLine key={event.seq} event={event} />)}
+                {visibleEvents.slice(-18).map((event) => <EventLine key={event.seq} event={event} />)}
               </ol>
             </div>
 
@@ -2231,33 +2810,56 @@ export const App = () => {
             </div>
 
             <div className="players">
-              {viewer.players.map((player) => (
-                <article key={player.id} className={`player ${player.id === activePlayer ? "active" : ""}`} style={{ borderColor: player.color }}>
-                  <div className="player-heading">
-                    <strong>{player.name}</strong>
-                    <div className="player-stats" aria-label={`${victoryPointAria(player)}, ${player.resourceCount} cards, ${player.developmentCardCount} development cards, ${player.playedKnights} knights, longest road length ${player.longestRoadLength}`}>
-                      <span className={player.secretVictoryPoints ? "vp-secret" : ""}>{victoryPointText(player)}</span>
-                      <span>{player.resourceCount} cards</span>
-                      <span>{player.developmentCardCount} dev</span>
-                      <span>{player.playedKnights} knights</span>
-                      <span>road {player.longestRoadLength}</span>
+              {displayPlayers.map((player) => {
+                const isBot = botPlayerIds.has(player.id);
+                return (
+                  <article key={player.id} className={`player ${player.id === activePlayer ? "active" : ""} ${isBot ? "bot-player" : "human-player"}`} style={{ borderColor: player.color }}>
+                    <div className="player-heading">
+                      <span className="player-kind" style={{ color: player.color }} aria-label={isBot ? `${player.name} is a bot` : `${player.name} is a player`}>
+                        {isBot ? <BotSymbol /> : <HumanSymbol />}
+                      </span>
+                      <strong>{player.name}</strong>
+                      <div className="player-stats" aria-label={`${victoryPointAria(player)}, ${player.resourceCount} resource cards, ${player.developmentCardCount} development cards, ${player.playedKnights} knights, longest road length ${player.longestRoadLength}`}>
+                        <span className={`stat-chip vp-chip ${player.secretVictoryPoints ? "vp-secret" : ""}`} title="Victory points">
+                          <VictoryPointStatSymbol />
+                          <span>{victoryPointText(player)}</span>
+                        </span>
+                        <span className="stat-chip" title="Resource cards">
+                          <CardsSymbol />
+                          <span>{player.resourceCount}</span>
+                        </span>
+                        <span className="stat-chip" title="Development cards">
+                          <DevelopmentCardIcon hidden />
+                          <span>{player.developmentCardCount}</span>
+                        </span>
+                        <span className="stat-chip" title="Knights used">
+                          <KnightStatSymbol />
+                          <span>{player.playedKnights}</span>
+                        </span>
+                        <span className="stat-chip" title="Road length">
+                          <RoadStatSymbol />
+                          <span>{player.longestRoadLength}</span>
+                        </span>
+                      </div>
+                      <div className="player-mobile-stats" aria-hidden="true">
+                        <span className={player.secretVictoryPoints ? "vp-secret" : ""}>{victoryPointText(player, true)}</span>
+                        <span>{player.resourceCount}C</span>
+                        <span>{player.developmentCardCount}D</span>
+                        <span>R{player.longestRoadLength}</span>
+                      </div>
                     </div>
-                    <div className="player-mobile-stats" aria-hidden="true">
-                      <span className={player.secretVictoryPoints ? "vp-secret" : ""}>{victoryPointText(player, true)}</span>
-                      <span>{player.resourceCount}C</span>
-                      <span>{player.developmentCardCount}D</span>
-                      <span>R{player.longestRoadLength}</span>
+                    <div className="player-awards">
+                      {player.hasLongestRoad ? <span className="badge">Longest Road</span> : null}
+                      {player.hasLargestArmy ? <span className="badge">Largest Army</span> : null}
                     </div>
-                  </div>
-                  {player.hasLongestRoad ? <span className="badge">Longest Road</span> : null}
-                  {player.hasLargestArmy ? <span className="badge">Largest Army</span> : null}
-                  {player.resources ? (
-                    <div className="mini-resources">
-                      {resources.map((resource) => <ResourceCard key={resource} resource={resource} count={player.resources?.[resource] ?? 0} compact />)}
-                    </div>
-                  ) : null}
-                </article>
-              ))}
+                    {player.resources ? (
+                      <div className="mini-resources">
+                        {resources.map((resource) => <ResourceCard key={resource} resource={resource} count={player.resources?.[resource] ?? 0} compact />)}
+                      </div>
+                    ) : null}
+                  </article>
+                );
+              })}
             </div>
           </aside>
         </div>

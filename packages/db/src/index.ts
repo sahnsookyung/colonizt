@@ -20,6 +20,7 @@ export const migrationFiles = [
   "004_session_column_backfill.sql",
   "005_room_lifecycle_and_invites.sql",
   "006_liveness_and_room_leases.sql",
+  "007_room_timer.sql",
 ];
 
 export const readMigration = async (name: string): Promise<string> => readFile(join(migrationsDir, name), "utf8");
@@ -81,6 +82,7 @@ export interface PersistRoomInput {
   pausedAt?: string;
   pauseReason?: string;
   tradeResponseDeadlines?: Record<string, number>;
+  timer?: { activePlayerId: string; expiresAt: number };
   archivedAt?: string;
   cleanupReason?: string;
 }
@@ -171,9 +173,9 @@ const upsertRoomWithClient = async (client: pg.PoolClient, room: PersistRoomInpu
   await client.query(
       `INSERT INTO rooms(
          id, mode, status, host_user_id, settings_json, room_code,
-         last_activity_at, empty_since, paused_at, pause_reason, trade_deadlines_json, archived_at, cleanup_reason
+         last_activity_at, empty_since, paused_at, pause_reason, trade_deadlines_json, timer_json, archived_at, cleanup_reason
        )
-       VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::timestamptz, now()), $8, $9, $10, $11, $12, $13)
+       VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::timestamptz, now()), $8, $9, $10, $11, $12, $13, $14)
        ON CONFLICT (id) DO UPDATE
        SET mode = EXCLUDED.mode,
            status = EXCLUDED.status,
@@ -184,6 +186,7 @@ const upsertRoomWithClient = async (client: pg.PoolClient, room: PersistRoomInpu
            paused_at = EXCLUDED.paused_at,
            pause_reason = EXCLUDED.pause_reason,
            trade_deadlines_json = EXCLUDED.trade_deadlines_json,
+           timer_json = EXCLUDED.timer_json,
            archived_at = EXCLUDED.archived_at,
            cleanup_reason = EXCLUDED.cleanup_reason,
            updated_at = now()`,
@@ -199,6 +202,7 @@ const upsertRoomWithClient = async (client: pg.PoolClient, room: PersistRoomInpu
         room.pausedAt ?? null,
         room.pauseReason ?? null,
         room.tradeResponseDeadlines ? JSON.stringify(room.tradeResponseDeadlines) : null,
+        room.timer ? JSON.stringify(room.timer) : null,
         room.archivedAt ?? null,
         room.cleanupReason ?? null,
       ],
@@ -512,6 +516,7 @@ export interface PersistedRoomRecord {
   pausedAt?: string;
   pauseReason?: string;
   tradeResponseDeadlines?: Record<string, number>;
+  timer?: { activePlayerId: string; expiresAt: number };
   archivedAt?: string;
   cleanupReason?: string;
   seats: Array<{ seatIndex: number; userId?: string; botId?: string; ready: boolean; connected: boolean }>;
@@ -584,6 +589,12 @@ const hydratePersistedRoomRecords = async (pool: pg.Pool, rows: pg.QueryResultRo
           .filter((entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1])),
       );
     }
+    if (row.timer_json && typeof row.timer_json === "object") {
+      const timer = row.timer_json as Record<string, unknown>;
+      if (typeof timer.activePlayerId === "string" && typeof timer.expiresAt === "number" && Number.isFinite(timer.expiresAt)) {
+        record.timer = { activePlayerId: timer.activePlayerId, expiresAt: timer.expiresAt };
+      }
+    }
     if (matchRow) {
       record.match = {
         id: matchRow.id,
@@ -604,7 +615,7 @@ export const listPersistedRooms = async (pool: pg.Pool, limit = 50): Promise<Per
   const rooms = await pool.query(
     `SELECT
        id, room_code, mode, status, host_user_id, settings_json, created_at,
-       last_activity_at, empty_since, paused_at, pause_reason, trade_deadlines_json, archived_at, cleanup_reason
+       last_activity_at, empty_since, paused_at, pause_reason, trade_deadlines_json, timer_json, archived_at, cleanup_reason
      FROM rooms
      WHERE archived_at IS NULL
        AND status NOT IN ('EXPIRED', 'ABANDONED')
@@ -620,7 +631,7 @@ export const findPersistedRoomByRef = async (pool: pg.Pool, roomRef: string): Pr
   const rooms = await pool.query(
     `SELECT
        id, room_code, mode, status, host_user_id, settings_json, created_at,
-       last_activity_at, empty_since, paused_at, pause_reason, trade_deadlines_json, archived_at, cleanup_reason
+       last_activity_at, empty_since, paused_at, pause_reason, trade_deadlines_json, timer_json, archived_at, cleanup_reason
      FROM rooms
      WHERE id = $1 OR room_code = $2
      ORDER BY created_at DESC
@@ -629,6 +640,11 @@ export const findPersistedRoomByRef = async (pool: pg.Pool, roomRef: string): Pr
   );
   const [record] = await hydratePersistedRoomRecords(pool, rooms.rows);
   return record;
+};
+
+export const persistedRoomCodeExists = async (pool: pg.Pool, code: string): Promise<boolean> => {
+  const result = await pool.query("SELECT 1 FROM rooms WHERE room_code = $1 LIMIT 1", [code.trim().toUpperCase()]);
+  return (result.rowCount ?? 0) > 0;
 };
 
 export interface RoomLeaseRecord {

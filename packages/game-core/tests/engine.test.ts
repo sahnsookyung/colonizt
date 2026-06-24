@@ -17,6 +17,7 @@ import {
   maritimeTradeRatio,
   maxRoadsPerPlayer,
   normalizeImportedState,
+  projectedResourceBank,
   replay,
   resourceCount,
   resources,
@@ -305,6 +306,43 @@ describe("game setup and phases", () => {
         );
       }
     }
+  });
+
+  it("does not produce a resource for anyone when the bank cannot pay every earned card", () => {
+    const state = completeSetup(createDemoGame("bank-short-production")).state;
+    let shortage: { rngIndex: number; resource: (typeof resources)[number]; beforeBank: number } | undefined;
+    for (let candidate = state.rng.index; candidate < state.rng.index + 400 && !shortage; candidate += 2) {
+      const rolled = rollSeededDice(state.rng.seed, candidate);
+      if (rolled.dice[0] + rolled.dice[1] === 7) continue;
+      const trial = structuredClone(state) as GameState;
+      trial.rng.index = candidate;
+      const result = applyCommand(trial, { type: "ROLL_DICE", playerId: "p1" });
+      if (!result.ok) continue;
+      const produced = result.value.events.find((event) => event.type === "RESOURCES_PRODUCED");
+      if (produced?.type !== "RESOURCES_PRODUCED") continue;
+      for (const resource of resources) {
+        const total = Object.values(produced.gains).reduce((sum, gains) => sum + (gains[resource] ?? 0), 0);
+        if (total > 1) {
+          shortage = { rngIndex: candidate, resource, beforeBank: 1 };
+          break;
+        }
+      }
+    }
+    expect(shortage).toBeDefined();
+    if (!shortage) throw new Error("Expected a roll with multi-card resource production");
+    state.rng.index = shortage.rngIndex;
+    for (const player of Object.values(state.players)) player.resources[shortage.resource] = 0;
+    state.players.p2!.resources[shortage.resource] = 18;
+    state.resourceBank[shortage.resource] = shortage.beforeBank;
+
+    const result = applyOrThrow(state, { type: "ROLL_DICE", playerId: "p1" });
+    const produced = result.events.find((event) => event.type === "RESOURCES_PRODUCED");
+
+    if (produced?.type === "RESOURCES_PRODUCED") {
+      for (const gains of Object.values(produced.gains)) expect(gains[shortage.resource] ?? 0).toBe(0);
+    }
+    expect(result.state.resourceBank[shortage.resource]).toBe(shortage.beforeBank);
+    expect(result.state.players.p2!.resources[shortage.resource]).toBe(18);
   });
 
   it("strikes one random building per player when plight reaches its turn", () => {
@@ -781,16 +819,34 @@ describe("development cards, thief, and adjudication", () => {
     state.players.p1!.specialCards = 1;
 
     const own = serializeForViewer(state, "p1").players.find((player) => player.id === "p1");
-    expect(own).toMatchObject({ score: 4, secretVictoryPoints: 1, visibleVictoryPoints: 5 });
+    expect(own).toMatchObject({
+      score: 4,
+      publicVictoryPoints: 4,
+      secretVictoryPoints: 1,
+      visibleVictoryPoints: 5,
+      victoryPointBreakdown: expect.objectContaining({ publicTotal: 4, secret: 1, total: 5 }),
+    });
     expect(own?.developmentCards?.[0]?.type).toBe("VICTORY_POINT");
 
     const opponent = serializeForViewer(state, "p2").players.find((player) => player.id === "p1");
-    expect(opponent).toMatchObject({ score: 4, secretVictoryPoints: 0, visibleVictoryPoints: 4 });
+    expect(opponent).toMatchObject({
+      score: 4,
+      publicVictoryPoints: 4,
+      secretVictoryPoints: 0,
+      visibleVictoryPoints: 4,
+      victoryPointBreakdown: expect.objectContaining({ publicTotal: 4, secret: 0, total: 4 }),
+    });
     expect(opponent?.developmentCards).toBeUndefined();
 
     state = applyEvent(state, { schemaVersion: state.schemaVersion, seq: state.eventSeq + 1, type: "GAME_OVER", winnerId: "p1", reason: "VICTORY_POINTS" });
     const revealed = serializeForViewer(state, "p2").players.find((player) => player.id === "p1");
-    expect(revealed).toMatchObject({ secretVictoryPoints: 1, visibleVictoryPoints: 5 });
+    expect(revealed).toMatchObject({
+      score: 5,
+      publicVictoryPoints: 4,
+      secretVictoryPoints: 1,
+      visibleVictoryPoints: 5,
+      victoryPointBreakdown: expect.objectContaining({ publicTotal: 4, secret: 1, total: 5 }),
+    });
     expect(revealed?.developmentCards?.[0]?.type).toBe("VICTORY_POINT");
   });
 
@@ -820,8 +876,7 @@ describe("development cards, thief, and adjudication", () => {
   });
 
   it("creates seeded random forced discard bundles", () => {
-    const state = completeSetup(createDemoGame("forced-random-discard")).state;
-    state.players.p2!.resources = { ...emptyResources(), timber: 3, brick: 2, grain: 2, fiber: 1 };
+    const state = withResources(completeSetup(createDemoGame("forced-random-discard")).state, "p2", { timber: 3, brick: 2, grain: 2, fiber: 1 });
     state.phase = { type: "DISCARDING", activePlayerId: "p2", rollerId: "p1", pending: { p2: 4 }, submitted: {} };
 
     const discard = randomizedDiscard(state, "p2", 4);
@@ -904,6 +959,25 @@ describe("development cards, thief, and adjudication", () => {
     expect("seed" in viewer.config).toBe(false);
     expect("matchId" in viewer.config).toBe(false);
     expect(viewer.developmentDeckRemaining).toBe(state.developmentDeck.length - state.developmentDeckCursor);
+    expect(viewer.resourceBank).toEqual(state.resourceBank);
+  });
+
+  it("projects resource bank only for legacy states that have no persisted bank", () => {
+    const state = applyOrThrow(completeSetup(createDemoGame("legacy-bank-projection")).state, { type: "ROLL_DICE", playerId: "p1" }).state;
+    const legacy = structuredClone(state) as Omit<GameState, "resourceBank"> & { resourceBank?: ResourceBundle };
+    delete legacy.resourceBank;
+
+    expect(serializeForViewer(legacy as GameState, "p1").resourceBank).toEqual(projectedResourceBank(legacy));
+  });
+
+  it("does not clamp impossible projected bank shortages", () => {
+    const state = completeSetup(createDemoGame("bank-corruption")).state;
+    state.players.p1!.resources.timber = 20;
+    state.resourceBank = projectedResourceBank(state);
+
+    const result = assertInvariants(state);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.message).toContain("bank has negative resources");
   });
 
   it("allows Year of Plenty to take duplicate resources", () => {
@@ -914,6 +988,27 @@ describe("development cards, thief, and adjudication", () => {
 
     const played = applyOrThrow(state, { type: "PLAY_YEAR_OF_PLENTY", playerId: "p1", cardId: "plenty-card", resources: ["ore", "ore"] });
     expect(played.state.players.p1!.resources.ore).toBe(before + 2);
+    expect(played.state.resourceBank.ore).toBe(state.resourceBank.ore - 2);
+  });
+
+  it("rejects Year of Plenty and maritime trades when the bank lacks the requested resource", () => {
+    let state = applyOrThrow(completeSetup(createDemoGame("bank-special-shortage")).state, { type: "ROLL_DICE", playerId: "p1" }).state;
+    state.players.p1!.developmentCards = [{ id: "plenty-card", type: "YEAR_OF_PLENTY", ownerId: "p1", boughtTurn: state.turn - 1 }];
+    state.players.p1!.specialCards = 1;
+    for (const player of Object.values(state.players)) player.resources.ore = 0;
+    state.players.p2!.resources.ore = 18;
+    state.resourceBank.ore = 1;
+    expectReject(state, { type: "PLAY_YEAR_OF_PLENTY", playerId: "p1", cardId: "plenty-card", resources: ["ore", "ore"] }, "INSUFFICIENT_RESOURCES");
+
+    state = withResources(state, "p1", { timber: 4 });
+    for (const player of Object.values(state.players)) player.resources.grain = 0;
+    state.players.p2!.resources.grain = 19;
+    state.resourceBank.grain = 0;
+    const maritime = getLegalActions(state, "p1").find((action) => action.type === "MARITIME_TRADE");
+    expect(maritime?.type).toBe("MARITIME_TRADE");
+    if (maritime?.type !== "MARITIME_TRADE") throw new Error("Expected maritime trades");
+    expect(maritime.trades.some((trade) => trade.requested === "grain")).toBe(false);
+    expectReject(state, { type: "MARITIME_TRADE", playerId: "p1", offered: "timber", requested: "grain" }, "INSUFFICIENT_RESOURCES");
   });
 
   it("rejects exhausted decks and cards bought on the current turn", () => {

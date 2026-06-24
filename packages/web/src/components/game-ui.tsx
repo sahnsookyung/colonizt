@@ -1,4 +1,4 @@
-import { resources, type GameEvent, type GameState, type Resource, type ResourceBundle, type Terrain } from "@colonizt/game-core";
+import { resources, type DevelopmentCardType, type GameEvent, type GameState, type Resource, type ResourceBundle, type Terrain } from "@colonizt/game-core";
 
 export const resourceLabels: Record<Resource, string> = {
   timber: "Timber",
@@ -250,6 +250,111 @@ export const SpecialSymbol = () => (
   <svg className="action-symbol" viewBox="0 0 100 100" aria-hidden="true">
     <rect className="symbol-card special-card" x="24" y="14" width="52" height="72" rx="9" />
     <path className="symbol-star" d="m50 27 7 14 16 2-12 11 3 16-14-8-14 8 3-16-12-11 16-2 7-14Z" />
+  </svg>
+);
+
+export const DevelopmentCardIcon = ({ type, hidden = false }: { type?: DevelopmentCardType; hidden?: boolean }) => {
+  const cardClass = hidden ? "hidden" : type?.toLowerCase().replaceAll("_", "-") ?? "unknown";
+  return (
+    <svg className={`development-card-icon development-card-icon-${cardClass}`} viewBox="0 0 100 130" aria-hidden="true">
+      <rect className="dev-card-face" x="12" y="8" width="76" height="114" rx="11" />
+      {hidden || !type ? (
+        <>
+          <path className="dev-card-mark" d="M35 47c0-12 8-20 20-20 11 0 19 7 19 17 0 8-4 13-12 18-6 4-8 8-8 15" />
+          <circle className="dev-card-dot" cx="54" cy="93" r="5" />
+        </>
+      ) : null}
+      {type === "KNIGHT" ? (
+        <>
+          <path className="dev-card-shield" d="M50 25 72 34v22c0 18-9 32-22 43-13-11-22-25-22-43V34l22-9Z" />
+          <path className="dev-card-line" d="M50 31v62M35 50h30" />
+          <path className="dev-card-crest" d="M39 33c4-11 18-11 22 0" />
+        </>
+      ) : null}
+      {type === "ROAD_BUILDING" ? (
+        <>
+          <rect className="dev-card-road" x="25" y="41" width="51" height="16" rx="8" transform="rotate(-22 50 49)" />
+          <rect className="dev-card-road alt" x="24" y="72" width="51" height="16" rx="8" transform="rotate(22 50 80)" />
+          <path className="dev-card-line" d="M30 53h38M32 80h37" />
+        </>
+      ) : null}
+      {type === "MONOPOLY" ? (
+        <>
+          <path className="dev-card-column" d="M30 48h40v47H30z" />
+          <path className="dev-card-line" d="M24 48h52M24 95h52M39 48v47M50 48v47M61 48v47" />
+          <path className="dev-card-crown" d="M30 42 50 25l20 17Z" />
+        </>
+      ) : null}
+      {type === "YEAR_OF_PLENTY" ? (
+        <>
+          <path className="dev-card-basket" d="M29 65h42l-7 31H36l-7-31Z" />
+          <path className="dev-card-line" d="M33 65c2-20 32-20 34 0M39 75h22M40 86h20" />
+          <circle className="dev-card-fruit" cx="42" cy="56" r="7" />
+          <circle className="dev-card-fruit alt" cx="56" cy="54" r="8" />
+        </>
+      ) : null}
+      {type === "VICTORY_POINT" ? (
+        <>
+          <path className="dev-card-star" d="m50 26 8 18 20 2-15 13 4 20-17-10-17 10 4-20-15-13 20-2 8-18Z" />
+          <path className="dev-card-ribbon" d="M37 82h26v22l-13-7-13 7V82Z" />
+        </>
+      ) : null}
+    </svg>
+  );
+};
+
+export const BotSymbol = () => (
+  <svg className="stat-symbol bot-symbol" viewBox="0 0 100 100" aria-hidden="true">
+    <rect className="stat-symbol-fill" x="22" y="28" width="56" height="46" rx="12" />
+    <path className="stat-symbol-stroke" d="M50 28V15M38 15h24M34 74v11M66 74v11" />
+    <circle className="stat-symbol-eye" cx="39" cy="51" r="5" />
+    <circle className="stat-symbol-eye" cx="61" cy="51" r="5" />
+    <path className="stat-symbol-stroke" d="M38 64h24" />
+  </svg>
+);
+
+export const HumanSymbol = () => (
+  <svg className="stat-symbol human-symbol" viewBox="0 0 100 100" aria-hidden="true">
+    <circle className="stat-symbol-fill" cx="50" cy="34" r="17" />
+    <path className="stat-symbol-fill" d="M24 85c4-22 16-34 26-34s22 12 26 34H24Z" />
+  </svg>
+);
+
+export const CardsSymbol = () => (
+  <svg className="stat-symbol cards-symbol" viewBox="0 0 100 100" aria-hidden="true">
+    <rect className="stat-symbol-fill" x="25" y="20" width="42" height="58" rx="7" transform="rotate(-8 46 49)" />
+    <rect className="stat-symbol-fill alt" x="36" y="24" width="42" height="58" rx="7" />
+    <path className="stat-symbol-stroke" d="M46 45h22M46 57h18" />
+  </svg>
+);
+
+export const KnightStatSymbol = () => (
+  <svg className="stat-symbol knight-stat-symbol" viewBox="0 0 100 100" aria-hidden="true">
+    <path className="stat-symbol-fill" d="M50 13 76 24v27c0 20-10 34-26 45-16-11-26-25-26-45V24l26-11Z" />
+    <path className="stat-symbol-stroke" d="M50 20v67M34 43h32" />
+  </svg>
+);
+
+export const RobberSymbol = () => (
+  <svg className="stat-symbol robber-stat-symbol" viewBox="0 0 100 100" aria-hidden="true">
+    <path className="stat-symbol-fill" d="M24 87c4-23 15-35 26-35s22 12 26 35H24Z" />
+    <path className="stat-symbol-fill alt" d="M28 43c0-15 10-27 22-27s22 12 22 27c0 13-10 23-22 23S28 56 28 43Z" />
+    <path className="stat-symbol-cutout" d="M38 43c2-8 6-12 12-12s10 4 12 12c-2 8-6 12-12 12s-10-4-12-12Z" />
+    <circle className="stat-symbol-eye" cx="45" cy="42" r="3.5" />
+    <circle className="stat-symbol-eye" cx="55" cy="42" r="3.5" />
+  </svg>
+);
+
+export const RoadStatSymbol = () => (
+  <svg className="stat-symbol road-stat-symbol" viewBox="0 0 100 100" aria-hidden="true">
+    <rect className="stat-symbol-fill" x="14" y="40" width="72" height="20" rx="10" transform="rotate(-18 50 50)" />
+    <path className="stat-symbol-stroke" d="M29 56h43" />
+  </svg>
+);
+
+export const VictoryPointStatSymbol = () => (
+  <svg className="stat-symbol vp-stat-symbol" viewBox="0 0 100 100" aria-hidden="true">
+    <path className="stat-symbol-fill" d="m50 13 10 22 24 3-18 16 5 24-21-12-21 12 5-24-18-16 24-3 10-22Z" />
   </svg>
 );
 

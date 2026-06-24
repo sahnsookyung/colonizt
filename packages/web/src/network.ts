@@ -65,6 +65,15 @@ const fetchRuntimeConfig = async (url: string, fallbackApiBaseUrl: string): Prom
   }
 };
 
+const errorPayload = async (response: Response, fallbackCode: string, fallbackMessage: string): Promise<unknown> => {
+  const payload = await response.json().catch(() => undefined) as { code?: unknown; message?: unknown } | undefined;
+  return {
+    code: typeof payload?.code === "string" ? payload.code : fallbackCode,
+    message: typeof payload?.message === "string" ? payload.message : fallbackMessage,
+    status: response.status,
+  };
+};
+
 export const resolveRuntimeConfig = async (seedBaseUrl = configuredBaseUrl): Promise<ResolvedRuntimeNetworkConfig> => {
   const normalizedSeed = seedBaseUrl ? trimTrailingSlash(seedBaseUrl) : undefined;
   const cacheKey = normalizedSeed ?? "__default__";
@@ -144,7 +153,7 @@ export const createNetworkClient = (baseUrl = configuredBaseUrl): NetworkClient 
   async loadReplay(replayId, token) {
     const config = await resolveRuntimeConfig(baseUrl);
     const response = await fetch(`${config.apiBaseUrl}/matches/${encodeURIComponent(replayId)}/replay`, token ? { headers: { "x-session-token": token } } : undefined);
-    if (!response.ok) throw new Error("Replay load failed");
+    if (!response.ok) throw await errorPayload(response, response.status === 404 ? "REPLAY_NOT_FOUND" : "REPLAY_LOAD_FAILED", "Replay load failed");
     return response.json() as Promise<ReplayLogPayload>;
   },
   async createWebSocketTicket(token) {

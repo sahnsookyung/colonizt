@@ -68,6 +68,9 @@ export class RoomAutomationScheduler {
           if (expired.events.some((event) => event.type === "TURN_ENDED")) this.options.metrics.recordScheduler("forced_end_turn");
           if (expired.events.some((event) => event.type === "TRADE_CLOSED" && event.reason === "RESPONSE_TIMEOUT")) this.options.metrics.recordScheduler("trade_timeout");
           this.options.onEvents(roomId, expired);
+        } else if (expired && !expired.ok) {
+          this.options.metrics.recordScheduler("turn_expiry_rejected");
+          this.options.onAutomationRejected?.(roomId, expired);
         }
         const bot = await this.options.manager.runDueBotAutomation(roomId, now);
         if (bot?.ok && bot.events.length > 0) {

@@ -262,6 +262,160 @@ describe("WebSocket gateway", () => {
     expect(manager.roomForRef(room.id)?.seats.some((seat) => seat.userId === guest.userId)).toBe(false);
   });
 
+  it("updates lobby names and settings, then starts by host Go from two ready players", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Host");
+    const guest = await manager.createSession("Guest");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 4 });
+    const app = await buildServer({ manager });
+    servers.push({ close: () => app.close() });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const hostSocket = await openSocket(app, host.token, { forwardedFor: "203.0.113.61" });
+    const guestSocket = await openSocket(app, guest.token, { forwardedFor: "198.51.100.71" });
+
+    hostSocket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.code }));
+    guestSocket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.code }));
+    await Promise.all([
+      waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string; seats: Array<{ userId?: string }> } }>(
+        hostSocket,
+        "ROOM_STATE",
+        (message) => message.room.id === room.id && message.room.seats.some((seat) => seat.userId === guest.userId),
+      ),
+      waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string; seats: Array<{ userId?: string }> } }>(
+        guestSocket,
+        "ROOM_STATE",
+        (message) => message.room.id === room.id && message.room.seats.some((seat) => seat.userId === guest.userId),
+      ),
+    ]);
+
+    hostSocket.send(JSON.stringify({ type: "UPDATE_DISPLAY_NAME", displayName: "Captain Host" }));
+    const named = await waitForMessageWhere<{ type: "ROOM_STATE"; room: { seats: Array<{ userId?: string; displayName?: string }> } }>(
+      guestSocket,
+      "ROOM_STATE",
+      (message) => message.room.seats.some((seat) => seat.userId === host.userId && seat.displayName === "Captain Host"),
+    );
+    expect(named.room.seats).toEqual(expect.arrayContaining([expect.objectContaining({ userId: host.userId, displayName: "Captain Host" })]));
+
+    hostSocket.send(JSON.stringify({
+      type: "UPDATE_ROOM_SETTINGS",
+      roomId: room.code,
+      settings: { minPlayers: 2, maxPlayers: 3, botDifficulty: "hard", rules: { mapPreset: "continent" } },
+    }));
+    const settingsUpdate = await waitForMessageWhere<{
+      type: "ROOM_STATE";
+      room: {
+        settings: { minPlayers?: number; maxPlayers?: number; botDifficulty?: string; rules?: { mapPreset?: string; mapRandomized?: boolean } };
+        seats: Array<{ ready: boolean }>;
+      };
+    }>(
+      hostSocket,
+      "ROOM_STATE",
+      (message) => message.room.settings.maxPlayers === 3 && message.room.settings.rules?.mapPreset === "continent",
+    );
+    expect(settingsUpdate.room.settings).toMatchObject({
+      minPlayers: 2,
+      maxPlayers: 3,
+      botDifficulty: "hard",
+      rules: { mapPreset: "continent", mapRandomized: true },
+    });
+    expect(settingsUpdate.room.seats.every((seat) => seat.ready === false)).toBe(true);
+
+    hostSocket.send(JSON.stringify({ type: "READY", roomId: room.code, ready: true }));
+    guestSocket.send(JSON.stringify({ type: "READY", roomId: room.code, ready: true }));
+    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { status: string; seats: Array<{ userId?: string; ready: boolean }> } }>(
+      hostSocket,
+      "ROOM_STATE",
+      (message) => message.room.status === "LOBBY"
+        && message.room.seats.some((seat) => seat.userId === host.userId && seat.ready)
+        && message.room.seats.some((seat) => seat.userId === guest.userId && seat.ready),
+    );
+
+    hostSocket.send(JSON.stringify({ type: "START_ROOM", roomId: room.code }));
+    const started = await waitForMessageWhere<{ type: "ROOM_STATE"; room: { status: string; game?: ViewerState } }>(
+      guestSocket,
+      "ROOM_STATE",
+      (message) => message.room.status === "IN_GAME" && Boolean(message.room.game),
+    );
+
+    expect(started.room.status).toBe("IN_GAME");
+    expect(manager.roomForRef(room.id)?.game?.playerOrder).toEqual([host.userId, guest.userId]);
+    expect(manager.roomForRef(room.id)?.game?.config.playerNames).toMatchObject({ [host.userId]: "Captain Host" });
+  });
+
+  it("adds and removes lobby bots by room code before starting a mixed game", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Host");
+    const guest = await manager.createSession("Guest");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 4 });
+    const app = await buildServer({ manager });
+    servers.push({ close: () => app.close() });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const hostSocket = await openSocket(app, host.token, { forwardedFor: "203.0.113.62" });
+    const guestSocket = await openSocket(app, guest.token, { forwardedFor: "198.51.100.72" });
+
+    hostSocket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.code }));
+    guestSocket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.code }));
+    await Promise.all([
+      waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string; seats: Array<{ userId?: string }> } }>(
+        hostSocket,
+        "ROOM_STATE",
+        (message) => message.room.id === room.id && message.room.seats.some((seat) => seat.userId === guest.userId),
+      ),
+      waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string; seats: Array<{ userId?: string }> } }>(
+        guestSocket,
+        "ROOM_STATE",
+        (message) => message.room.id === room.id && message.room.seats.some((seat) => seat.userId === guest.userId),
+      ),
+    ]);
+
+    hostSocket.send(JSON.stringify({ type: "ADD_BOT", roomId: room.code }));
+    const botAdded = await waitForMessageWhere<{ type: "ROOM_STATE"; room: { seats: Array<{ botId?: string; ready: boolean; connected: boolean }> } }>(
+      guestSocket,
+      "ROOM_STATE",
+      (message) => message.room.seats.some((seat) => seat.botId === "bot_3"),
+    );
+    expect(botAdded.room.seats).toEqual(expect.arrayContaining([expect.objectContaining({ botId: "bot_3", ready: true, connected: true })]));
+
+    hostSocket.send(JSON.stringify({ type: "REMOVE_BOT", roomId: room.code, seatIndex: 2 }));
+    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { seats: Array<{ botId?: string }> } }>(
+      guestSocket,
+      "ROOM_STATE",
+      (message) => !message.room.seats.some((seat) => seat.botId === "bot_3"),
+    );
+
+    hostSocket.send(JSON.stringify({ type: "ADD_BOT", roomId: room.code }));
+    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { seats: Array<{ botId?: string }> } }>(
+      hostSocket,
+      "ROOM_STATE",
+      (message) => message.room.seats.some((seat) => seat.botId === "bot_3"),
+    );
+    hostSocket.send(JSON.stringify({ type: "ADD_BOT", roomId: room.code }));
+    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { seats: Array<{ botId?: string }> } }>(
+      hostSocket,
+      "ROOM_STATE",
+      (message) => message.room.seats.some((seat) => seat.botId === "bot_4"),
+    );
+
+    hostSocket.send(JSON.stringify({ type: "READY", roomId: room.code, ready: true }));
+    guestSocket.send(JSON.stringify({ type: "READY", roomId: room.code, ready: true }));
+    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { status: string; seats: Array<{ userId?: string; ready: boolean }> } }>(
+      hostSocket,
+      "ROOM_STATE",
+      (message) => message.room.status === "LOBBY"
+        && message.room.seats.some((seat) => seat.userId === host.userId && seat.ready)
+        && message.room.seats.some((seat) => seat.userId === guest.userId && seat.ready),
+    );
+
+    hostSocket.send(JSON.stringify({ type: "START_ROOM", roomId: room.code }));
+    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { status: string; game?: ViewerState } }>(
+      guestSocket,
+      "ROOM_STATE",
+      (message) => message.room.status === "IN_GAME" && Boolean(message.room.game),
+    );
+
+    expect(manager.roomForRef(room.id)?.game?.playerOrder).toEqual([host.userId, guest.userId, "bot_3", "bot_4"]);
+  });
+
   it("keeps simultaneous room broadcasts isolated across simulated networks", async () => {
     const manager = new RoomManager();
     const hostA = await manager.createSession("Host A");
@@ -316,8 +470,10 @@ describe("WebSocket gateway", () => {
       if (!joined.ok) throw new Error("Failed to join test room");
       await manager.setReady(room.id, host, true);
       const ready = await manager.setReady(room.id, player, true);
-      if (!ready.ok || !ready.room.game) throw new Error("Failed to start test room");
-      rooms.push({ host, observer, room, game: ready.room.game });
+      if (!ready.ok) throw new Error("Failed to ready test room");
+      const started = await manager.startRoomByHost(room.code, host);
+      if (!started.ok || !started.room.game) throw new Error("Failed to start test room");
+      rooms.push({ host, observer, room, game: started.room.game });
     }
     const app = await buildServer({ manager });
     servers.push({ close: () => app.close() });
@@ -478,6 +634,29 @@ describe("WebSocket gateway", () => {
     expect((await waitForMessage<{ type: "ERROR"; code: string }>(socket, "ERROR")).code).toBe("BAD_JSON");
     socket.send(JSON.stringify({ type: "PING", nonce: "still-open" }));
     expect(await waitForMessage(socket, "PONG")).toMatchObject({ type: "PONG", nonce: "still-open" });
+  });
+
+  it("disconnects stale in-game sockets without abandoning the room", async () => {
+    const manager = new RoomManager(undefined, { emptyGameTtlMs: 60_000 });
+    const host = await manager.createSession("Host");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: true, ranked: false });
+    const ready = await manager.setReady(room.id, host, true);
+    if (!ready.ok) throw new Error("Failed to start room");
+    const app = await buildServer({ manager, presenceStaleMs: 25, presenceSweepIntervalMs: 10 });
+    servers.push({ close: () => app.close() });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+
+    const socket = await openSocket(app, host.token);
+    socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.id }));
+    await waitForMessage(socket, "ROOM_STATE");
+
+    const closed = await waitForClose(socket);
+    expect(closed).toMatchObject({ code: 4000, reason: "Presence stale" });
+    expect(room.status).toBe("IN_GAME");
+    expect(room.archivedAt).toBeUndefined();
+    expect(room.seats.find((seat) => seat.userId === host.userId)).toMatchObject({ connected: false });
+    expect(room.pausedAt).toBeDefined();
+    expect(room.pauseReason).toBe("EMPTY_ROOM");
   });
 
   it("resyncs missed broadcasts after reconnect with a fresh ticket", async () => {

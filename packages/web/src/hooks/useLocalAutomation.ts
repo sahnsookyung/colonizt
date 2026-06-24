@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, type Dispatch, type MutableRefObject, t
 import {
   emptyResources,
   hasResources,
+  tradeRecipientIds,
   type GameCommand,
   type GameEvent,
   type GameState,
@@ -23,6 +24,32 @@ const botActionDelays = {
   BUILD_ROAD: 550,
   DEFAULT: 450,
 } as const;
+
+const tradeFullyAnswered = (state: GameState, trade: GameState["trades"][string]): boolean =>
+  tradeRecipientIds(state, trade).every((playerId) => {
+    const status = trade.responses?.[playerId]?.status;
+    return Boolean(status) && status !== "PENDING";
+  });
+
+const resolveBotOfferCommand = (state: GameState, tradeId: string, humanPlayerId: PlayerId): GameCommand | undefined => {
+  const trade = state.trades[tradeId];
+  if (!trade || trade.status !== "COLLECTING_RESPONSES") return undefined;
+  const currentBotIds = new Set(localBotPlayerIdsForState(state, humanPlayerId));
+  if (!currentBotIds.has(trade.fromPlayerId)) return undefined;
+  const controller = botForLocalPlayer(state, trade.fromPlayerId, humanPlayerId);
+  const candidates = tradeRecipientIds(state, trade)
+    .filter((playerId) => trade.responses?.[playerId]?.status === "WANTS_ACCEPT")
+    .filter((playerId) =>
+      hasResources(state.players[trade.fromPlayerId]?.resources ?? emptyResources(), trade.offered)
+      && hasResources(state.players[playerId]?.resources ?? emptyResources(), trade.requested),
+    )
+    .map((playerId) => ({ playerId, score: scoreTradeResponder(state, trade, playerId, controller.profile, state.config.botDifficulty ?? "medium") }))
+    .sort((left, right) => right.score - left.score || state.playerOrder.indexOf(left.playerId) - state.playerOrder.indexOf(right.playerId));
+  const selected = candidates[0]?.playerId;
+  return selected
+    ? { type: "FINALIZE_TRADE", playerId: trade.fromPlayerId, tradeId: trade.id, toPlayerId: selected }
+    : { type: "CANCEL_TRADE", playerId: trade.fromPlayerId, tradeId: trade.id };
+};
 
 interface LocalCommandResult {
   state: GameState;
@@ -151,6 +178,21 @@ export const useLocalAutomation = ({
         tradeResponseTimersRef.current.set(key, timer);
       });
 
+      const currentBotIds = new Set(localBotPlayerIdsForState(state, humanPlayerId));
+      const responseKey = tradeRecipientIds(state, trade).map((playerId) => `${playerId}:${trade.responses?.[playerId]?.status ?? "PENDING"}`).join("|");
+      const readyResolutionKey = `resolve:${trade.id}:${trade.createdAtSeq}:${responseKey}`;
+      if (currentBotIds.has(trade.fromPlayerId) && tradeFullyAnswered(state, trade) && !tradeResponseTimersRef.current.has(readyResolutionKey)) {
+        const timer = setTimeout(() => {
+          tradeResponseTimersRef.current.delete(readyResolutionKey);
+          const current = stateRef.current;
+          const currentTrade = current.trades[trade.id];
+          if (!currentTrade || currentTrade.status !== "COLLECTING_RESPONSES" || !tradeFullyAnswered(current, currentTrade)) return;
+          const command = resolveBotOfferCommand(current, currentTrade.id, humanPlayerId);
+          if (command) applyLocalCommandRef.current(command);
+        }, 300);
+        tradeResponseTimersRef.current.set(readyResolutionKey, timer);
+      }
+
       const deadlineKey = `deadline:${trade.id}:${trade.createdAtSeq}`;
       if (tradeResponseTimersRef.current.has(deadlineKey)) return;
       const timer = setTimeout(() => {
@@ -163,21 +205,8 @@ export const useLocalAutomation = ({
           applyLocalCommandRef.current({ type: "EXPIRE_TRADE", playerId: currentTrade.fromPlayerId, tradeId: currentTrade.id, reason: "RESPONSE_TIMEOUT" });
           return;
         }
-        const controller = botForLocalPlayer(current, currentTrade.fromPlayerId, humanPlayerId);
-        const candidates = current.playerOrder
-          .filter((playerId) => playerId !== currentTrade.fromPlayerId)
-          .filter((playerId) => currentTrade.recipients === "ANY" || currentTrade.recipients.includes(playerId))
-          .filter((playerId) => currentTrade.responses?.[playerId]?.status === "WANTS_ACCEPT")
-          .filter((playerId) =>
-            hasResources(current.players[currentTrade.fromPlayerId]?.resources ?? emptyResources(), currentTrade.offered)
-            && hasResources(current.players[playerId]?.resources ?? emptyResources(), currentTrade.requested),
-          )
-          .map((playerId) => ({ playerId, score: scoreTradeResponder(current, currentTrade, playerId, controller.profile, current.config.botDifficulty ?? "medium") }))
-          .sort((left, right) => right.score - left.score || current.playerOrder.indexOf(left.playerId) - current.playerOrder.indexOf(right.playerId));
-        const selected = candidates[0]?.playerId;
-        applyLocalCommandRef.current(selected
-          ? { type: "FINALIZE_TRADE", playerId: currentTrade.fromPlayerId, tradeId: currentTrade.id, toPlayerId: selected }
-          : { type: "CANCEL_TRADE", playerId: currentTrade.fromPlayerId, tradeId: currentTrade.id });
+        const command = resolveBotOfferCommand(current, currentTrade.id, humanPlayerId);
+        if (command) applyLocalCommandRef.current(command);
       }, Math.max(0, (localTradeDeadlines[trade.id] ?? Date.now() + 15_000) - Date.now()));
       tradeResponseTimersRef.current.set(deadlineKey, timer);
     });
@@ -189,6 +218,7 @@ export const useLocalAutomation = ({
     humanPlayerId,
     localTradeDeadlines,
     setLocalTradeDeadlines,
+    state.playerOrder,
     state.trades,
     stateRef,
   ]);

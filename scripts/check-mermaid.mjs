@@ -1,8 +1,11 @@
 /* global console */
 import { readFileSync } from "node:fs";
 
-const docs = ["docs/architecture.md"];
+const docs = ["docs/architecture.md", "README.md"];
 const allowedHeaders = ["flowchart", "sequenceDiagram", "erDiagram"];
+const maxReadableLines = 80;
+const maxReadableLineChars = 118;
+const maxReadableLabelChars = 72;
 
 const assertBalanced = (block, path, blockIndex, firstLine) => {
   const stack = [];
@@ -36,6 +39,28 @@ const assertBalanced = (block, path, blockIndex, firstLine) => {
   if (stack.length > 0) throw new Error(`${path} mermaid block ${blockIndex} has unbalanced brackets`);
 };
 
+const normalizedLabel = (label) =>
+  label.replace(/<br\s*\/?>/gi, " ").replace(/\s+/g, " ").trim();
+
+const assertReadable = (block, path, blockIndex) => {
+  const lines = block.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  if (lines.length > maxReadableLines) {
+    throw new Error(`${path} mermaid block ${blockIndex} has ${lines.length} lines; split dense diagrams before they become unreadable`);
+  }
+  lines.forEach((line, lineIndex) => {
+    if (line.length > maxReadableLineChars) {
+      throw new Error(`${path} mermaid block ${blockIndex} line ${lineIndex + 1} is too long for readable rendering`);
+    }
+  });
+
+  for (const match of block.matchAll(/"([^"]+)"/g)) {
+    const label = normalizedLabel(match[1] ?? "");
+    if (label.length > maxReadableLabelChars) {
+      throw new Error(`${path} mermaid block ${blockIndex} label "${label}" is too long; move detail into prose`);
+    }
+  }
+};
+
 for (const path of docs) {
   const content = readFileSync(path, "utf8");
   const blocks = [...content.matchAll(/```mermaid\n([\s\S]*?)\n```/g)].map((match) => match[1] ?? "");
@@ -46,6 +71,7 @@ for (const path of docs) {
       throw new Error(`${path} mermaid block ${index + 1} starts with unsupported header "${firstLine}"`);
     }
     assertBalanced(block, path, index + 1, firstLine);
+    assertReadable(block, path, index + 1);
   });
   console.log(`Validated ${blocks.length} Mermaid block(s) in ${path}`);
 }

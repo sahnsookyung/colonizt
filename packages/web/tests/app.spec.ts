@@ -75,11 +75,53 @@ test("medium desktop HUD keeps every resource visible and compact", async ({ pag
   for (const card of metrics.cards) {
     expect(card.left).toBeGreaterThanOrEqual(0);
     expect(card.right).toBeLessThanOrEqual(metrics.viewportWidth + 1);
-    expect(card.width).toBeGreaterThan(48);
+    expect(card.width).toBeGreaterThan(40);
   }
   expect(metrics.hand.right).toBeLessThanOrEqual(metrics.actions.left - 8);
   expect(metrics.hand.height).toBeLessThanOrEqual(82);
   expect(metrics.actions.height).toBeLessThanOrEqual(78);
+});
+
+test("desktop game screen fits the viewport without page scrolling", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop project only");
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("button", { name: /Bot Match/ }).click();
+  await expect(page.getByLabel("Game board and actions")).toBeVisible();
+
+  const metrics = await page.evaluate(() => {
+    const box = (selector: string) => {
+      const element = document.querySelector(selector);
+      if (!element) throw new Error(`Missing ${selector}`);
+      const rect = element.getBoundingClientRect();
+      return { bottom: rect.bottom, height: rect.height, left: rect.left, right: rect.right, top: rect.top, width: rect.width };
+    };
+    const playerCards = [...document.querySelectorAll<HTMLElement>(".players .player")].map((player) => {
+      const rect = player.getBoundingClientRect();
+      return { bottom: rect.bottom, top: rect.top, height: rect.height };
+    });
+    return {
+      viewportHeight: window.innerHeight,
+      viewportWidth: window.innerWidth,
+      documentScrollHeight: document.documentElement.scrollHeight,
+      bodyScrollHeight: document.body.scrollHeight,
+      shell: box(".app-shell"),
+      boardLayout: box(".board-layout"),
+      boardStage: box(".board-stage"),
+      sidePanel: box(".side-panel"),
+      players: box(".players"),
+      playerCards,
+    };
+  });
+
+  expect(metrics.documentScrollHeight).toBeLessThanOrEqual(metrics.viewportHeight + 1);
+  expect(metrics.bodyScrollHeight).toBeLessThanOrEqual(metrics.viewportHeight + 1);
+  expect(metrics.shell.height).toBeLessThanOrEqual(metrics.viewportHeight + 1);
+  expect(metrics.boardLayout.bottom).toBeLessThanOrEqual(metrics.viewportHeight + 1);
+  expect(metrics.boardStage.bottom).toBeLessThanOrEqual(metrics.viewportHeight + 1);
+  expect(metrics.sidePanel.bottom).toBeLessThanOrEqual(metrics.viewportHeight + 1);
+  expect(metrics.playerCards).toHaveLength(4);
+  expect(metrics.playerCards.at(-1)?.bottom ?? 0).toBeLessThanOrEqual(metrics.viewportHeight + 1);
 });
 
 test("action controls use solid contained colors", async ({ page, isMobile }) => {
@@ -120,6 +162,87 @@ test("action controls use solid contained colors", async ({ page, isMobile }) =>
     expect(button.backgroundImage).toBe("none");
     expect(button.alpha).toBe(1);
   }
+});
+
+test("dynamic UI text stays contained without overlapping controls", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: /Bot Match/ }).click();
+  await expect(page.getByLabel("Game board and actions")).toBeVisible();
+
+  await page.evaluate(() => {
+    const longText = "GeneratedTextWithoutNaturalBreaks".repeat(6);
+    const setText = (selector: string, prefix: string) => {
+      document.querySelectorAll<HTMLElement>(selector).forEach((element, index) => {
+        element.textContent = `${prefix} ${index + 1} ${longText}`;
+      });
+    };
+    setText(".player-heading strong", "Player");
+    setText(".phase-card strong", "Panel");
+    setText(".phase-card > span:not(.eyebrow)", "Status");
+    setText(".board-action span", "Action");
+    setText(".game-log-panel li", "Event");
+  });
+
+  const issues = await page.evaluate(() => {
+    type Rect = { bottom: number; height: number; left: number; right: number; top: number; width: number };
+    const rectFor = (element: Element): Rect => {
+      const rect = element.getBoundingClientRect();
+      return { bottom: rect.bottom, height: rect.height, left: rect.left, right: rect.right, top: rect.top, width: rect.width };
+    };
+    const isVisible = (element: Element) => {
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
+    const boundaryFor = (element: HTMLElement) =>
+      element.closest<HTMLElement>(".board-action,.player-heading,.player-mobile-stats,.phase-card,.event-strip,.topbar,.lobby-seat")
+      ?? element.parentElement;
+    const problems: string[] = [];
+
+    for (const selector of [
+      ".player-heading strong",
+      ".player-mobile-stats span",
+      ".phase-card strong",
+      ".phase-card > span:not(.eyebrow)",
+      ".board-action span",
+      ".panel-title strong",
+      ".panel-title span",
+    ]) {
+      document.querySelectorAll<HTMLElement>(selector).forEach((element) => {
+        if (!isVisible(element)) return;
+        const boundary = boundaryFor(element);
+        if (!boundary || !isVisible(boundary)) return;
+        const rect = rectFor(element);
+        const bounds = rectFor(boundary);
+        if (rect.left < bounds.left - 1 || rect.right > bounds.right + 1 || rect.top < bounds.top - 1 || rect.bottom > bounds.bottom + 1) {
+          problems.push(`${selector} escapes ${boundary.className}`);
+        }
+      });
+    }
+
+    const overlaps = (left: Rect, right: Rect) =>
+      Math.min(left.right, right.right) - Math.max(left.left, right.left) > 1
+      && Math.min(left.bottom, right.bottom) - Math.max(left.top, right.top) > 1;
+
+    for (const selector of [".players", ".board-action-bar", ".game-log-panel ol", ".side-panel"]) {
+      const container = document.querySelector<HTMLElement>(selector);
+      if (!container || !isVisible(container)) continue;
+      const boxes = [...container.children]
+        .filter((child) => isVisible(child))
+        .map((child) => ({ name: child.className || child.tagName, rect: rectFor(child) }));
+      for (let leftIndex = 0; leftIndex < boxes.length; leftIndex += 1) {
+        for (let rightIndex = leftIndex + 1; rightIndex < boxes.length; rightIndex += 1) {
+          const left = boxes[leftIndex]!;
+          const right = boxes[rightIndex]!;
+          if (overlaps(left.rect, right.rect)) problems.push(`${selector} children overlap: ${left.name} / ${right.name}`);
+        }
+      }
+    }
+
+    return problems;
+  });
+
+  expect(issues).toEqual([]);
 });
 
 test("board tile drags do not create native SVG selection artifacts", async ({ page, isMobile }) => {
@@ -193,4 +316,149 @@ test("mobile viewport keeps primary controls visible", async ({ page, isMobile }
   expect(metrics.actions.height).toBeLessThanOrEqual(64);
   expect(metrics.actions.right).toBeLessThanOrEqual(metrics.viewportWidth + 1);
   expect(metrics.players.bottom).toBeLessThanOrEqual(72);
+});
+
+test("mobile online lobby stays scrollable and starts from two ready players", async ({ page, isMobile }) => {
+  test.skip(!isMobile, "mobile project only");
+  await page.setViewportSize({ width: 390, height: 640 });
+  await page.addInitScript(() => {
+    type TestSeat = { seatIndex: number; userId?: string; botId?: string; displayName?: string; ready: boolean; connected: boolean };
+    type TestRoom = {
+      id: string;
+      code: string;
+      inviteUrl: string;
+      status: string;
+      hostUserId: string;
+      settings: {
+        mode: string;
+        botFill: boolean;
+        ranked: boolean;
+        minPlayers: number;
+        maxPlayers: number;
+        botDifficulty: string;
+        rules: { mapPreset: string; mapRandomized: boolean };
+      };
+      seats: TestSeat[];
+      spectatorCount: number;
+      events: unknown[];
+    };
+    const testWindow = window as typeof window & {
+      __lobbyRoom: TestRoom;
+      __sentMessages: unknown[];
+    };
+    testWindow.__sentMessages = [];
+    testWindow.__lobbyRoom = {
+      id: "room_mobile",
+      code: "MOB123",
+      inviteUrl: "https://play.example/?room=MOB123",
+      status: "LOBBY",
+      hostUserId: "u_host",
+      settings: { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 4, botDifficulty: "medium", rules: { mapPreset: "standard", mapRandomized: true } },
+      seats: [
+        { seatIndex: 0, userId: "u_host", displayName: "Mobile Host", ready: true, connected: true },
+        { seatIndex: 1, userId: "u_guest", displayName: "Guest", ready: true, connected: true },
+        { seatIndex: 2, ready: false, connected: false },
+        { seatIndex: 3, ready: false, connected: false },
+      ],
+      spectatorCount: 0,
+      events: [],
+    };
+
+    class FakeWebSocket extends EventTarget {
+      static readonly CONNECTING = 0;
+      static readonly OPEN = 1;
+      static readonly CLOSING = 2;
+      static readonly CLOSED = 3;
+      readonly url: string;
+      readyState = FakeWebSocket.OPEN;
+
+      constructor(url: string) {
+        super();
+        this.url = url;
+        setTimeout(() => this.dispatchEvent(new Event("open")), 0);
+      }
+
+      send(payload: string): void {
+        const message = JSON.parse(payload) as { type: string; seatIndex?: number };
+        testWindow.__sentMessages.push(message);
+        if (message.type === "JOIN_ROOM") {
+          setTimeout(() => this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "ROOM_STATE", room: testWindow.__lobbyRoom }) })), 0);
+        }
+        if (message.type === "ADD_BOT") {
+          const seats = testWindow.__lobbyRoom.seats.map((seat) => ({ ...seat }));
+          const seat = seats.find((candidate) => !candidate.userId && !candidate.botId);
+          if (seat) {
+            seat.botId = `bot_${seat.seatIndex + 1}`;
+            seat.displayName = `Bot ${seat.seatIndex + 1}`;
+            seat.ready = true;
+            seat.connected = true;
+          }
+          testWindow.__lobbyRoom = { ...testWindow.__lobbyRoom, seats };
+          setTimeout(() => this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "ROOM_STATE", room: testWindow.__lobbyRoom }) })), 0);
+        }
+      }
+
+      close(): void {
+        this.readyState = FakeWebSocket.CLOSED;
+        this.dispatchEvent(new Event("close"));
+      }
+    }
+
+    Object.assign(FakeWebSocket, {
+      CONNECTING: 0,
+      OPEN: 1,
+      CLOSING: 2,
+      CLOSED: 3,
+    });
+    window.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+  });
+  await page.route("**/config", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ apiBaseUrl: "http://127.0.0.1:8787", wsBaseUrl: "ws://127.0.0.1:8787" }),
+    });
+  });
+  await page.route("**/sessions", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ token: "s_host", userId: "u_host", displayName: "Mobile Host" }) });
+  });
+  await page.route("**/rooms", async (route) => {
+    const room = await page.evaluate(() => (window as typeof window & { __lobbyRoom: unknown }).__lobbyRoom);
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify(room) });
+  });
+  await page.route("**/ws-tickets", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ ticket: "wst_mobile", expiresAt: "2026-06-22T00:00:00.000Z", ttlMs: 30_000 }) });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: /Player Match/ }).click();
+  await expect(page.getByLabel("Online lobby")).toBeVisible();
+  await expect(page.locator(".lobby-code-card strong")).toContainText("MOB123");
+
+  const layout = await page.evaluate(() => {
+    const shell = document.querySelector<HTMLElement>(".app-shell");
+    if (!shell) throw new Error("Missing app shell");
+    const shellBox = shell.getBoundingClientRect();
+    return {
+      overflow: window.getComputedStyle(shell).overflow,
+      shellHeight: shellBox.height,
+      scrollHeight: document.documentElement.scrollHeight,
+      viewportHeight: window.innerHeight,
+    };
+  });
+  expect(layout.overflow).not.toBe("hidden");
+  expect(layout.scrollHeight).toBeGreaterThan(layout.viewportHeight);
+
+  await page.getByRole("group", { name: "Lobby bots" }).scrollIntoViewIfNeeded();
+  await expect(page.getByRole("group", { name: "Lobby bots" })).toBeVisible();
+  await page.getByRole("button", { name: "Add Bot" }).click();
+  await expect(page.getByLabel("Lobby seats and rules")).toContainText("Bot 3");
+
+  await page.getByRole("button", { name: "Go" }).scrollIntoViewIfNeeded();
+  await expect(page.getByRole("button", { name: "Go" })).toBeEnabled();
+  await page.getByRole("button", { name: "Go" }).click();
+  const sentMessages = await page.evaluate(() => (window as typeof window & { __sentMessages: Array<{ type: string; roomId?: string }> }).__sentMessages);
+  expect(sentMessages).toEqual(expect.arrayContaining([
+    expect.objectContaining({ type: "ADD_BOT", roomId: "MOB123" }),
+    expect.objectContaining({ type: "START_ROOM", roomId: "MOB123" }),
+  ]));
 });

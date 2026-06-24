@@ -4,6 +4,7 @@ import { MemoryEventStore, type EventStore, type StoredCommandResult } from "../
 import { MemoryRoomOwnershipStore } from "../src/ownership.js";
 import { RoomCapacityError, RoomManager, type Room } from "../src/room-manager.js";
 import type { GameEvent } from "@colonizt/game-core";
+import { withResources } from "@colonizt/demo-state";
 
 const startedRoom = async (eventStore?: EventStore) => {
   const manager = new RoomManager();
@@ -96,6 +97,30 @@ class DelayedMatchStartStore extends MemoryEventStore {
   }
 }
 
+class CountingStartStore extends MemoryEventStore {
+  persistRoomCount = 0;
+  matchStartCount = 0;
+
+  async persistRoom(room: Room): Promise<void> {
+    this.persistRoomCount += 1;
+    await super.persistRoom(room);
+  }
+
+  async persistMatchStart(room: Room, state: GameState): Promise<void> {
+    this.matchStartCount += 1;
+    await super.persistMatchStart(room, state);
+  }
+}
+
+class FirstCodeCollisionStore extends MemoryEventStore {
+  roomCodeChecks = 0;
+
+  override async roomCodeExists(code: string): Promise<boolean> {
+    this.roomCodeChecks += 1;
+    return this.roomCodeChecks === 1 || super.roomCodeExists(code);
+  }
+}
+
 describe("RoomManager", () => {
   it("creates sessions and rooms", async () => {
     const manager = new RoomManager();
@@ -105,6 +130,18 @@ describe("RoomManager", () => {
     expect(room.seats[0]?.userId).toBe(session.userId);
     expect(room.code).toMatch(/^[A-Z2-9]{6}$/);
     expect(manager.roomForRef(room.code)?.id).toBe(room.id);
+  });
+
+  it("checks persisted room codes before assigning a public lobby code", async () => {
+    const store = new FirstCodeCollisionStore();
+    const manager = new RoomManager(store);
+    const session = await manager.createSession("Host");
+
+    const room = await manager.createRoom(session, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
+
+    expect(room.code).toMatch(/^[A-Z2-9]{6}$/);
+    expect(store.roomCodeChecks).toBeGreaterThan(1);
+    expect(await store.roomCodeExists(room.code)).toBe(true);
   });
 
   it("persists new rooms before acquiring ownership leases", async () => {
@@ -178,9 +215,256 @@ describe("RoomManager", () => {
 
     expect(ready.ok).toBe(true);
     if (!ready.ok) throw new Error("ready failed");
-    expect(ready.room.status).toBe("IN_GAME");
-    expect(ready.room.game?.playerOrder).toEqual([host!.userId, guest!.userId]);
-    expect(ready.room.game?.config.maxPlayers).toBe(2);
+    expect(ready.room.status).toBe("LOBBY");
+
+    const started = await manager.startRoomByHost(room.code, host!);
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error("start failed");
+    expect(started.room.status).toBe("IN_GAME");
+    expect(started.room.game?.playerOrder).toEqual([host!.userId, guest!.userId]);
+    expect(started.room.game?.config.maxPlayers).toBe(2);
+  });
+
+  it("starts four-seat lobbies with two ready connected players through host Go", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Host");
+    const guest = await manager.createSession("Guest");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 4 });
+
+    const joined = await manager.joinRoom(room.code, guest);
+    expect(joined.ok).toBe(true);
+    await manager.syncConnections(room.id, new Set([host.userId, guest.userId]));
+    await manager.setReady(room.code, host, true);
+    const ready = await manager.setReady(room.code, guest, true);
+    expect(ready).toMatchObject({ ok: true, room: { status: "LOBBY" } });
+
+    const started = await manager.startRoomByHost(room.code, host);
+
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error("start failed");
+    expect(started.room.status).toBe("IN_GAME");
+    expect(started.room.seats).toHaveLength(4);
+    expect(started.room.game?.playerOrder).toEqual([host.userId, guest.userId]);
+    expect(started.room.game?.config.maxPlayers).toBe(2);
+  });
+
+  it("lets the host add and remove lobby bots as ready seats", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Host");
+    const guest = await manager.createSession("Guest");
+    const outsider = await manager.createSession("Outsider");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 4 });
+    expect((await manager.joinRoom(room.code, guest)).ok).toBe(true);
+
+    await expect(manager.addLobbyBot(room.code, outsider)).resolves.toMatchObject({ ok: false, code: "NOT_ROOM_HOST" });
+    const firstBot = await manager.addLobbyBot(room.code, host);
+    expect(firstBot.ok).toBe(true);
+    if (!firstBot.ok) throw new Error("add bot failed");
+    expect(firstBot.room.seats[2]).toMatchObject({ botId: "bot_3", ready: true, connected: true });
+
+    const removed = await manager.removeLobbyBot(room.code, host, 2);
+    expect(removed.ok).toBe(true);
+    if (!removed.ok) throw new Error("remove bot failed");
+    expect(removed.room.seats[2]).toMatchObject({ seatIndex: 2, ready: false, connected: false });
+    expect(removed.room.seats[2]?.botId).toBeUndefined();
+
+    const addedAgain = await manager.addLobbyBot(room.code, host);
+    expect(addedAgain.ok).toBe(true);
+    if (!addedAgain.ok) throw new Error("add bot failed");
+    const secondBot = await manager.addLobbyBot(room.code, host);
+    expect(secondBot.ok).toBe(true);
+    if (!secondBot.ok) throw new Error("add bot failed");
+    expect(secondBot.room.seats.filter((seat) => seat.botId)).toHaveLength(2);
+    await expect(manager.addLobbyBot(room.code, host)).resolves.toMatchObject({ ok: false, code: "ROOM_FULL" });
+
+    await manager.syncConnections(room.id, new Set([host.userId, guest.userId]));
+    await manager.setReady(room.code, host, true);
+    await manager.setReady(room.code, guest, true);
+    const started = await manager.startRoomByHost(room.code, host);
+
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error("start failed");
+    expect(started.room.game?.playerOrder).toEqual([host.userId, guest.userId, "bot_3", "bot_4"]);
+    expect(started.room.game?.config.maxPlayers).toBe(4);
+  });
+
+  it("ignores stale disconnected lobby seats when the ready connected minimum can start", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Host");
+    const guest = await manager.createSession("Guest");
+    const stale = await manager.createSession("Stale");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 4 });
+    expect((await manager.joinRoom(room.code, guest)).ok).toBe(true);
+    expect((await manager.joinRoom(room.code, stale)).ok).toBe(true);
+
+    await manager.syncConnections(room.id, new Set([host.userId, guest.userId]));
+    await manager.setReady(room.code, host, true);
+    await manager.setReady(room.code, guest, true);
+    const started = await manager.startRoomByHost(room.code, host);
+
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error("start failed");
+    expect(started.room.game?.playerOrder).toEqual([host.userId, guest.userId]);
+    expect(started.room.game?.config.maxPlayers).toBe(2);
+    expect(started.room.seats.some((seat) => seat.userId === stale.userId)).toBe(false);
+  });
+
+  it("does not start over connected unready lobby players", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Host");
+    const guest = await manager.createSession("Guest");
+    const unready = await manager.createSession("Unready");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 4 });
+    expect((await manager.joinRoom(room.code, guest)).ok).toBe(true);
+    expect((await manager.joinRoom(room.code, unready)).ok).toBe(true);
+    await manager.syncConnections(room.id, new Set([host.userId, guest.userId, unready.userId]));
+    await manager.setReady(room.code, host, true);
+    await manager.setReady(room.code, guest, true);
+
+    await expect(manager.startRoomByHost(room.code, host)).resolves.toMatchObject({ ok: false, code: "ROOM_NOT_READY" });
+  });
+
+  it("persists host starts through the match-start boundary without a second room write", async () => {
+    const store = new CountingStartStore();
+    const manager = new RoomManager(store);
+    const host = await manager.createSession("Host");
+    const guest = await manager.createSession("Guest");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 4 });
+    expect((await manager.joinRoom(room.code, guest)).ok).toBe(true);
+    await manager.syncConnections(room.id, new Set([host.userId, guest.userId]));
+    await manager.setReady(room.code, host, true);
+    await manager.setReady(room.code, guest, true);
+    const roomWritesBeforeStart = store.persistRoomCount;
+
+    const started = await manager.startRoomByHost(room.code, host);
+
+    expect(started.ok).toBe(true);
+    expect(store.matchStartCount).toBe(1);
+    expect(store.persistRoomCount).toBe(roomWritesBeforeStart);
+    const persisted = await store.loadRoomByRef(room.code);
+    expect(persisted?.status).toBe("IN_GAME");
+    expect(persisted?.match).toBeDefined();
+  });
+
+  it("lets the host update lobby settings and resets readiness", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Host");
+    const guest = await manager.createSession("Guest");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 4 });
+    const joined = await manager.joinRoom(room.code, guest);
+    expect(joined.ok).toBe(true);
+    await manager.setReady(room.id, host, true);
+    await manager.setReady(room.id, guest, true);
+
+    const updated = await manager.updateRoomSettings(room.code, host, {
+      minPlayers: 2,
+      maxPlayers: 3,
+      botDifficulty: "hard",
+      rules: { mapPreset: "islands" },
+    });
+
+    expect(updated.ok).toBe(true);
+    if (!updated.ok) throw new Error("settings update failed");
+    expect(updated.room.seats).toHaveLength(3);
+    expect(updated.room.seats.every((seat) => seat.ready === false)).toBe(true);
+    expect(updated.room.settings).toMatchObject({
+      minPlayers: 2,
+      maxPlayers: 3,
+      botDifficulty: "hard",
+      rules: { mapPreset: "islands", mapRandomized: true },
+    });
+  });
+
+  it("preserves readiness when lobby settings do not effectively change", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Host");
+    const guest = await manager.createSession("Guest");
+    const room = await manager.createRoom(host, {
+      mode: "CLASSIC",
+      botFill: false,
+      ranked: false,
+      minPlayers: 2,
+      maxPlayers: 4,
+      botDifficulty: "medium",
+      rules: { mapPreset: "standard" },
+    });
+    expect((await manager.joinRoom(room.code, guest)).ok).toBe(true);
+    await manager.setReady(room.code, host, true);
+    await manager.setReady(room.code, guest, true);
+
+    const updated = await manager.updateRoomSettings(room.code, host, {
+      minPlayers: 2,
+      maxPlayers: 4,
+      botDifficulty: "medium",
+      rules: { mapPreset: "standard", mapRandomized: true },
+    });
+
+    expect(updated.ok).toBe(true);
+    if (!updated.ok) throw new Error("settings update failed");
+    expect(updated.room.seats.find((seat) => seat.userId === host.userId)?.ready).toBe(true);
+    expect(updated.room.seats.find((seat) => seat.userId === guest.userId)?.ready).toBe(true);
+  });
+
+  it("rejects non-host settings updates and shrinking below occupied seats", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Host");
+    const guest = await manager.createSession("Guest");
+    const third = await manager.createSession("Third");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 4 });
+    expect((await manager.joinRoom(room.code, guest)).ok).toBe(true);
+    expect((await manager.joinRoom(room.code, third)).ok).toBe(true);
+
+    await expect(manager.updateRoomSettings(room.code, guest, { maxPlayers: 3 })).resolves.toMatchObject({ ok: false, code: "NOT_ROOM_HOST" });
+    await expect(manager.updateRoomSettings(room.code, host, { maxPlayers: 2 })).resolves.toMatchObject({ ok: false, code: "ROOM_HAS_TOO_MANY_PLAYERS" });
+  });
+
+  it("does not silently drop occupied higher seats when closing seats", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Host");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 4 });
+    expect((await manager.addLobbyBot(room.code, host)).ok).toBe(true);
+    const added = await manager.addLobbyBot(room.code, host);
+    expect(added.ok).toBe(true);
+    if (!added.ok) throw new Error("add bot failed");
+    expect(added.room.seats[2]?.botId).toBe("bot_3");
+    const removedLowerBot = await manager.removeLobbyBot(room.code, host, 1);
+    expect(removedLowerBot.ok).toBe(true);
+    expect(room.seats.filter((seat) => seat.userId || seat.botId)).toHaveLength(2);
+
+    await expect(manager.updateRoomSettings(room.code, host, { maxPlayers: 2 })).resolves.toMatchObject({
+      ok: false,
+      code: "ROOM_HAS_OCCUPIED_CLOSED_SEAT",
+    });
+    expect(room.seats[2]?.botId).toBe("bot_3");
+  });
+
+  it("uses updated lobby display names in seats and started games", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Host");
+    const guest = await manager.createSession("Guest");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 4 });
+    const joined = await manager.joinRoom(room.code, guest);
+    expect(joined.ok).toBe(true);
+    expect(room.seats.find((seat) => seat.userId === host.userId)?.displayName).toBe("Host");
+    expect(room.seats.find((seat) => seat.userId === guest.userId)?.displayName).toBe("Guest");
+
+    await manager.updateDisplayName(host, "Ada");
+    await manager.updateDisplayName(guest, "Ben");
+    expect(room.seats.find((seat) => seat.userId === host.userId)?.displayName).toBe("Ada");
+    expect(room.seats.find((seat) => seat.userId === guest.userId)?.displayName).toBe("Ben");
+    expect(manager.publicRoom(room, host.userId).seats).toEqual(expect.arrayContaining([
+      expect.objectContaining({ userId: host.userId, displayName: "Ada" }),
+      expect.objectContaining({ userId: guest.userId, displayName: "Ben" }),
+    ]));
+
+    await manager.syncConnections(room.id, new Set([host.userId, guest.userId]));
+    await manager.setReady(room.code, host, true);
+    await manager.setReady(room.code, guest, true);
+    const started = await manager.startRoomByHost(room.code, host);
+
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error("start failed");
+    expect(started.room.game?.config.playerNames).toMatchObject({ [host.userId]: "Ada", [guest.userId]: "Ben" });
   });
 
   it("does not start a lobby with disconnected ready players", async () => {
@@ -255,14 +539,16 @@ describe("RoomManager", () => {
       expect(joined.ok).toBe(true);
     }
 
-    const readyResultsPromise = Promise.all(sessions.map((session) => manager.setReady(room.id, session, true)));
+    const readyResults = await Promise.all(sessions.map((session) => manager.setReady(room.id, session, true)));
+    expect(readyResults.every((result) => result.ok)).toBe(true);
+    const startPromise = manager.startRoomByHost(room.id, host);
     await store.startEntered;
     expect(room.status).toBe("LOBBY");
     expect(room.game).toBeUndefined();
 
     store.releaseMatchStart();
-    const readyResults = await readyResultsPromise;
-    expect(readyResults.some((result) => result.ok && result.room.status === "IN_GAME")).toBe(true);
+    const started = await startPromise;
+    expect(started.ok).toBe(true);
     expect(room.status).toBe("IN_GAME");
     expect(room.game).toBeDefined();
 
@@ -443,6 +729,10 @@ describe("RoomManager", () => {
       expect(ready.ok).toBe(true);
     }
 
+    expect(room.status).toBe("LOBBY");
+    const started = await manager.startRoomByHost(room.code, sessions[0]!);
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error("start failed");
     expect(room.status).toBe("IN_GAME");
     expect(room.game?.playerOrder).toEqual(sessions.map((session) => session.userId));
   });
@@ -545,6 +835,23 @@ describe("RoomManager", () => {
     expect(ownView.tradeResponseDeadlines?.[trade.id]).toBe(12_345_678);
   });
 
+  it("preserves persisted active timers when hydrating rooms", async () => {
+    const store = new MemoryEventStore();
+    const { room } = await startedRoom(store);
+    if (!room.timer || !room.game || !("activePlayerId" in room.game.phase)) throw new Error("room did not start with an active timer");
+    const persistedExpiresAt = Date.parse("2026-06-23T12:34:56.000Z");
+    room.timer = { activePlayerId: room.game.phase.activePlayerId, expiresAt: persistedExpiresAt };
+    await store.persistRoom(room);
+
+    const restarted = new RoomManager(store);
+    await restarted.hydrateFromStore();
+
+    expect(restarted.rooms.get(room.id)?.timer).toEqual({
+      activePlayerId: room.game.phase.activePlayerId,
+      expiresAt: persistedExpiresAt,
+    });
+  });
+
   it("does not claim human-only pending trades as immediate automation work", async () => {
     const manager = new RoomManager();
     const sessions = await Promise.all(["Host", "P2", "P3", "P4"].map((name) => manager.createSession(name)));
@@ -557,9 +864,11 @@ describe("RoomManager", () => {
       const ready = await manager.setReady(room.id, session, true);
       expect(ready.ok).toBe(true);
     }
+    const started = await manager.startRoomByHost(room.id, sessions[0]!);
+    expect(started.ok).toBe(true);
     if (!room.game) throw new Error("game not started");
+    room.game = withResources(room.game, sessions[0]!.userId, { timber: 2, brick: 0, grain: 0, fiber: 0, ore: 0 });
     room.game.phase = { type: "ACTION_PHASE", activePlayerId: sessions[0]!.userId };
-    room.game.players[sessions[0]!.userId]!.resources = { ...emptyResources(), timber: 2 };
 
     const offered = await manager.submitCommand(room.id, sessions[0]!, 1, {
       type: "OFFER_TRADE",
@@ -572,6 +881,41 @@ describe("RoomManager", () => {
 
     expect(offered.ok).toBe(true);
     expect(manager.dueAutomationRoomIds(Date.now())).not.toContain(room.id);
+  });
+
+  it("resolves bot offers as soon as all recipients answer", async () => {
+    const { manager, session, room } = await startedRoom();
+    if (!room.game) throw new Error("game not started");
+    const botOfferer = room.seats.find((seat) => seat.botId)?.botId;
+    if (!botOfferer) throw new Error("missing bot seat");
+    room.game = withResources(room.game, botOfferer, { timber: 2, brick: 0, grain: 0, fiber: 0, ore: 0 });
+    room.game = withResources(room.game, session.userId, { timber: 0, brick: 0, grain: 0, fiber: 0, ore: 2 });
+    room.game.phase = { type: "ACTION_PHASE", activePlayerId: botOfferer };
+    const recipients = room.game.playerOrder.filter((playerId) => playerId !== botOfferer);
+    const trade: TradeOffer = {
+      id: "ready-bot-offer",
+      fromPlayerId: botOfferer,
+      offered: { ...emptyResources(), timber: 1 },
+      requested: { ...emptyResources(), ore: 1 },
+      recipients: "ANY",
+      status: "COLLECTING_RESPONSES",
+      createdAtSeq: room.game.eventSeq + 1,
+      expiresAtSeq: room.game.eventSeq + 20,
+      responses: Object.fromEntries(recipients.map((playerId) => [
+        playerId,
+        { playerId, status: playerId === session.userId ? "WANTS_ACCEPT" : "REJECTED", respondedAtSeq: room.game!.eventSeq + 2 },
+      ])),
+    };
+    room.game.trades[trade.id] = trade;
+    room.tradeResponseDeadlines.set(trade.id, Date.now() + 15_000);
+
+    const result = await manager.runDueBotAutomation(room.id);
+
+    expect(result?.ok).toBe(true);
+    expect(result?.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "TRADE_ACCEPTED", tradeId: trade.id, fromPlayerId: botOfferer, toPlayerId: session.userId }),
+    ]));
+    expect(room.game.trades[trade.id]?.status).toBe("ACCEPTED");
   });
 
   it("does not mutate room events when durable append fails", async () => {
@@ -652,9 +996,9 @@ describe("RoomManager", () => {
 
   it("auto-discards a forced randomized bundle when a discard timer expires", async () => {
     const { manager, room } = await startedRoom();
+    room.game = withResources(room.game!, room.game!.playerOrder[1]!, { timber: 3, brick: 2, grain: 2, fiber: 1, ore: 0 });
     const game = room.game!;
     const discarder = game.playerOrder[1]!;
-    game.players[discarder]!.resources = { ...emptyResources(), timber: 3, brick: 2, grain: 2, fiber: 1 };
     game.phase = { type: "DISCARDING", activePlayerId: discarder, rollerId: game.playerOrder[0]!, pending: { [discarder]: 4 }, submitted: {} };
     room.timer = { activePlayerId: discarder, expiresAt: Date.now() - 1 };
 
@@ -672,9 +1016,9 @@ describe("RoomManager", () => {
 
   it("does not extend the action timer for commands in the same active phase", async () => {
     const { manager, session, room } = await startedRoom();
+    room.game = withResources(room.game!, session.userId, { timber: 0, brick: 0, grain: 0, fiber: 2, ore: 0 });
     room.game!.phase = { type: "ACTION_PHASE", activePlayerId: session.userId };
     room.game!.turn = 8;
-    room.game!.players[session.userId]!.resources = { ...emptyResources(), fiber: 2 };
     const expiresAt = Date.now() + 5_000;
     room.timer = { activePlayerId: session.userId, expiresAt };
 

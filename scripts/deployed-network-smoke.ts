@@ -5,7 +5,9 @@ type RoomMessage = {
   type: "ROOM_STATE";
   room: {
     id: string;
+    code?: string;
     status: string;
+    seats?: Array<{ userId?: string; botId?: string; ready: boolean; connected: boolean }>;
     game?: {
       eventSeq: number;
       phase: { type: string; activePlayerId?: string };
@@ -126,27 +128,36 @@ const sockets: WebSocket[] = [];
 let exitCode = 0;
 
 try {
-  const players = await Promise.all(["Host", "Player 2", "Player 3", "Player 4"].map((name) => createSession(`Smoke ${name} ${Date.now()}`)));
+  const players = await Promise.all(["Host", "Player 2"].map((name) => createSession(`Smoke ${name} ${Date.now()}`)));
   const host = players[0];
   if (!host) throw new Error("No host session");
-  const room = await requestJson<{ id: string }>(`${apiBase}/rooms`, {
+  const room = await requestJson<{ id: string; code?: string }>(`${apiBase}/rooms`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-session-token": host.token, origin: webOrigin },
-    body: JSON.stringify({ mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 4, rules: { mapRandomized: true } }),
+    body: JSON.stringify({ mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 4, rules: { mapRandomized: true } }),
   });
+  const roomRef = room.code ?? room.id;
 
   const playerSockets = await Promise.all(players.map((player) => connect(player.token)));
   sockets.push(...playerSockets);
   const hostSocket = playerSockets[0];
   if (!hostSocket) throw new Error("No host socket");
   const joinedPromises = playerSockets.map((socket) => waitForMessage<RoomMessage>(socket, "ROOM_STATE"));
-  for (const socket of playerSockets) socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.id }));
+  for (const socket of playerSockets) socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: roomRef }));
   await Promise.all(joinedPromises);
 
   const startedPromises = playerSockets.map((socket) =>
     waitForMessage<RoomMessage>(socket, "ROOM_STATE", (message) => message.room.status === "IN_GAME" && Boolean(message.room.game)),
   );
-  for (const socket of playerSockets) socket.send(JSON.stringify({ type: "READY", roomId: room.id, ready: true }));
+  const readyPromises = playerSockets.map((socket) =>
+    waitForMessage<RoomMessage>(socket, "ROOM_STATE", (message) =>
+      message.room.status === "LOBBY"
+      && (message.room.seats?.filter((seat) => (seat.userId || seat.botId) && seat.ready && (seat.connected || seat.botId)).length ?? 0) >= players.length,
+    ),
+  );
+  for (const socket of playerSockets) socket.send(JSON.stringify({ type: "READY", roomId: roomRef, ready: true }));
+  await Promise.all(readyPromises);
+  hostSocket.send(JSON.stringify({ type: "START_ROOM", roomId: roomRef }));
   const [started] = await Promise.all(startedPromises);
   if (!started) throw new Error("No started room state observed");
 
@@ -164,7 +175,7 @@ try {
   const commandRejected = waitForCommandRejected(activeSocket, 1);
   activeSocket.send(JSON.stringify({
     type: "COMMAND",
-    roomId: room.id,
+    roomId: roomRef,
     clientSeq: 1,
     command: { type: "PLACE_SETUP", playerId: activePlayerId, vertexId, edgeId },
   }));
@@ -183,9 +194,9 @@ try {
   const reconnected = await connect(host.token);
   sockets.push(reconnected);
   const reconnectedStatePromise = waitForMessage<RoomMessage>(reconnected, "ROOM_STATE");
-  reconnected.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.id }));
+  reconnected.send(JSON.stringify({ type: "JOIN_ROOM", roomId: roomRef }));
   await reconnectedStatePromise;
-  reconnected.send(JSON.stringify({ type: "RESYNC", roomId: room.id, lastSeq: 0 }));
+  reconnected.send(JSON.stringify({ type: "RESYNC", roomId: roomRef, lastSeq: 0 }));
   const resync = await waitForMessage<ResyncMessage>(reconnected, "RESYNC");
   if (resync.snapshot?.eventSeq !== hostEvents.snapshot?.eventSeq) throw new Error("Deployed reconnect snapshot mismatch");
 
@@ -193,6 +204,9 @@ try {
     ok: true,
     label: "deployed-network-smoke",
     roomId: room.id,
+    roomCode: room.code,
+    startPlayers: players.length,
+    maxPlayers: 4,
     humanPlayers: players.map((player) => player.userId),
     eventSeq: hostEvents.snapshot?.eventSeq,
     events: hostEvents.events.map((event) => event.type),
