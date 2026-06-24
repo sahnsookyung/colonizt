@@ -85,4 +85,29 @@ describePostgres("PostgresEventStore integration", () => {
     expect(expiredStatus).toMatchObject({ status: "EXPIRED", cleanupReason: "EMPTY_LOBBY_TTL" });
     expect(loadedReplay?.events.map((event) => event.seq)).toEqual([1]);
   });
+
+  it("persists two-player starts from four-seat lobbies without open seats as match players", async () => {
+    const store = new PostgresEventStore(pool);
+    const manager = new RoomManager(store);
+    const host = await manager.createSession("Postgres Host");
+    const guest = await manager.createSession("Postgres Guest");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 4 });
+    const joined = await manager.joinRoom(room.code, guest);
+    expect(joined.ok).toBe(true);
+
+    await manager.syncConnections(room.id, new Set([host.userId, guest.userId]));
+    await manager.setReady(room.code, host, true);
+    await manager.setReady(room.code, guest, true);
+
+    const started = await manager.startRoomByHost(room.code, host);
+
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error("start failed");
+    expect(started.room.game?.playerOrder).toEqual([host.userId, guest.userId]);
+    const rows = await pool.query("SELECT user_id, seat_index FROM match_players WHERE match_id = $1 ORDER BY seat_index", [`match_${room.id}`]);
+    expect(rows.rows).toEqual([
+      { user_id: host.userId, seat_index: 0 },
+      { user_id: guest.userId, seat_index: 1 },
+    ]);
+  });
 });

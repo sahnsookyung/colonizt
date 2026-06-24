@@ -299,6 +299,7 @@ export class PostgresEventStore implements EventStore {
   }
 
   async persistMatchStart(room: Room, state: GameState): Promise<void> {
+    const playerIds = new Set(state.config.playerOrder);
     await insertMatch(this.pool, {
       id: state.config.matchId,
       roomId: room.id,
@@ -307,10 +308,10 @@ export class PostgresEventStore implements EventStore {
       seedHash: state.config.seed,
       config: state.config,
       board: state.board,
-      players: room.seats.map((seat) => ({
-        userId: (seat.userId ?? seat.botId) as string,
-        seatIndex: seat.seatIndex,
-      })),
+      players: room.seats.flatMap((seat) => {
+        const id = seat.userId ?? seat.botId;
+        return id && playerIds.has(id) ? [{ userId: id, seatIndex: seat.seatIndex }] : [];
+      }),
     });
     await this.persistRoom(room);
   }

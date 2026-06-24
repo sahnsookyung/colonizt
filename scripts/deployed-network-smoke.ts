@@ -62,9 +62,15 @@ const closeSocket = (socket: WebSocket): void => {
 };
 
 const waitForMessage = <T extends { type: string }>(socket: WebSocket, type: string, predicate: (message: T) => boolean = () => true): Promise<T> =>
-  failAfter(new Promise((resolve) => {
+  failAfter(new Promise((resolve, reject) => {
     const listener = (raw: WebSocket.RawData) => {
       const message = JSON.parse(raw.toString()) as T;
+      if (message.type === "ERROR" || message.type === "COMMAND_REJECTED") {
+        socket.off("message", listener);
+        const payload = message as T & { code?: string; message?: string };
+        reject(new Error(`${message.type}: ${payload.code ?? "UNKNOWN"} ${payload.message ?? ""}`.trim()));
+        return;
+      }
       if (message.type === type && predicate(message)) {
         socket.off("message", listener);
         resolve(message);
