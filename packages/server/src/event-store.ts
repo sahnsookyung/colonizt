@@ -12,24 +12,32 @@ import {
   insertReport,
   listMatchSummaries,
   listPersistedRooms,
+  loadLatestMatchSnapshot,
   loadReplayLog,
   loadReplayLogByRoomId,
   markMatchFinished,
   persistedRoomCodeExists,
+  saveMatchSnapshot,
   upsertCommandResult,
   upsertSession,
   upsertRoom,
   type MatchSummary,
   type PersistedCommandResultRecord,
+  type PersistedMatchSnapshotRecord,
   type PersistedRoomRecord,
 } from "@colonizt/db";
 import type { ChatMessage, Report, Room, Session } from "./room-manager.js";
 import { hashSessionToken } from "./security.js";
 
+const snapshotIntervalEvents = 25;
+const shouldSnapshot = (state: GameState, events: readonly GameEvent[] = []): boolean =>
+  state.eventSeq > 0 && (state.phase.type === "GAME_OVER" || events.some((event) => event.seq % snapshotIntervalEvents === 0));
+
 export interface StoredReplayLog {
   config: GameConfig;
   board: BoardGraph;
   events: GameEvent[];
+  snapshot?: StoredMatchSnapshot;
 }
 
 export type StoredMatchSummary = MatchSummary;
@@ -55,6 +63,7 @@ export interface StoredRoomRecord {
     config: GameConfig;
     board: BoardGraph;
     events: GameEvent[];
+    snapshot?: StoredMatchSnapshot;
     endedAt?: string;
     winnerUserId?: string;
   };
@@ -67,6 +76,8 @@ export interface EventStore {
   persistMatchStart(room: Room, state: GameState): Promise<void>;
   appendEvents(room: Room, events: GameEvent[]): Promise<void>;
   commitEvents?(room: Room, events: GameEvent[], result?: StoredCommandResult): Promise<void>;
+  saveSnapshot?(room: Room, state: GameState): Promise<void>;
+  loadLatestSnapshot?(matchId: string): Promise<StoredMatchSnapshot | undefined>;
   markFinished(room: Room, winnerId: string): Promise<void>;
   persistChat(room: Room, chat: ChatMessage): Promise<void>;
   persistReport(room: Room, report: Report): Promise<void>;
@@ -96,11 +107,18 @@ export interface StoredCommandResult {
   rejectionMessage?: string;
 }
 
+export interface StoredMatchSnapshot {
+  matchId: string;
+  seq: number;
+  state: GameState;
+}
+
 export class MemoryEventStore implements EventStore {
   readonly rooms = new Map<string, Room>();
   readonly replayLogs = new Map<string, StoredReplayLog>();
   readonly sessions = new Map<string, Session>();
   readonly commandResults = new Map<string, StoredCommandResult>();
+  readonly snapshots = new Map<string, StoredMatchSnapshot[]>();
 
   async persistSession(session: Session): Promise<void> {
     this.sessions.set(session.token, session);
@@ -128,6 +146,22 @@ export class MemoryEventStore implements EventStore {
 
   async markFinished(_room: Room, _winnerId: string): Promise<void> {
     return;
+  }
+
+  async saveSnapshot(room: Room, state: GameState): Promise<void> {
+    const snapshot = { matchId: state.config.matchId, seq: state.eventSeq, state: structuredClone(state) as GameState };
+    const snapshots = this.snapshots.get(state.config.matchId) ?? [];
+    const next = snapshots.filter((candidate) => candidate.seq !== snapshot.seq);
+    next.push(snapshot);
+    next.sort((left, right) => left.seq - right.seq);
+    this.snapshots.set(state.config.matchId, next);
+    const log = this.replayLogs.get(state.config.matchId);
+    if (log) log.snapshot = snapshot;
+    this.rooms.set(room.id, room);
+  }
+
+  async loadLatestSnapshot(matchId: string): Promise<StoredMatchSnapshot | undefined> {
+    return this.snapshots.get(matchId)?.at(-1);
   }
 
   async persistChat(_room: Room, _chat: ChatMessage): Promise<void> {
@@ -206,6 +240,8 @@ export class MemoryEventStore implements EventStore {
         board: room.game.board,
         events: room.events,
       };
+      const snapshot = this.snapshots.get(room.game.config.matchId)?.at(-1);
+      if (snapshot) record.match.snapshot = snapshot;
     }
     return record;
   }
@@ -236,6 +272,7 @@ export class MemoryEventStore implements EventStore {
     try {
       await this.appendEvents(room, events);
       if (result) await this.persistCommandResult(result);
+      if (room.game && shouldSnapshot(room.game, events)) await this.saveSnapshot(room, room.game);
       if (room.game?.phase.type === "GAME_OVER") await this.markFinished(room, room.game.phase.winnerId);
       await this.persistRoom(room);
     } catch (error) {
@@ -358,8 +395,19 @@ export class PostgresEventStore implements EventStore {
       matchId: room.game.config.matchId,
       events: events.map((event) => ({ seq: event.seq, type: event.type, payload: event })),
       ...(persistedResult ? { commandResult: persistedResult } : {}),
+      ...(shouldSnapshot(room.game, events) ? { snapshot: { matchId: room.game.config.matchId, seq: room.game.eventSeq, state: room.game } } : {}),
       ...(room.game.phase.type === "GAME_OVER" ? { winnerUserId: room.game.phase.winnerId } : {}),
     });
+  }
+
+  async saveSnapshot(room: Room, state: GameState): Promise<void> {
+    if (!room.game) return;
+    await saveMatchSnapshot(this.pool, { matchId: state.config.matchId, seq: state.eventSeq, state });
+  }
+
+  async loadLatestSnapshot(matchId: string): Promise<StoredMatchSnapshot | undefined> {
+    const snapshot: PersistedMatchSnapshotRecord | undefined = await loadLatestMatchSnapshot(this.pool, matchId);
+    return snapshot ? { matchId: snapshot.matchId, seq: snapshot.seq, state: snapshot.state as GameState } : undefined;
   }
 
   async markFinished(room: Room, winnerId: string): Promise<void> {
@@ -443,6 +491,11 @@ export class PostgresEventStore implements EventStore {
           board: record.match.board as BoardGraph,
           events: record.match.events as GameEvent[],
         };
+        if (record.match.snapshot) stored.match.snapshot = {
+          matchId: record.match.snapshot.matchId,
+          seq: record.match.snapshot.seq,
+          state: record.match.snapshot.state as GameState,
+        };
         if (record.match.endedAt) stored.match.endedAt = record.match.endedAt;
         if (record.match.winnerUserId) stored.match.winnerUserId = record.match.winnerUserId;
       }
@@ -476,6 +529,11 @@ export class PostgresEventStore implements EventStore {
         config: record.match.config as GameConfig,
         board: record.match.board as BoardGraph,
         events: record.match.events as GameEvent[],
+      };
+      if (record.match.snapshot) stored.match.snapshot = {
+        matchId: record.match.snapshot.matchId,
+        seq: record.match.snapshot.seq,
+        state: record.match.snapshot.state as GameState,
       };
       if (record.match.endedAt) stored.match.endedAt = record.match.endedAt;
       if (record.match.winnerUserId) stored.match.winnerUserId = record.match.winnerUserId;

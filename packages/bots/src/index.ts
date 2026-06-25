@@ -21,6 +21,7 @@ import {
   settlementCost,
   specialCardCost,
   subtractResources,
+  tradeRecipientIds,
   trueVictoryPoints,
   type EdgeId,
   type BotDifficulty,
@@ -670,6 +671,73 @@ export const scoreTradeResponder = (
   const responderDelta = evaluateState(responderView, responderAfterHand) - responderBefore;
   const responderThreat = trueVictoryPoints(state, responderId) * 0.12 + resourceCount(responderView.ownResources) * 0.015;
   return offererDelta * 1.2 - responderDelta * 0.75 - responderThreat;
+};
+
+export const tradeFullyAnswered = (state: GameState, trade: TradeOffer): boolean =>
+  tradeRecipientIds(state, trade).every((playerId) => {
+    const status = trade.responses?.[playerId]?.status;
+    return Boolean(status) && status !== "PENDING";
+  });
+
+export interface BotOfferResolutionTrace {
+  tradeId: string;
+  fromPlayerId: PlayerId;
+  selectedPlayerId?: PlayerId;
+  candidateScores: Array<{ playerId: PlayerId; score: number }>;
+  reason: "FINALIZE" | "CANCEL_NO_ACCEPTORS" | "EXPIRE_NON_BOT_OFFERER" | "NOT_COLLECTING" | "OFFERER_NOT_FUNDED";
+}
+
+export interface BotOfferResolutionInput {
+  state: GameState;
+  tradeId: string;
+  botIds: Iterable<PlayerId>;
+  profileForPlayer?: (playerId: PlayerId) => BotProfile;
+  difficulty?: BotDifficulty;
+  expireNonBotOfferer?: boolean;
+}
+
+export const resolveBotOfferCommand = ({
+  state,
+  tradeId,
+  botIds,
+  profileForPlayer = () => "greedy",
+  difficulty = state.config.botDifficulty ?? "medium",
+  expireNonBotOfferer = true,
+}: BotOfferResolutionInput): { command: GameCommand; trace: BotOfferResolutionTrace } | undefined => {
+  const trade = state.trades[tradeId];
+  if (!trade || trade.status !== "COLLECTING_RESPONSES") return undefined;
+  const botIdSet = new Set(botIds);
+  if (!botIdSet.has(trade.fromPlayerId)) {
+    return expireNonBotOfferer
+      ? {
+        command: { type: "EXPIRE_TRADE", playerId: trade.fromPlayerId, tradeId: trade.id, reason: "RESPONSE_TIMEOUT" },
+        trace: { tradeId, fromPlayerId: trade.fromPlayerId, candidateScores: [], reason: "EXPIRE_NON_BOT_OFFERER" },
+      }
+      : undefined;
+  }
+  if (!hasResources(state.players[trade.fromPlayerId]?.resources ?? emptyResources(), trade.offered)) {
+    return {
+      command: { type: "CANCEL_TRADE", playerId: trade.fromPlayerId, tradeId: trade.id },
+      trace: { tradeId, fromPlayerId: trade.fromPlayerId, candidateScores: [], reason: "OFFERER_NOT_FUNDED" },
+    };
+  }
+  const offererProfile = profileForPlayer(trade.fromPlayerId);
+  const candidateScores = tradeRecipientIds(state, trade)
+    .filter((playerId) => trade.responses?.[playerId]?.status === "WANTS_ACCEPT")
+    .filter((playerId) => hasResources(state.players[playerId]?.resources ?? emptyResources(), trade.requested))
+    .map((playerId) => ({ playerId, score: scoreTradeResponder(state, trade, playerId, offererProfile, difficulty) }))
+    .sort((left, right) => right.score - left.score || state.playerOrder.indexOf(left.playerId) - state.playerOrder.indexOf(right.playerId));
+  const selectedPlayerId = candidateScores[0]?.playerId;
+  if (!selectedPlayerId) {
+    return {
+      command: { type: "CANCEL_TRADE", playerId: trade.fromPlayerId, tradeId: trade.id },
+      trace: { tradeId, fromPlayerId: trade.fromPlayerId, candidateScores, reason: "CANCEL_NO_ACCEPTORS" },
+    };
+  }
+  return {
+    command: { type: "FINALIZE_TRADE", playerId: trade.fromPlayerId, tradeId: trade.id, toPlayerId: selectedPlayerId },
+    trace: { tradeId, fromPlayerId: trade.fromPlayerId, selectedPlayerId, candidateScores, reason: "FINALIZE" },
+  };
 };
 
 const strategicTradeBonus = (view: BotView, beforeHand: ResourceBundle, afterHand: ResourceBundle, gained: ResourceBundle, paid: ResourceBundle): number => {

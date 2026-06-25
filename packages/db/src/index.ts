@@ -368,6 +368,7 @@ export interface CommitMatchEventsInput {
   matchId: string;
   events: Array<{ seq: number; type: string; payload: unknown }>;
   commandResult?: PersistCommandResultInput;
+  snapshot?: PersistMatchSnapshotInput;
   winnerUserId?: string;
 }
 
@@ -382,6 +383,7 @@ export const commitMatchEvents = async (pool: pg.Pool, input: CommitMatchEventsI
       );
     }
     if (input.commandResult) await upsertCommandResultWithClient(client, input.commandResult);
+    if (input.snapshot) await saveMatchSnapshotWithClient(client, input.snapshot);
     if (input.winnerUserId) {
       await client.query("UPDATE matches SET ended_at = now(), winner_user_id = $2 WHERE id = $1", [input.matchId, input.winnerUserId]);
     }
@@ -439,14 +441,92 @@ export const findCommandResult = async (
   return record;
 };
 
+export interface PersistMatchSnapshotInput {
+  matchId: string;
+  seq: number;
+  state: unknown;
+}
+
+export interface PersistedMatchSnapshotRecord {
+  matchId: string;
+  seq: number;
+  state: unknown;
+}
+
+const saveMatchSnapshotWithClient = async (client: pg.PoolClient, snapshot: PersistMatchSnapshotInput): Promise<void> => {
+  await client.query(
+    `INSERT INTO match_snapshots(match_id, seq, state_json)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (match_id, seq) DO UPDATE
+     SET state_json = EXCLUDED.state_json,
+         created_at = now()`,
+    [snapshot.matchId, snapshot.seq, snapshot.state],
+  );
+};
+
+export const saveMatchSnapshot = async (pool: pg.Pool, snapshot: PersistMatchSnapshotInput): Promise<void> => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await saveMatchSnapshotWithClient(client, snapshot);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
+export const loadLatestMatchSnapshot = async (pool: pg.Pool, matchId: string): Promise<PersistedMatchSnapshotRecord | undefined> => {
+  const result = await pool.query(
+    `SELECT match_id, seq, state_json
+     FROM match_snapshots
+     WHERE match_id = $1
+     ORDER BY seq DESC
+     LIMIT 1`,
+    [matchId],
+  );
+  const row = result.rows[0];
+  return row ? { matchId: row.match_id, seq: Number(row.seq), state: row.state_json } : undefined;
+};
+
+const validatePersistedEventRows = (rows: pg.QueryResultRow[]): unknown[] =>
+  rows.map((row) => {
+    const seq = Number(row.seq);
+    const type = String(row.event_type);
+    const payload = row.payload_json;
+    if (!payload || typeof payload !== "object") {
+      throw new Error(`Persisted event row ${seq} has a malformed payload`);
+    }
+    const event = payload as { seq?: unknown; type?: unknown };
+    if (event.seq !== seq) {
+      throw new Error(`Persisted event row seq ${seq} does not match payload seq ${String(event.seq)}`);
+    }
+    if (event.type !== type) {
+      throw new Error(`Persisted event row type ${type} does not match payload type ${String(event.type)}`);
+    }
+    return payload;
+  });
+
+const loadMatchEventPayloads = async (pool: pg.Pool, matchId: string, afterSeq = 0): Promise<unknown[]> => {
+  const events = await pool.query(
+    `SELECT seq, event_type, payload_json
+     FROM match_events
+     WHERE match_id = $1 AND seq > $2
+     ORDER BY seq ASC`,
+    [matchId, afterSeq],
+  );
+  return validatePersistedEventRows(events.rows);
+};
+
 export const loadReplayLog = async (pool: pg.Pool, matchId: string): Promise<{ config: unknown; board: unknown; events: unknown[] } | undefined> => {
   const match = await pool.query("SELECT config_json, board_json FROM matches WHERE id = $1", [matchId]);
   if ((match.rowCount ?? 0) === 0) return undefined;
-  const events = await pool.query("SELECT payload_json FROM match_events WHERE match_id = $1 ORDER BY seq ASC", [matchId]);
   return {
     config: match.rows[0].config_json,
     board: match.rows[0].board_json,
-    events: events.rows.map((row) => row.payload_json),
+    events: await loadMatchEventPayloads(pool, matchId),
   };
 };
 
@@ -525,6 +605,7 @@ export interface PersistedRoomRecord {
     config: unknown;
     board: unknown;
     events: unknown[];
+    snapshot?: PersistedMatchSnapshotRecord;
     endedAt?: string;
     winnerUserId?: string;
   };
@@ -554,9 +635,8 @@ const hydratePersistedRoomRecords = async (pool: pg.Pool, rows: pg.QueryResultRo
       [row.id],
     );
     const matchRow = match.rows[0];
-    const events = matchRow
-      ? await pool.query("SELECT payload_json FROM match_events WHERE match_id = $1 ORDER BY seq ASC", [matchRow.id])
-      : undefined;
+    const events = matchRow ? await loadMatchEventPayloads(pool, matchRow.id) : undefined;
+    const snapshot = matchRow ? await loadLatestMatchSnapshot(pool, matchRow.id) : undefined;
     const record: PersistedRoomRecord = {
       id: row.id,
       mode: row.mode,
@@ -600,8 +680,9 @@ const hydratePersistedRoomRecords = async (pool: pg.Pool, rows: pg.QueryResultRo
         id: matchRow.id,
         config: matchRow.config_json,
         board: matchRow.board_json,
-        events: events?.rows.map((event) => event.payload_json) ?? [],
+        events: events ?? [],
       };
+      if (snapshot) record.match.snapshot = snapshot;
       const endedAt = dateString(matchRow.ended_at);
       if (endedAt) record.match.endedAt = endedAt;
       if (matchRow.winner_user_id) record.match.winnerUserId = matchRow.winner_user_id;

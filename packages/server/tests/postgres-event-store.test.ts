@@ -1,7 +1,7 @@
 import type pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { getLegalActions } from "@colonizt/game-core";
-import { createPool, runMigrations } from "@colonizt/db";
+import { createPool, loadReplayLog, runMigrations } from "@colonizt/db";
 import { PostgresEventStore } from "../src/event-store.js";
 import { RoomManager } from "../src/room-manager.js";
 
@@ -84,6 +84,36 @@ describePostgres("PostgresEventStore integration", () => {
     expect(resolved?.userId).toBe(session.userId);
     expect(expiredStatus).toMatchObject({ status: "EXPIRED", cleanupReason: "EMPTY_LOBBY_TTL" });
     expect(loadedReplay?.events.map((event) => event.seq)).toEqual([1]);
+  });
+
+  it("persists latest match snapshots and rejects row/payload replay mismatches", async () => {
+    const store = new PostgresEventStore(pool);
+    const manager = new RoomManager(store, { emptyLobbyTtlMs: 1000 });
+    const session = await manager.createSession("Snapshot Host");
+    const room = await manager.createRoom(session, { mode: "CLASSIC", botFill: true, ranked: false });
+    const ready = await manager.setReady(room.id, session, true);
+    if (!ready.ok || !ready.room.game) throw new Error("room did not start");
+
+    await store.saveSnapshot(ready.room, ready.room.game);
+    const snapshot = await store.loadLatestSnapshot(ready.room.game.config.matchId);
+    expect(snapshot).toMatchObject({
+      matchId: ready.room.game.config.matchId,
+      seq: ready.room.game.eventSeq,
+    });
+    expect(snapshot?.state.eventSeq).toBe(ready.room.game.eventSeq);
+
+    await pool.query(
+      `INSERT INTO matches(id, mode, ranked, seed_hash, config_json, board_json)
+       VALUES ($1, 'CLASSIC', false, 'bad-seed', '{}'::jsonb, '{}'::jsonb)`,
+      ["bad_replay_rows"],
+    );
+    await pool.query(
+      `INSERT INTO match_events(match_id, seq, event_type, payload_json)
+       VALUES ($1, 1, 'TURN_ENDED', $2)`,
+      ["bad_replay_rows", { schemaVersion: 3, seq: 2, type: "TURN_ENDED", playerId: "p1", nextPlayerId: "p2" }],
+    );
+
+    await expect(loadReplayLog(pool, "bad_replay_rows")).rejects.toThrow(/row seq 1 does not match payload seq 2/);
   });
 
   it("persists two-player starts from four-seat lobbies without open seats as match players", async () => {

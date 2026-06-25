@@ -1,14 +1,12 @@
 import { useCallback, useEffect, useRef, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
 import {
-  emptyResources,
-  hasResources,
   tradeRecipientIds,
   type GameCommand,
   type GameEvent,
   type GameState,
   type PlayerId,
 } from "@colonizt/game-core";
-import { createBotTradeId, createBotView, evaluateTrade, greedyBot, randomLegalBot, scoreTradeResponder } from "@colonizt/bots";
+import { createBotTradeId, createBotView, evaluateTrade, greedyBot, randomLegalBot, resolveBotOfferCommand, tradeFullyAnswered } from "@colonizt/bots";
 import { isLocalBotPlayer, localBotAutomationKey, localBotPlayerIdsForState, nextLocalTradeDeadlines } from "../local-automation.js";
 
 const localBotControllers = [randomLegalBot, greedyBot, randomLegalBot, greedyBot] as const;
@@ -24,32 +22,6 @@ const botActionDelays = {
   BUILD_ROAD: 550,
   DEFAULT: 450,
 } as const;
-
-const tradeFullyAnswered = (state: GameState, trade: GameState["trades"][string]): boolean =>
-  tradeRecipientIds(state, trade).every((playerId) => {
-    const status = trade.responses?.[playerId]?.status;
-    return Boolean(status) && status !== "PENDING";
-  });
-
-const resolveBotOfferCommand = (state: GameState, tradeId: string, humanPlayerId: PlayerId): GameCommand | undefined => {
-  const trade = state.trades[tradeId];
-  if (!trade || trade.status !== "COLLECTING_RESPONSES") return undefined;
-  const currentBotIds = new Set(localBotPlayerIdsForState(state, humanPlayerId));
-  if (!currentBotIds.has(trade.fromPlayerId)) return undefined;
-  const controller = botForLocalPlayer(state, trade.fromPlayerId, humanPlayerId);
-  const candidates = tradeRecipientIds(state, trade)
-    .filter((playerId) => trade.responses?.[playerId]?.status === "WANTS_ACCEPT")
-    .filter((playerId) =>
-      hasResources(state.players[trade.fromPlayerId]?.resources ?? emptyResources(), trade.offered)
-      && hasResources(state.players[playerId]?.resources ?? emptyResources(), trade.requested),
-    )
-    .map((playerId) => ({ playerId, score: scoreTradeResponder(state, trade, playerId, controller.profile, state.config.botDifficulty ?? "medium") }))
-    .sort((left, right) => right.score - left.score || state.playerOrder.indexOf(left.playerId) - state.playerOrder.indexOf(right.playerId));
-  const selected = candidates[0]?.playerId;
-  return selected
-    ? { type: "FINALIZE_TRADE", playerId: trade.fromPlayerId, tradeId: trade.id, toPlayerId: selected }
-    : { type: "CANCEL_TRADE", playerId: trade.fromPlayerId, tradeId: trade.id };
-};
 
 interface LocalCommandResult {
   state: GameState;
@@ -187,8 +159,14 @@ export const useLocalAutomation = ({
           const current = stateRef.current;
           const currentTrade = current.trades[trade.id];
           if (!currentTrade || currentTrade.status !== "COLLECTING_RESPONSES" || !tradeFullyAnswered(current, currentTrade)) return;
-          const command = resolveBotOfferCommand(current, currentTrade.id, humanPlayerId);
-          if (command) applyLocalCommandRef.current(command);
+          const resolution = resolveBotOfferCommand({
+            state: current,
+            tradeId: currentTrade.id,
+            botIds: localBotPlayerIdsForState(current, humanPlayerId),
+            profileForPlayer: (playerId) => botForLocalPlayer(current, playerId, humanPlayerId).profile,
+            expireNonBotOfferer: false,
+          });
+          if (resolution) applyLocalCommandRef.current(resolution.command);
         }, 300);
         tradeResponseTimersRef.current.set(readyResolutionKey, timer);
       }
@@ -205,8 +183,14 @@ export const useLocalAutomation = ({
           applyLocalCommandRef.current({ type: "EXPIRE_TRADE", playerId: currentTrade.fromPlayerId, tradeId: currentTrade.id, reason: "RESPONSE_TIMEOUT" });
           return;
         }
-        const command = resolveBotOfferCommand(current, currentTrade.id, humanPlayerId);
-        if (command) applyLocalCommandRef.current(command);
+        const resolution = resolveBotOfferCommand({
+          state: current,
+          tradeId: currentTrade.id,
+          botIds: localBotPlayerIdsForState(current, humanPlayerId),
+          profileForPlayer: (playerId) => botForLocalPlayer(current, playerId, humanPlayerId).profile,
+          expireNonBotOfferer: true,
+        });
+        if (resolution) applyLocalCommandRef.current(resolution.command);
       }, Math.max(0, (localTradeDeadlines[trade.id] ?? Date.now() + 15_000) - Date.now()));
       tradeResponseTimersRef.current.set(deadlineKey, timer);
     });

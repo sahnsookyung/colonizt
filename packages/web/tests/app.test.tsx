@@ -415,14 +415,48 @@ describe("App", () => {
     expect(actionBar).toHaveTextContent("City");
     expect(actionBar).toHaveTextContent("End Turn");
     expect(within(actionBar).getByRole("button", { name: "Open trade" })).toHaveClass("trade-action");
-    expect(within(actionBar).getByRole("button", { name: "Draw special card" })).toHaveClass("special-action");
+    expect(within(actionBar).getByRole("button", { name: /Draw special card\. Cost:/ })).toHaveClass("special-action");
     expect(within(actionBar).getByRole("button", { name: "Build road" })).toHaveClass("road-action");
     expect(within(actionBar).getByRole("button", { name: "Build settlement" })).toHaveClass("settlement-action");
     expect(within(actionBar).getByRole("button", { name: "Upgrade city" })).toHaveClass("city-action");
 
-    const sidebar = screen.getByLabelText("Players and controls");
-    expect(within(sidebar).getByLabelText("Development cards")).toBeInTheDocument();
+    const sidebar = screen.getByLabelText("Match information and players");
+    expect(within(sidebar).queryByLabelText("Development cards")).not.toBeInTheDocument();
     expect(within(sidebar).getByLabelText("Gameplay log")).toBeInTheDocument();
+  });
+
+  it("keeps online room actions out of the information sidebar", async () => {
+    const game = completeSetup(createDemoGame("web-online-sidebar-info-only")).state;
+    await renderOnlineGame(game);
+
+    const sidebar = screen.getByLabelText("Match information and players");
+    expect(within(sidebar).queryByRole("button", { name: /Copy Invite|Copy/ })).not.toBeInTheDocument();
+    expect(within(sidebar).queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+    expect(within(sidebar).queryByRole("button", { name: "Leave" })).not.toBeInTheDocument();
+
+    const roomControls = screen.getAllByLabelText("Room controls");
+    expect(roomControls.length).toBeGreaterThan(0);
+    expect(roomControls.some((controls) => within(controls).queryByRole("button", { name: /Copy Invite|Copy/ }) !== null)).toBe(true);
+    expect(roomControls.some((controls) => within(controls).queryByRole("button", { name: "Leave" }) !== null)).toBe(true);
+  });
+
+  it("shows randomized special-card costs on the in-board action button", async () => {
+    let game = completeSetup(createDemoGame("web-special-cost-visible")).state;
+    game.phase = { type: "ACTION_PHASE", activePlayerId: "p1" };
+    game.config.rules = {
+      ...game.config.rules,
+      specialCardCostRandomized: true,
+      specialCardCost: { ...emptyResources(), timber: 1, brick: 1, fiber: 1 },
+    };
+    game = withResources(game, "p1", { timber: 1, brick: 1, fiber: 1 });
+
+    await renderOnlineGame(game);
+
+    const specialButton = screen.getByRole("button", { name: "Draw special card. Cost: 1 Timber, 1 Brick, 1 Fiber" });
+    expect(specialButton).toHaveAttribute("data-tooltip", "Special card cost: 1 Timber, 1 Brick, 1 Fiber");
+    expect(specialButton.querySelector(".action-cost-icons .resource-icon-timber")).not.toBeNull();
+    expect(specialButton.querySelector(".action-cost-icons .resource-icon-brick")).not.toBeNull();
+    expect(specialButton.querySelector(".action-cost-icons .resource-icon-fiber")).not.toBeNull();
   });
 
   it("enables city upgrades before city mode is selected", async () => {
@@ -445,6 +479,17 @@ describe("App", () => {
         command: expect.objectContaining({ type: "UPGRADE_CITY", playerId: "p1" }),
       }),
     ])));
+  });
+
+  it("renders settlement houses from ownership when building details are absent", async () => {
+    const game = completeSetup(createDemoGame("web-legacy-settlement-rendering")).state;
+    const settlementCount = Object.keys(game.settlements).length;
+    expect(settlementCount).toBeGreaterThan(0);
+    game.buildings = {};
+
+    await renderOnlineGame(game);
+
+    expect(document.querySelectorAll(".house-building")).toHaveLength(settlementCount);
   });
 
   it("componentizes own secret VP and keeps Road Building on the board", async () => {
@@ -471,20 +516,20 @@ describe("App", () => {
     expect(screen.getByText("4 (5) VP")).toBeInTheDocument();
     expect(screen.queryByText("5 (6) VP")).not.toBeInTheDocument();
     expect(screen.queryByText("3 (5) VP")).not.toBeInTheDocument();
-    expect(screen.getByText("Secret +1 VP")).toBeInTheDocument();
     expect(screen.getByLabelText("Bank holdings")).toBeInTheDocument();
     const handDevCards = screen.getByLabelText("Your development cards in hand");
     expect(within(handDevCards).getByRole("button", { name: "Victory Point: Secret +1 VP" })).toHaveAttribute("aria-disabled", "true");
-    expect(within(handDevCards).getByRole("button", { name: "Road Building: Ready" })).toBeEnabled();
+    const roadBuildingButton = within(handDevCards).getByRole("button", { name: "Road Building: Ready" });
+    expect(roadBuildingButton).toBeEnabled();
+    expect(screen.queryByLabelText("Development cards")).not.toBeInTheDocument();
+    expect(within(handDevCards).queryByRole("button", { name: /^e\d+$/ })).not.toBeInTheDocument();
 
-    const devPanel = screen.getByLabelText("Development cards");
-    expect(within(devPanel).queryByRole("button", { name: /^e\d+$/ })).not.toBeInTheDocument();
-    fireEvent.click(within(devPanel).getByRole("button", { name: "Use" }));
-    expect(within(devPanel).getByRole("button", { name: "0/2 roads" })).toBeInTheDocument();
-    expect(within(devPanel).queryByRole("button", { name: /^e\d+$/ })).not.toBeInTheDocument();
+    fireEvent.click(roadBuildingButton);
+    expect(within(handDevCards).getByRole("button", { name: "Road Building: 0/2 roads" })).toBeInTheDocument();
+    expect(within(handDevCards).queryByRole("button", { name: /^e\d+$/ })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getAllByRole("button", { name: /Build road here/ })[0]!);
-    expect(within(devPanel).getByRole("button", { name: "1/2 roads" })).toBeInTheDocument();
+    expect(within(handDevCards).getByRole("button", { name: "Road Building: 1/2 roads" })).toBeInTheDocument();
     fireEvent.click(screen.getAllByRole("button", { name: /Build road here/ })[0]!);
 
     await waitFor(() => expect(sentMessages).toEqual(expect.arrayContaining([
@@ -493,6 +538,26 @@ describe("App", () => {
         command: expect.objectContaining({ type: "PLAY_ROAD_BUILDING", playerId: "p1", cardId: "road-card", edgeIds: expect.any(Array) }),
       }),
     ])));
+  });
+
+  it("groups repeated development cards in the hand rack", async () => {
+    const game = completeSetup(createDemoGame("web-dev-card-groups")).state;
+    game.phase = { type: "ACTION_PHASE", activePlayerId: "p1" };
+    game.players.p1!.developmentCards = [
+      { id: "knight-a", type: "KNIGHT", ownerId: "p1", boughtTurn: game.turn - 1 },
+      { id: "knight-b", type: "KNIGHT", ownerId: "p1", boughtTurn: game.turn - 1 },
+      { id: "vp-a", type: "VICTORY_POINT", ownerId: "p1", boughtTurn: game.turn - 1 },
+    ];
+    game.players.p1!.specialCards = 3;
+    game.players.p2!.resources = { ...emptyResources(), timber: 1 };
+
+    await renderOnlineGame(game);
+
+    const handDevCards = screen.getByLabelText("Your development cards in hand");
+    expect(within(handDevCards).getByRole("button", { name: "Knight x2: Ready" })).toBeEnabled();
+    expect(within(handDevCards).getByText("x2")).toBeInTheDocument();
+    expect(within(handDevCards).queryAllByRole("button", { name: /Knight/ })).toHaveLength(1);
+    expect(within(handDevCards).getByRole("button", { name: "Victory Point: Secret +1 VP" })).toHaveAttribute("aria-disabled", "true");
   });
 
   it("limits Year of Plenty picks to resources the bank can supply", async () => {
@@ -504,8 +569,8 @@ describe("App", () => {
 
     await renderOnlineGame(game);
 
-    const devPanel = screen.getByLabelText("Development cards");
-    fireEvent.click(within(devPanel).getByRole("button", { name: "Use" }));
+    const handDevCards = screen.getByLabelText("Your development cards in hand");
+    fireEvent.click(within(handDevCards).getByRole("button", { name: "Year of Plenty: Ready" }));
     const overlay = screen.getByLabelText("Year of Plenty card choice");
     expect(within(overlay).queryByRole("button", { name: "Choose Ore as first Year of Plenty resource" })).not.toBeInTheDocument();
     expect(within(overlay).queryByRole("button", { name: "Choose Ore as second Year of Plenty resource" })).not.toBeInTheDocument();
@@ -523,8 +588,8 @@ describe("App", () => {
     game.players.p2!.resources = { ...emptyResources(), timber: 1 };
 
     const { sentMessages } = await renderOnlineGame(game);
-    const devPanel = screen.getByLabelText("Development cards");
-    fireEvent.click(within(devPanel).getByRole("button", { name: "Use" }));
+    const handDevCards = screen.getByLabelText("Your development cards in hand");
+    fireEvent.click(within(handDevCards).getByRole("button", { name: "Knight: Ready" }));
 
     expect(screen.queryByRole("button", { name: /Steal from/ })).not.toBeInTheDocument();
     const targetHex = screen.getAllByRole("button", { name: /Select robber destination on/ })[0];
@@ -550,6 +615,7 @@ describe("App", () => {
 
     expect(screen.getByLabelText("Discard resources")).toBeInTheDocument();
     const discardPanel = screen.getByLabelText("Discard resources");
+    expect(within(screen.getByLabelText("Match information and players")).queryByLabelText("Discard resources")).not.toBeInTheDocument();
     await waitFor(() => expect(within(discardPanel).getByText(/0\/4 · \d+:\d{2}/)).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "Select Timber to discard" }));
     expect(screen.queryByLabelText("Trade interface")).not.toBeInTheDocument();

@@ -9,7 +9,6 @@ import {
   eligibleStealTargets,
   getLegalActions,
   hasResources,
-  normalizeImportedState,
   randomizedDiscard,
   replay,
   resourceCount,
@@ -25,11 +24,12 @@ import {
   type HexId,
   type ViewerState,
 } from "@colonizt/game-core";
-import { createBotTradeId, createBotView, evaluateTrade, greedyBot, hasEquivalentBotTradeOffer, plannerBot, randomLegalBot, scoreTradeResponder, tradeShapeKey, type BotController } from "@colonizt/bots";
+import { createBotTradeId, createBotView, evaluateTrade, greedyBot, hasEquivalentBotTradeOffer, plannerBot, randomLegalBot, resolveBotOfferCommand, tradeFullyAnswered, tradeShapeKey, type BotController } from "@colonizt/bots";
 import { DueWorkIndex } from "./due-work.js";
 import { MemoryEventStore, type EventStore, type StoredCommandResult, type StoredMatchSummary, type StoredRoomRecord } from "./event-store.js";
 import { applyLobbySettings, canStartLobby, publicSeatsForRoom, startableSeatsForRoom, type LobbySettingsUpdate } from "./lobby.js";
 import type { RoomOwnershipStore } from "./ownership.js";
+import { hydrateGameFromStoredMatch } from "./replay-hydration.js";
 import { hashCommandPayload } from "./security.js";
 
 const tradeResponseWindowMs = 15_000;
@@ -1441,7 +1441,7 @@ export class RoomManager {
   }
 
   private roomFromStoredRecord(record: StoredRoomRecord): Room {
-    const game = record.match ? normalizeImportedState(replay(record.match)) : undefined;
+    const game = record.match ? hydrateGameFromStoredMatch(record.match) : undefined;
     const status = game?.phase.type === "GAME_OVER" ? "FINISHED" : record.status;
     const room: Room = {
       id: record.id,
@@ -1509,31 +1509,14 @@ export class RoomManager {
 
   private botOfferResolutionCommand(room: Room, tradeId: string): GameCommand | undefined {
     if (!room.game) return undefined;
-    const trade = room.game.trades[tradeId];
-    if (!trade || trade.status !== "COLLECTING_RESPONSES") return undefined;
-    const botIds = new Set(this.botSeatIds(room));
-    if (!botIds.has(trade.fromPlayerId)) {
-      return { type: "EXPIRE_TRADE", playerId: trade.fromPlayerId, tradeId: trade.id, reason: "RESPONSE_TIMEOUT" };
-    }
-    const candidates = tradeRecipientIds(room.game, trade)
-      .filter((playerId) => trade.responses?.[playerId]?.status === "WANTS_ACCEPT")
-      .filter((playerId) =>
-        hasResources(room.game!.players[trade.fromPlayerId]?.resources ?? emptyResources(), trade.offered)
-        && hasResources(room.game!.players[playerId]?.resources ?? emptyResources(), trade.requested),
-      )
-      .map((playerId) => ({ playerId, score: scoreTradeResponder(room.game!, trade, playerId, this.botFor(trade.fromPlayerId).profile, room.game!.config.botDifficulty ?? "medium") }))
-      .sort((left, right) => right.score - left.score || room.game!.playerOrder.indexOf(left.playerId) - room.game!.playerOrder.indexOf(right.playerId));
-    const selected = candidates[0]?.playerId;
-    return selected
-      ? { type: "FINALIZE_TRADE", playerId: trade.fromPlayerId, tradeId: trade.id, toPlayerId: selected }
-      : { type: "CANCEL_TRADE", playerId: trade.fromPlayerId, tradeId: trade.id };
-  }
-
-  private tradeFullyAnswered(state: GameState, trade: GameState["trades"][string]): boolean {
-    return tradeRecipientIds(state, trade).every((playerId) => {
-      const status = trade.responses?.[playerId]?.status;
-      return Boolean(status) && status !== "PENDING";
+    const resolution = resolveBotOfferCommand({
+      state: room.game,
+      tradeId,
+      botIds: this.botSeatIds(room),
+      profileForPlayer: (playerId) => this.botFor(playerId).profile,
+      difficulty: room.game.config.botDifficulty ?? "medium",
     });
+    return resolution?.command;
   }
 
   private readyBotOfferResolutionCommand(room: Room): GameCommand | undefined {
@@ -1542,7 +1525,7 @@ export class RoomManager {
     const trade = Object.values(room.game.trades)
       .filter((candidate) => candidate.status === "COLLECTING_RESPONSES")
       .filter((candidate) => botIds.has(candidate.fromPlayerId))
-      .filter((candidate) => this.tradeFullyAnswered(room.game!, candidate))
+      .filter((candidate) => tradeFullyAnswered(room.game!, candidate))
       .sort((left, right) => left.createdAtSeq - right.createdAtSeq || left.id.localeCompare(right.id))[0];
     return trade ? this.botOfferResolutionCommand(room, trade.id) : undefined;
   }

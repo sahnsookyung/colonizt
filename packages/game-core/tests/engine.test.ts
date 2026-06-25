@@ -30,6 +30,7 @@ import {
   specialCardCost,
   subtractResources,
   validateBoard,
+  validateReplayLog,
   type EdgeId,
   type GameEvent,
   type GameCommand,
@@ -410,6 +411,28 @@ describe("game setup and phases", () => {
     state = applyOrThrow(state, { type: "ROLL_DICE", playerId: "p1" }).state;
     const ended = applyOrThrow(state, { type: "END_TURN", playerId: "p1" }).state;
     expect(ended.phase).toMatchObject({ type: "WAITING_FOR_ROLL", activePlayerId: "p2" });
+  });
+});
+
+describe("replay validation", () => {
+  it("rejects duplicate, missing, and non-1 replay sequences", () => {
+    const { state, events } = completeSetup(createDemoGame("replay-validation"));
+    const log = { config: state.config, board: state.board, events: events.slice(0, 3) };
+
+    expect(validateReplayLog(log)).toEqual([]);
+    expect(() => replay({ ...log, events: [log.events[1]!] })).toThrow(/expected event sequence 1, got 2/i);
+    expect(() => replay({ ...log, events: [log.events[0]!, { ...log.events[1]!, seq: 1 }] })).toThrow(/appears more than once/);
+    expect(() => replay({ ...log, events: [log.events[0]!, { ...log.events[2]!, seq: 3 }] })).toThrow(/expected event sequence 2, got 3/i);
+  });
+
+  it("replays a validated snapshot plus tail to the same state as the full event log", () => {
+    const { state, events } = completeSetup(createDemoGame("replay-snapshot-tail"));
+    const snapshotSeq = 4;
+    const snapshot = replay({ config: state.config, board: state.board, events: events.filter((event) => event.seq <= snapshotSeq) });
+    const tail = events.filter((event) => event.seq > snapshotSeq);
+
+    expect(validateReplayLog({ config: state.config, board: state.board, snapshot: { seq: snapshotSeq, state: snapshot }, events: tail })).toEqual([]);
+    expect(replay({ config: state.config, board: state.board, snapshot: { seq: snapshotSeq, state: snapshot }, events: tail })).toEqual(state);
   });
 });
 

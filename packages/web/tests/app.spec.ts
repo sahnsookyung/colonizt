@@ -98,7 +98,15 @@ test("desktop game screen fits the viewport without page scrolling", async ({ pa
     };
     const playerCards = [...document.querySelectorAll<HTMLElement>(".players .player")].map((player) => {
       const rect = player.getBoundingClientRect();
-      return { bottom: rect.bottom, top: rect.top, height: rect.height };
+      const stats = player.querySelector<HTMLElement>(".player-stats")?.getBoundingClientRect();
+      return {
+        bottom: rect.bottom,
+        top: rect.top,
+        height: rect.height,
+        statsBottom: stats?.bottom ?? 0,
+        statsTop: stats?.top ?? 0,
+        statsHeight: stats?.height ?? 0,
+      };
     });
     return {
       viewportHeight: window.innerHeight,
@@ -122,6 +130,11 @@ test("desktop game screen fits the viewport without page scrolling", async ({ pa
   expect(metrics.sidePanel.bottom).toBeLessThanOrEqual(metrics.viewportHeight + 1);
   expect(metrics.playerCards).toHaveLength(4);
   expect(metrics.playerCards.at(-1)?.bottom ?? 0).toBeLessThanOrEqual(metrics.viewportHeight + 1);
+  for (const card of metrics.playerCards) {
+    expect(card.statsHeight).toBeGreaterThan(18);
+    expect(card.statsTop).toBeGreaterThanOrEqual(card.top);
+    expect(card.statsBottom).toBeLessThanOrEqual(card.bottom);
+  }
 });
 
 test("action controls use solid contained colors", async ({ page, isMobile }) => {

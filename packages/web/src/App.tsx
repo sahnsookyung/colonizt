@@ -40,7 +40,6 @@ import {
   BoardHousePiece,
   BoardIcon,
   BotSymbol,
-  CardsSymbol,
   DevelopmentCardIcon,
   DicePanel,
   EndTurnSymbol,
@@ -49,6 +48,7 @@ import {
   HumanSymbol,
   KnightStatSymbol,
   ResourceCard,
+  ResourceIcon,
   RobberSymbol,
   RoadSymbol,
   RoadStatSymbol,
@@ -62,7 +62,9 @@ import {
   resourceLabels,
   terrainLabels,
 } from "./components/game-ui.js";
+import { HandRack, type DevelopmentCardGroupView } from "./components/hand-rack.js";
 import { LobbyScreen, type LobbySettingsInput } from "./components/lobby-screen.js";
+import { PlayerStatsList } from "./components/player-stats-list.js";
 import { useLocalAutomation } from "./hooks/useLocalAutomation.js";
 import { useNetworkRoom } from "./hooks/useNetworkRoom.js";
 import { useSyncedRef } from "./hooks/useSyncedRef.js";
@@ -167,6 +169,12 @@ const boardBounds = (state: GameState) => {
 
 const bundlesEqual = (left: ResourceBundle, right: ResourceBundle): boolean =>
   resources.every((resource) => left[resource] === right[resource]);
+
+const bundleSummary = (bundle: Partial<ResourceBundle>): string =>
+  resources
+    .filter((resource) => (bundle[resource] ?? 0) > 0)
+    .map((resource) => `${bundle[resource]} ${resourceLabels[resource]}`)
+    .join(", ");
 
 const issueCommand = (state: GameState, command: GameCommand): { state: GameState; events: GameEvent[]; error?: string } => {
   const result = applyCommand(state, command);
@@ -337,6 +345,7 @@ export const App = () => {
   const [networkRoom, setNetworkRoom] = useState<PublicRoomPayload | null>(null);
   const [lobbyPending, setLobbyPending] = useState({ ready: false, settings: false, start: false, name: false });
   const [networkSocketOpen, setNetworkSocketOpen] = useState(false);
+  const [showMatchDetails, setShowMatchDetails] = useState(false);
   const { tradeOffer, setTradeOffer, tradeRequest, setTradeRequest, tradeOpen, setTradeOpen, setTradeDraft, clearTradeDraft } = useTradeDraft();
   const [selectedTradeResponder, setSelectedTradeResponder] = useState<PlayerId | null>(null);
   const [localTradeDeadlines, setLocalTradeDeadlines] = useState<Record<string, number>>({});
@@ -435,6 +444,7 @@ export const App = () => {
   const canEndTurn = legal.some((action) => action.type === "END_TURN");
   const canOfferTrade = legal.some((action) => action.type === "OFFER_TRADE");
   const specialCost = specialCardCost(state.config.rules);
+  const specialCostLabel = bundleSummary(specialCost) || "free";
   const canBuySpecialCard = legal.some((action) => action.type === "BUY_SPECIAL_CARD");
   const discardAction = legal.find((action) => action.type === "DISCARD_RESOURCES");
   const moveThiefAction = legal.find((action) => action.type === "MOVE_THIEF");
@@ -1138,7 +1148,7 @@ export const App = () => {
     }
     setRoadBuildingDraft({ cardId, edgeIds: nextEdges });
   };
-  const cancelRoadBuilding = () => {
+  const cancelSpecialCardMode = () => {
     playSound("select");
     setSpecialBoardMode(null);
     setRoadBuildingDraft({ cardId: "", edgeIds: [] });
@@ -1259,14 +1269,43 @@ export const App = () => {
     if (activeYearOfPlentyCardId === card.id) return "Choosing resources";
     return developmentCardStatus(card);
   };
-  const developmentCardTooltip = (card: DevelopmentCard): string => `${developmentCardLabels[card.type]}: ${developmentCardStatus(card)}`;
   const activateDevelopmentCard = (card: DevelopmentCard) => {
+    if (isDevelopmentCardActive(card)) {
+      cancelSpecialCardMode();
+      return;
+    }
     if (!isDevelopmentCardPlayable(card)) return;
     if (card.type === "KNIGHT") startKnightTargeting(card.id);
     else if (card.type === "ROAD_BUILDING") startRoadBuilding(card.id);
     else if (card.type === "MONOPOLY") startMonopolyChoice(card.id);
     else if (card.type === "YEAR_OF_PLENTY") startYearOfPlentyChoice(card.id);
   };
+  const isDevelopmentCardActive = (card: DevelopmentCard): boolean =>
+    activeKnightCardId === card.id
+    || activeRoadBuildingCardId === card.id
+    || activeMonopolyCardId === card.id
+    || activeYearOfPlentyCardId === card.id;
+  const groupedDevelopmentCards: DevelopmentCardGroupView[] = developmentCardTypes.flatMap((type) => {
+    const cards = ownDevelopmentCards.filter((card) => card.type === type && !card.playedTurn);
+    if (cards.length === 0) return [];
+    const activeCard = cards.find(isDevelopmentCardActive);
+    const playableCard = cards.find(isDevelopmentCardPlayable);
+    const primary = activeCard ?? playableCard ?? cards[0]!;
+    const active = isDevelopmentCardActive(primary);
+    const status = activeDevelopmentCardStatus(primary);
+    const labelPrefix = cards.length > 1 ? `${developmentCardLabels[type]} x${cards.length}` : developmentCardLabels[type];
+    return [{
+      type,
+      cards,
+      primary,
+      active,
+      playable: Boolean(playableCard),
+      status,
+      label: `${labelPrefix}: ${status}`,
+      tooltip: `${labelPrefix}: ${developmentCardStatus(primary)}`,
+      shortLabel: developmentCardShortLabels[type],
+    }];
+  });
   const constructionActions: Array<{
     mode: BuildMode;
     label: string;
@@ -1908,6 +1947,14 @@ export const App = () => {
             </p>
           </div>
           <div className="topbar-actions">
+            {networkRoomInfo ? (
+              <div className="room-topbar-actions" aria-label="Room controls">
+                <span>{networkRoomInfo.code ?? networkRoomInfo.id}</span>
+                <button type="button" onClick={copyInvite}>Copy Invite</button>
+                {reconnectRetryAt ? <button type="button" onClick={retryOnlineNow}>Retry</button> : null}
+                <button type="button" onClick={returnToSetup}>Leave</button>
+              </div>
+            ) : null}
             {isReplaying && replayLog ? (
               <div className="replay-controls" aria-label="Replay controls">
                 <button type="button" onClick={() => stepReplay(-1)} disabled={replayIndex === 0}>Prev</button>
@@ -1924,6 +1971,14 @@ export const App = () => {
 
         <div className="board-layout">
           <div className="board-stage">
+            {networkRoomInfo ? (
+              <div className="room-hud-actions" aria-label="Room controls">
+                <span>{networkRoomInfo.code ?? networkRoomInfo.id}</span>
+                <button type="button" onClick={copyInvite}>Copy</button>
+                {reconnectRetryAt ? <button type="button" onClick={retryOnlineNow}>Retry</button> : null}
+                <button type="button" onClick={returnToSetup}>Leave</button>
+              </div>
+            ) : null}
             <svg className="board" viewBox={`${bounds.minX} ${bounds.minY} ${bounds.width} ${bounds.height}`} role="group" aria-label="Resource board" onClick={handleBoardClick}>
               <defs>
                 <radialGradient id="oceanGlow" cx="50%" cy="44%" r="72%">
@@ -2172,8 +2227,9 @@ export const App = () => {
                 );
               })}
               {Object.values(state.board.vertices).map((vertex) => {
-                const building = state.buildings[vertex.id];
-                const owner = building?.owner;
+                const settlementOwner = state.settlements[vertex.id];
+                const building = state.buildings[vertex.id] ?? (settlementOwner ? { owner: settlementOwner, type: "settlement" as const } : undefined);
+                const owner = building?.owner ?? settlementOwner;
                 const isLegalSettlement = legalSettlements.has(vertex.id);
                 const isLegalCity = legalCities.has(vertex.id);
                 const isLegalVertex = isLegalSettlement || isLegalCity;
@@ -2256,10 +2312,26 @@ export const App = () => {
                 <TradeSymbol />
                 <span>Trade</span>
               </button>
-              <button type="button" className="board-action special-action" onClick={buySpecialCard} disabled={!canBuySpecialCard} aria-label="Draw special card">
+              <button
+                type="button"
+                className="board-action special-action"
+                onClick={buySpecialCard}
+                disabled={!canBuySpecialCard}
+                aria-label={`Draw special card. Cost: ${specialCostLabel}`}
+                title={`Special card cost: ${specialCostLabel}`}
+                data-tooltip={`Special card cost: ${specialCostLabel}`}
+              >
                 <SpecialSymbol />
                 <span>Special Card</span>
                 <small>{resourceCount(specialCost)}</small>
+                <span className="action-cost-icons" aria-hidden="true">
+                  {resources.filter((resource) => specialCost[resource] > 0).map((resource) => (
+                    <span key={resource}>
+                      <ResourceIcon resource={resource} />
+                      <b>{specialCost[resource]}</b>
+                    </span>
+                  ))}
+                </span>
               </button>
               {constructionActions.map((action) => (
                 <button
@@ -2290,57 +2362,30 @@ export const App = () => {
               </button>
             </div>
 
-            <div className="hand-rack" aria-label="Your resources">
-              <div className="resource-hand" aria-label="Resource cards">
-                {resources.map((resource) => {
-                  const discardSelected = discardDraft[resource] ?? 0;
-                  const isDiscardSelection = discardAction?.type === "DISCARD_RESOURCES";
-                  const owned = humanPlayer?.resources[resource] ?? 0;
-                  const discardFull = isDiscardSelection && resourceCount(discardDraft) >= discardAction.count;
-                  const canPickDiscard = isDiscardSelection && owned > discardSelected && !discardFull;
-                  return (
-                    <ResourceCard
-                      key={resource}
-                      resource={resource}
-                      count={owned}
-                      compact
-                      onClick={() => isDiscardSelection ? incrementDiscard(resource) : openTradeFromResource(resource)}
-                      buttonLabel={isDiscardSelection ? `Select ${resourceLabels[resource]} to discard` : `Open trade with ${resourceLabels[resource]}`}
-                      selected={isDiscardSelection ? discardSelected > 0 : tradeOffer[resource] > 0}
-                      selectedCount={isDiscardSelection ? discardSelected : 0}
-                      disabled={isDiscardSelection ? !canPickDiscard : false}
-                    />
-                  );
-                })}
-              </div>
-              {ownDevelopmentCards.some((card) => !card.playedTurn) ? (
-                <div className="dev-hand" aria-label="Your development cards in hand">
-                  {ownDevelopmentCards.filter((card) => !card.playedTurn).map((card) => {
-                    const playable = isDevelopmentCardPlayable(card);
-                    const active = activeKnightCardId === card.id
-                      || activeRoadBuildingCardId === card.id
-                      || activeMonopolyCardId === card.id
-                      || activeYearOfPlentyCardId === card.id;
-                    const status = activeDevelopmentCardStatus(card);
-                    const label = `${developmentCardLabels[card.type]}: ${status}`;
-                    return (
-                      <button
-                        key={card.id}
-                        type="button"
-                        className={`dev-hand-card ${active ? "selected" : ""} ${!playable ? "is-disabled" : ""} ${card.type === "VICTORY_POINT" ? "secret-vp-card" : ""}`}
-                        onClick={() => activateDevelopmentCard(card)}
-                        aria-disabled={!playable}
-                        aria-label={label}
-                        title={developmentCardTooltip(card)}
-                      >
-                        <DevelopmentCardIcon type={card.type} />
-                        <small>{developmentCardShortLabels[card.type]}</small>
-                      </button>
-                    );
-                  })}
+            {discardAction?.type === "DISCARD_RESOURCES" ? (
+              <div className="phase-card discard-board-panel modal-control-card" aria-label="Discard resources">
+                <div className="panel-title">
+                  <strong>Discard</strong>
+                  <span>{resourceCount(discardDraft)}/{discardAction.count}{turnDeadline?.mode === "discard" && turnSecondsRemaining !== undefined ? ` · ${formatTimer(turnSecondsRemaining)}` : ""}</span>
                 </div>
-              ) : null}
-            </div>
+                <div className="discard-summary">
+                  <span>Select cards from your hand.</span>
+                  <button type="button" onClick={clearDiscard} disabled={resourceCount(discardDraft) === 0}>Clear</button>
+                </div>
+                <button type="button" className="primary-wide" onClick={submitDiscard} disabled={!canSubmitDiscard}>Discard</button>
+              </div>
+            ) : null}
+
+            <HandRack
+              resourceHand={humanPlayer?.resources ?? emptyResources()}
+              tradeOffer={tradeOffer}
+              discardDraft={discardDraft}
+              developmentCardGroups={groupedDevelopmentCards}
+              onResourceTrade={openTradeFromResource}
+              onDiscardResource={incrementDiscard}
+              onDevelopmentCard={activateDevelopmentCard}
+              {...(discardAction?.type === "DISCARD_RESOURCES" ? { discardCount: discardAction.count } : {})}
+            />
 
             {selectedRobberHex ? (
               <div className="robber-choice-overlay" aria-label="Choose player to rob">
@@ -2693,21 +2738,7 @@ export const App = () => {
             ) : null}
           </div>
 
-          <aside className="side-panel" aria-label="Players and controls">
-            {discardAction?.type === "DISCARD_RESOURCES" ? (
-              <div className="phase-card modal-control-card" aria-label="Discard resources">
-                <div className="panel-title">
-                  <strong>Discard</strong>
-                  <span>{resourceCount(discardDraft)}/{discardAction.count}{turnDeadline?.mode === "discard" && turnSecondsRemaining !== undefined ? ` · ${formatTimer(turnSecondsRemaining)}` : ""}</span>
-                </div>
-                <div className="discard-summary">
-                  <span>Select cards from your hand.</span>
-                  <button type="button" onClick={clearDiscard} disabled={resourceCount(discardDraft) === 0}>Clear</button>
-                </div>
-                <button type="button" className="primary-wide" onClick={submitDiscard} disabled={!canSubmitDiscard}>Discard</button>
-              </div>
-            ) : null}
-
+          <aside className="side-panel" aria-label="Match information and players">
             <div className="phase-card bank-panel" aria-label="Bank holdings">
               <div className="panel-title">
                 <strong>Bank</strong>
@@ -2720,64 +2751,6 @@ export const App = () => {
               </div>
             </div>
 
-            <div className={`phase-card dev-card-panel ${ownDevelopmentCards.length === 0 ? "empty" : ""}`} aria-label="Development cards">
-              <div className="panel-title">
-                <strong>Development Cards</strong>
-                <span>{ownDevelopmentCards.filter((card) => !card.playedTurn).length}</span>
-              </div>
-              {ownDevelopmentCards.length === 0 ? (
-                <span className="muted-line">No cards</span>
-              ) : (
-                <div className="dev-card-list">
-                  {ownDevelopmentCards.map((card) => {
-                    const playable = isDevelopmentCardPlayable(card);
-                    const cardStatus = developmentCardStatus(card);
-                    const roadBuildingActive = activeRoadBuildingCardId === card.id;
-                    const roadBuildingSelections = roadBuildingActive ? roadBuildingSelectedEdges.length : 0;
-                    return (
-                      <div key={card.id} className={`dev-card-row ${card.playedTurn ? "played" : ""}`}>
-                        <DevelopmentCardIcon type={card.type} />
-                        <span className="dev-card-copy">{developmentCardLabels[card.type]}</span>
-                        <small>{cardStatus}</small>
-                        {card.type === "KNIGHT" && playKnightAction?.type === "PLAY_KNIGHT" && playable ? (
-                          <div className="dev-card-actions">
-                            <button type="button" className={activeKnightCardId === card.id ? "selected" : ""} onClick={() => startKnightTargeting(card.id)}>
-                              {activeKnightCardId === card.id ? "Choosing target" : "Use"}
-                            </button>
-                            {activeKnightCardId === card.id ? <button type="button" onClick={() => setSpecialBoardMode(null)}>Cancel</button> : null}
-                          </div>
-                        ) : null}
-                        {card.type === "ROAD_BUILDING" && playRoadBuildingAction?.type === "PLAY_ROAD_BUILDING" && playable ? (
-                          <div className="dev-card-actions dev-card-picker">
-                            <button type="button" className={roadBuildingActive ? "selected" : ""} onClick={() => startRoadBuilding(card.id)}>
-                              {roadBuildingActive ? `${roadBuildingSelections}/${roadBuildingRequiredCount} roads` : "Use"}
-                            </button>
-                            {roadBuildingActive ? <button type="button" onClick={cancelRoadBuilding}>Cancel</button> : null}
-                          </div>
-                        ) : null}
-                        {card.type === "MONOPOLY" && playMonopolyAction?.type === "PLAY_MONOPOLY" && playable ? (
-                          <div className="dev-card-actions">
-                            <button type="button" className={activeMonopolyCardId === card.id ? "selected" : ""} onClick={() => startMonopolyChoice(card.id)}>
-                              {activeMonopolyCardId === card.id ? "Choosing resource" : "Use"}
-                            </button>
-                            {activeMonopolyCardId === card.id ? <button type="button" onClick={() => setSpecialBoardMode(null)}>Cancel</button> : null}
-                          </div>
-                        ) : null}
-                        {card.type === "YEAR_OF_PLENTY" && playYearOfPlentyAction?.type === "PLAY_YEAR_OF_PLENTY" && playable ? (
-                          <div className="dev-card-actions dev-card-picker">
-                            <button type="button" className={activeYearOfPlentyCardId === card.id ? "selected" : ""} onClick={() => startYearOfPlentyChoice(card.id)}>
-                              {activeYearOfPlentyCardId === card.id ? "Choosing resources" : "Use"}
-                            </button>
-                            {activeYearOfPlentyCardId === card.id ? <button type="button" onClick={() => setSpecialBoardMode(null)}>Cancel</button> : null}
-                          </div>
-                        ) : null}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-
             <div className="game-log-panel" aria-label="Gameplay log">
               <div className="panel-title">
                 <strong>Gameplay Log</strong>
@@ -2788,79 +2761,40 @@ export const App = () => {
               </ol>
             </div>
 
-            <div className="phase-card">
-              <span className="eyebrow">{networkStatus}</span>
+            <div className={`phase-card match-status-card ${showMatchDetails ? "expanded" : ""}`}>
+              <div className="match-status-summary">
+                <div>
+                  <span className="eyebrow">{networkStatus}</span>
+                  <strong>{activeName ? `Active: ${activeName}` : "Game over"}</strong>
+                  <span>{turnTimerLabel ? `${turnTimerLabel} remaining` : state.lastRoll ? `${state.lastRoll.dice[0]} + ${state.lastRoll.dice[1]} = ${state.lastRoll.sum}` : "No roll yet"}</span>
+                </div>
+                <button type="button" onClick={() => setShowMatchDetails((shown) => !shown)} aria-expanded={showMatchDetails} aria-controls="match-details">
+                  {showMatchDetails ? "Hide" : "Details"}
+                </button>
+              </div>
               {networkRoomInfo ? (
                 <div className="room-share">
                   <span>Room Code</span>
                   <strong>{networkRoomInfo.code ?? networkRoomInfo.id}</strong>
                   {pendingCommandCount > 0 ? <small>{pendingCommandCount} pending</small> : null}
                   {reconnectRetryAt ? <small>Retry {Math.max(0, Math.ceil((reconnectRetryAt - nowMs) / 1000))}s</small> : null}
-                  <button type="button" onClick={copyInvite}>Copy Invite</button>
-                  <button type="button" onClick={retryOnlineNow} disabled={!reconnectRetryAt}>Retry</button>
-                  <button type="button" onClick={returnToSetup}>Leave</button>
                 </div>
               ) : null}
-              <strong>{activeName ? `Active: ${activeName}` : "Game over"}</strong>
-              <span>{state.lastRoll ? `${state.lastRoll.dice[0]} + ${state.lastRoll.dice[1]} = ${state.lastRoll.sum}` : "Dice have not rolled yet"}</span>
-              {turnTimerLabel ? <span>{turnTimerLabel} remaining</span> : null}
-              <span>Target {state.config.victoryPoints} VP · Longest Road {state.longestRoadOwner ? state.players[state.longestRoadOwner]?.name : "unclaimed"}</span>
-              <span>Largest Army {state.largestArmyOwner ? state.players[state.largestArmyOwner]?.name : "unclaimed"} · Robber {state.thiefHexId ? terrainLabels[state.board.hexes[state.thiefHexId]?.resource ?? "desert"] : "unset"}</span>
-              <span>Difficulty {state.config.botDifficulty ?? "medium"}{activeRules.length > 0 ? ` · ${activeRules.join(" · ")}` : ""}</span>
+              <div id="match-details" className="match-details" hidden={!showMatchDetails}>
+                <span>{state.lastRoll ? `${state.lastRoll.dice[0]} + ${state.lastRoll.dice[1]} = ${state.lastRoll.sum}` : "Dice have not rolled yet"}</span>
+                <span>Target {state.config.victoryPoints} VP · Longest Road {state.longestRoadOwner ? state.players[state.longestRoadOwner]?.name : "unclaimed"}</span>
+                <span>Largest Army {state.largestArmyOwner ? state.players[state.largestArmyOwner]?.name : "unclaimed"} · Robber {state.thiefHexId ? terrainLabels[state.board.hexes[state.thiefHexId]?.resource ?? "desert"] : "unset"}</span>
+                <span>Difficulty {state.config.botDifficulty ?? "medium"}{activeRules.length > 0 ? ` · ${activeRules.join(" · ")}` : ""}</span>
+              </div>
             </div>
 
-            <div className="players">
-              {displayPlayers.map((player) => {
-                const isBot = botPlayerIds.has(player.id);
-                return (
-                  <article key={player.id} className={`player ${player.id === activePlayer ? "active" : ""} ${isBot ? "bot-player" : "human-player"}`} style={{ borderColor: player.color }}>
-                    <div className="player-heading">
-                      <span className="player-kind" style={{ color: player.color }} aria-label={isBot ? `${player.name} is a bot` : `${player.name} is a player`}>
-                        {isBot ? <BotSymbol /> : <HumanSymbol />}
-                      </span>
-                      <strong>{player.name}</strong>
-                      <div className="player-stats" aria-label={`${victoryPointAria(player)}, ${player.resourceCount} resource cards, ${player.developmentCardCount} development cards, ${player.playedKnights} knights, longest road length ${player.longestRoadLength}`}>
-                        <span className={`stat-chip vp-chip ${player.secretVictoryPoints ? "vp-secret" : ""}`} title="Victory points">
-                          <VictoryPointStatSymbol />
-                          <span>{victoryPointText(player)}</span>
-                        </span>
-                        <span className="stat-chip" title="Resource cards">
-                          <CardsSymbol />
-                          <span>{player.resourceCount}</span>
-                        </span>
-                        <span className="stat-chip" title="Development cards">
-                          <DevelopmentCardIcon hidden />
-                          <span>{player.developmentCardCount}</span>
-                        </span>
-                        <span className="stat-chip" title="Knights used">
-                          <KnightStatSymbol />
-                          <span>{player.playedKnights}</span>
-                        </span>
-                        <span className="stat-chip" title="Road length">
-                          <RoadStatSymbol />
-                          <span>{player.longestRoadLength}</span>
-                        </span>
-                      </div>
-                      <div className="player-mobile-stats" aria-hidden="true">
-                        <span className={player.secretVictoryPoints ? "vp-secret" : ""}>{victoryPointText(player, true)}</span>
-                        <span>{player.resourceCount}C</span>
-                        <span>{player.developmentCardCount}D</span>
-                        <span>R{player.longestRoadLength}</span>
-                      </div>
-                    </div>
-                    <div className="player-awards">
-                      {player.hasLongestRoad ? <span className="badge">Longest Road</span> : null}
-                      {player.hasLargestArmy ? <span className="badge">Largest Army</span> : null}
-                    </div>
-                    {player.resources ? (
-                      <div className="mini-resources">
-                        {resources.map((resource) => <ResourceCard key={resource} resource={resource} count={player.resources?.[resource] ?? 0} compact />)}
-                      </div>
-                    ) : null}
-                  </article>
-                );
-              })}
-            </div>
+            <PlayerStatsList
+              players={displayPlayers}
+              botPlayerIds={botPlayerIds}
+              victoryPointText={victoryPointText}
+              victoryPointAria={victoryPointAria}
+              {...(activePlayer ? { activePlayerId: activePlayer } : {})}
+            />
           </aside>
         </div>
       </section>

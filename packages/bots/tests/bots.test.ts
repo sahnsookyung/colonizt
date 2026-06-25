@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { completeSetup, createDemoGame, playBotGame, withResources } from "@colonizt/demo-state";
 import { applyCommand, cityCost, emptyResources, specialCardCost, type BotDifficulty, type DevelopmentCardType, type MapPreset, type PlayerId } from "@colonizt/game-core";
-import { botStateFingerprint, chooseBotCommand, createBotView, evaluateState, evaluateTrade, greedyBot, hasEquivalentBotTradeOffer, roadOpensSettlementAccess, scoreBotCandidates, scoreTradeResponder } from "../src/index.js";
+import { botStateFingerprint, chooseBotCommand, createBotView, evaluateState, evaluateTrade, greedyBot, hasEquivalentBotTradeOffer, resolveBotOfferCommand, roadOpensSettlementAccess, scoreBotCandidates, scoreTradeResponder, tradeFullyAnswered } from "../src/index.js";
 
 const tournamentPlayerIds = ["p1", "p2", "p3", "p4"] as const satisfies readonly PlayerId[];
 const alternateMapPresets = ["islands", "continent"] as const satisfies readonly MapPreset[];
@@ -180,6 +180,53 @@ describe("bot policies", () => {
     const score = scoreTradeResponder(result.value.nextState, trade, "p2", greedyBot.profile, "hard");
     expect(Number.isFinite(score)).toBe(true);
     expect(scoreTradeResponder(result.value.nextState, trade, "p2", greedyBot.profile, "hard")).toBe(score);
+  });
+
+  it("resolves bot-offered trades through one deterministic helper", () => {
+    let state = completeSetup(createDemoGame("shared-trade-resolution", { botDifficulty: "hard" })).state;
+    state = { ...state, phase: { type: "ACTION_PHASE", activePlayerId: "p2" } };
+    state = withResources(state, "p2", { timber: 1 });
+    state = withResources(state, "p1", { ore: 1 });
+    state = withResources(state, "p3", { ore: 1 });
+    const offered = { ...emptyResources(), timber: 1 };
+    const requested = { ...emptyResources(), ore: 1 };
+    const offeredResult = applyCommand(state, {
+      type: "OFFER_TRADE",
+      playerId: "p2",
+      tradeId: "shared-resolution",
+      offered,
+      requested,
+      recipients: "ANY",
+    });
+    expect(offeredResult.ok).toBe(true);
+    if (!offeredResult.ok) throw new Error("Expected bot trade offer");
+    const p1Response = applyCommand(offeredResult.value.nextState, { type: "RESPOND_TRADE", playerId: "p1", tradeId: "shared-resolution", response: "WANTS_ACCEPT" });
+    expect(p1Response.ok).toBe(true);
+    if (!p1Response.ok) throw new Error("Expected p1 response");
+    const p3Response = applyCommand(p1Response.value.nextState, { type: "RESPOND_TRADE", playerId: "p3", tradeId: "shared-resolution", response: "WANTS_ACCEPT" });
+    expect(p3Response.ok).toBe(true);
+    if (!p3Response.ok) throw new Error("Expected p3 response");
+
+    const trade = p3Response.value.nextState.trades["shared-resolution"]!;
+    expect(tradeFullyAnswered(p3Response.value.nextState, trade)).toBe(false);
+    const resolution = resolveBotOfferCommand({
+      state: p3Response.value.nextState,
+      tradeId: trade.id,
+      botIds: ["p2"],
+      profileForPlayer: () => greedyBot.profile,
+      difficulty: "hard",
+    });
+
+    expect(resolution?.command.type).toBe("FINALIZE_TRADE");
+    expect(resolution?.trace.reason).toBe("FINALIZE");
+    expect(new Set(resolution?.trace.candidateScores.map((candidate) => candidate.playerId))).toEqual(new Set(["p1", "p3"]));
+    expect(resolveBotOfferCommand({
+      state: p3Response.value.nextState,
+      tradeId: trade.id,
+      botIds: ["p2"],
+      profileForPlayer: () => greedyBot.profile,
+      difficulty: "hard",
+    })?.command).toEqual(resolution?.command);
   });
 
   it("only chooses commands accepted by the engine preview path", () => {

@@ -154,6 +154,28 @@ describe("RoomManager", () => {
     expect(room.id).toMatch(/^room_/);
   });
 
+  it("writes memory snapshots when a committed event batch crosses the snapshot interval", async () => {
+    const store = new MemoryEventStore();
+    const { room } = await startedRoom(store);
+    if (!room.game) throw new Error("Expected started room");
+    const [playerId, nextPlayerId] = room.game.playerOrder;
+    if (!playerId || !nextPlayerId) throw new Error("Expected at least two players");
+    const events = [24, 25, 26].map((seq) => ({
+      schemaVersion: room.game!.schemaVersion,
+      seq,
+      type: "TURN_ENDED",
+      playerId,
+      nextPlayerId,
+    } as GameEvent));
+    room.game = { ...room.game, eventSeq: 26 };
+
+    await store.commitEvents(room, events);
+
+    const snapshot = await store.loadLatestSnapshot(room.game.config.matchId);
+    expect(snapshot?.seq).toBe(26);
+    expect(snapshot?.state.eventSeq).toBe(26);
+  });
+
   it("rejects new rooms when active room capacity is reached", async () => {
     const manager = new RoomManager(new MemoryEventStore(), { maxActiveRooms: 1 });
     const first = await manager.createSession("First");

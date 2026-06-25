@@ -4,22 +4,36 @@ Replays are reconstructed from:
 
 - Initial game config.
 - Initial board.
-- Ordered accepted game events.
-- Optional snapshots used only to speed loading.
+- Accepted game events ordered by contiguous `seq`.
+- Optional server-only snapshots used to speed loading.
 
 Every event has:
 
 - `schemaVersion`.
-- `matchId`.
-- `serverSeq`.
+- `seq`.
 - `type`.
-- `payload`.
+- event-specific payload fields.
 
-Snapshots are optimization, not truth. If a snapshot disagrees with the event log, replay must prefer the ordered events.
+Snapshots are optimization, not public truth. Authoritative snapshots contain full `GameState`, are never exposed directly through viewer APIs, and must have `snapshot.seq === snapshot.state.eventSeq`. Public room and replay endpoints still use viewer-safe serialization.
 
-## Schema Version 2
+## Replay Validation
 
-New games and events use `schemaVersion: 2`. Version 2 keeps bank and harbor trades immediate, but player-to-player trades are staged:
+`@colonizt/game-core` validates replay logs before applying events:
+
+- snapshots must have a non-negative integer `seq`, matching state `eventSeq`, and a supported schema version;
+- event payloads must be objects with integer `seq`, supported `schemaVersion`, and string `type`;
+- event sequences must start at `1` for full logs, or `snapshot.seq + 1` for snapshot-plus-tail logs;
+- duplicate and missing event sequences are rejected.
+
+The SQL replay loader also checks that each persisted row's `seq` and `event_type` match the embedded event payload before hydration. A corrupt row fails closed instead of silently rebuilding partial state.
+
+## Snapshot Hydration
+
+When a snapshot is available, room hydration replays `snapshot.state` plus only events after `snapshot.seq`. Snapshot-plus-tail replay must equal full replay for the same match. The server writes snapshots every 25 accepted events and at game over.
+
+## Schema Versions 2 And 3
+
+New games and events use `schemaVersion: 3`. Version 2 and 3 keep bank and harbor trades immediate, but player-to-player trades are staged:
 
 - `TRADE_OFFERED` opens a trade with `status: "COLLECTING_RESPONSES"` and a `responses` entry for every eligible recipient.
 - Recipients answer with `RESPOND_TRADE`, which emits `TRADE_RESPONSE_RECORDED`.
@@ -28,7 +42,7 @@ New games and events use `schemaVersion: 2`. Version 2 keeps bank and harbor tra
 - If every eligible recipient rejects, the trade closes with `TRADE_CLOSED` reason `ALL_REJECTED`.
 - If the staged response window expires, the trade closes with `TRADE_CLOSED` reason `RESPONSE_TIMEOUT`.
 
-The response window is 15 seconds in the server/UI layer. Wall-clock deadlines are not part of the deterministic replay state; snapshots may include viewer-only `tradeResponseDeadlines` metadata so clients can render countdowns.
+The response window is 15 seconds in the server/UI layer. Wall-clock deadlines are not part of the deterministic replay state. Active room payloads may include viewer-safe deadline metadata so clients can render countdowns; replay reconstruction is based on accepted events.
 
 ## Version 1 Import
 

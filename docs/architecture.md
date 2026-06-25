@@ -69,7 +69,12 @@ flowchart TB
 
   subgraph ui["UI components"]
     lobbyScreen["Lobby screen"]
-    gameUi["Game UI"]
+    boardUi["Board HUD and overlays"]
+    actionDock["Action dock"]
+    handRack["HandRack"]
+    playerStats["PlayerStatsList"]
+    sidebar["Sidebar info panels"]
+    postGame["PostGame overlay"]
     options["Match options"]
   end
 
@@ -92,7 +97,12 @@ flowchart TB
   end
 
   app --> lobbyScreen
-  app --> gameUi
+  app --> boardUi
+  app --> actionDock
+  app --> handRack
+  app --> playerStats
+  app --> sidebar
+  app --> postGame
   app --> options
   app --> client
   app --> socket
@@ -102,7 +112,12 @@ flowchart TB
   client --> protocol
   socket --> protocol
   lobbyScreen --> protocol
-  gameUi --> core
+  boardUi --> core
+  actionDock --> core
+  handRack --> core
+  playerStats --> core
+  sidebar --> core
+  postGame --> core
   replayUi --> core
   localAutomation --> bots
   localAutomation --> core
@@ -308,6 +323,7 @@ sequenceDiagram
   Core-->>Manager: accepted GameEvent list and next GameState
   Manager->>Store: appendEvents and persistCommandResult
   Store->>DB: insert match_events and command_results
+  Store->>DB: save match_snapshot every 25 events and game over
   Manager->>Core: serializeEventsForViewer and serializeForViewer
   Socket-->>Client: viewer-safe EVENTS and snapshot
 
@@ -358,8 +374,10 @@ flowchart TB
   events["Ordered GameEvent log"]
   commandResults["command_results<br/>idempotency"]
   roomRows["rooms<br/>code, seats, timers"]
-  snapshots["viewer snapshots"]
-  replay["game-core replay(config, board, events)"]
+  snapshots["server snapshots<br/>full GameState"]
+  validator["validateReplayLog"]
+  tail["tail events<br/>seq greater than snapshot"]
+  replay["game-core replay"]
   viewer["viewer-safe serialization"]
   replayUi["React replay UI"]
   hydrate["RoomManager hydrateFromStore"]
@@ -370,14 +388,15 @@ flowchart TB
   accepted --> reducer --> events --> postgres
   accepted --> commandResults --> postgres
   activeRooms --> roomRows --> postgres
-  events --> snapshots
-  postgres --> replay --> viewer --> replayUi
-  postgres --> hydrate --> activeRooms
+  events --> snapshots --> postgres
+  postgres --> validator --> replay --> viewer --> replayUi
+  postgres --> snapshots --> tail --> validator
+  validator --> hydrate --> activeRooms
   postgres --> leases --> activeRooms
   events --> activeRooms
 ```
 
-PostgreSQL is durable match truth when `DATABASE_URL` is configured. The server runs migrations on startup, hydrates recent sessions and rooms, preserves public room codes, lobby seats, trade deadlines, and active turn timers, and reconstructs game state from persisted config, board, and events. Snapshots and active room state are conveniences; ordered events remain the replay source of truth.
+PostgreSQL is durable match truth when `DATABASE_URL` is configured. The server runs migrations on startup, hydrates recent sessions and rooms, preserves public room codes, lobby seats, trade deadlines, and active turn timers, validates stored replay rows, and reconstructs game state from persisted config, board, snapshots, and tail events. Full snapshots are server-only acceleration data; viewer APIs continue to receive redacted state and events.
 
 ## Persistence Model
 
