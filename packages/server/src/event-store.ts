@@ -28,6 +28,7 @@ import {
 } from "@colonizt/db";
 import type { ChatMessage, Report, Room, Session } from "./room-manager.js";
 import { hashSessionToken } from "./security.js";
+import { validateStoredCommandResult, validateStoredRoomRecord } from "./store-validation.js";
 
 const snapshotIntervalEvents = 25;
 const shouldSnapshot = (state: GameState, events: readonly GameEvent[] = []): boolean =>
@@ -201,13 +202,13 @@ export class MemoryEventStore implements EventStore {
       .filter((room) => !room.archivedAt && room.status !== "EXPIRED" && room.status !== "ABANDONED")
       .slice(-limit)
       .reverse()
-      .map((room) => this.storedRecordFromRoom(room));
+      .map((room) => validateStoredRoomRecord(this.storedRecordFromRoom(room)));
   }
 
   async loadRoomByRef(roomRef: string): Promise<StoredRoomRecord | undefined> {
     const normalizedRef = roomRef.trim().toUpperCase();
     const room = [...this.rooms.values()].find((candidate) => candidate.id === roomRef || candidate.code === normalizedRef);
-    return room ? this.storedRecordFromRoom(room) : undefined;
+    return room ? validateStoredRoomRecord(this.storedRecordFromRoom(room)) : undefined;
   }
 
   async roomCodeExists(code: string): Promise<boolean> {
@@ -259,7 +260,8 @@ export class MemoryEventStore implements EventStore {
   }
 
   async loadCommandResult(roomId: string, userId: string, clientSeq: number): Promise<StoredCommandResult | undefined> {
-    return this.commandResults.get(`${roomId}:${userId}:${clientSeq}`);
+    const result = this.commandResults.get(`${roomId}:${userId}:${clientSeq}`);
+    return result ? validateStoredCommandResult(result) : undefined;
   }
 
   async commitEvents(room: Room, events: GameEvent[], result?: StoredCommandResult): Promise<void> {
@@ -499,7 +501,7 @@ export class PostgresEventStore implements EventStore {
         if (record.match.endedAt) stored.match.endedAt = record.match.endedAt;
         if (record.match.winnerUserId) stored.match.winnerUserId = record.match.winnerUserId;
       }
-      return stored;
+      return validateStoredRoomRecord(stored);
     });
   }
 
@@ -538,7 +540,7 @@ export class PostgresEventStore implements EventStore {
       if (record.match.endedAt) stored.match.endedAt = record.match.endedAt;
       if (record.match.winnerUserId) stored.match.winnerUserId = record.match.winnerUserId;
     }
-    return stored;
+    return validateStoredRoomRecord(stored);
   }
 
   async roomCodeExists(code: string): Promise<boolean> {
@@ -574,7 +576,7 @@ export class PostgresEventStore implements EventStore {
   async loadCommandResult(roomId: string, userId: string, clientSeq: number): Promise<StoredCommandResult | undefined> {
     const result: PersistedCommandResultRecord | undefined = await findCommandResult(this.pool, roomId, userId, clientSeq);
     if (!result) return undefined;
-    return {
+    return validateStoredCommandResult({
       roomId: result.roomId,
       userId: result.userId,
       clientSeq: result.clientSeq,
@@ -586,6 +588,6 @@ export class PostgresEventStore implements EventStore {
       ...(result.events ? { events: result.events as GameEvent[] } : {}),
       ...(result.rejectionCode ? { rejectionCode: result.rejectionCode } : {}),
       ...(result.rejectionMessage ? { rejectionMessage: result.rejectionMessage } : {}),
-    };
+    });
   }
 }

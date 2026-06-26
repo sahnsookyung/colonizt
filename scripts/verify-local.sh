@@ -10,8 +10,11 @@ npm run test:property
 npm run test:integration
 npm run simulate:bots:gate
 npm run smoke:network
+npm run load:sockets
 npm run simulate:ranked
 npm run simulate:rush
 npm --workspace @colonizt/web run test
 npm run replay:fixtures
 npm run build
+npm run test:e2e -- --project=chromium
+npm run test:e2e -- --project=mobile

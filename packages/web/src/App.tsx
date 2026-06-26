@@ -3,7 +3,6 @@ import {
   applyCommand,
   applyEvents,
   canBuildRoad,
-  classicDevelopmentDeck,
   emptyResources,
   eligibleStealTargets,
   getLegalActions,
@@ -12,7 +11,6 @@ import {
   maritimeTradeRatio,
   resourceCount,
   roadCost,
-  schemaVersion,
   serializeForViewer,
   settlementCost,
   specialCardCost,
@@ -76,6 +74,7 @@ import { replayAtIndex, type ReplayLogState } from "./replay-state.js";
 import { clearResumeState, readResumeState, writeResumeState } from "./resume.js";
 import { playSound, playSoundForEvents } from "./sounds.js";
 import { normalizeTradeDraft, type TradeDraft } from "./trade-draft.js";
+import { applyEventsToViewerProjection, projectViewerToGameState } from "./viewer-projection.js";
 
 const diceAnimationMs = 820;
 const rollDeadlineMs = 60_000;
@@ -180,120 +179,6 @@ const issueCommand = (state: GameState, command: GameCommand): { state: GameStat
   const result = applyCommand(state, command);
   if (!result.ok) return { state, events: [], error: result.error.message };
   return { state: result.value.nextState, events: result.value.events };
-};
-
-const viewerToGameState = (viewer: ViewerState, seed: string, configOverrides: Partial<Pick<GameConfig, "botDifficulty" | "rules">> = {}): GameState => {
-  const deckRemaining = Math.max(0, Math.min(classicDevelopmentDeck.length, viewer.developmentDeckRemaining ?? classicDevelopmentDeck.length));
-  const state: GameState = {
-    schemaVersion,
-    config: {
-      matchId: `client-${seed}`,
-      seed,
-      victoryPoints: viewer.config.victoryPoints,
-      maxPlayers: viewer.config.maxPlayers,
-      turnSeconds: viewer.config.turnSeconds,
-      playerOrder: viewer.config.playerOrder,
-      playerNames: viewer.config.playerNames,
-      playerColors: viewer.config.playerColors,
-      botDifficulty: configOverrides.botDifficulty ?? viewer.config.botDifficulty ?? defaultMatchOptions.botDifficulty,
-      rules: {
-        ...defaultMatchOptions.rules,
-        ...viewer.config.rules,
-        ...configOverrides.rules,
-      },
-    },
-    board: viewer.board,
-    players: Object.fromEntries(viewer.players.map((player) => [
-      player.id,
-      {
-        id: player.id,
-        name: player.name,
-        color: player.color,
-        score: player.publicVictoryPoints ?? player.score,
-        resources: player.resources ?? emptyResources(),
-        specialCards: player.specialCards,
-        developmentCards: player.developmentCards ?? [],
-        longestRoadLength: player.longestRoadLength,
-        hasLongestRoad: player.hasLongestRoad,
-        playedKnights: player.playedKnights,
-        hasLargestArmy: player.hasLargestArmy,
-        ...(player.playedDevelopmentCardTurn !== undefined ? { playedDevelopmentCardTurn: player.playedDevelopmentCardTurn } : {}),
-      },
-    ])),
-    playerOrder: viewer.playerOrder,
-    resourceBank: viewer.resourceBank,
-    phase: viewer.phase,
-    turn: viewer.turn,
-    roads: viewer.roads,
-    settlements: viewer.settlements,
-    buildings: viewer.buildings,
-    developmentDeck: [...classicDevelopmentDeck],
-    developmentDeckCursor: classicDevelopmentDeck.length - deckRemaining,
-    playedKnightCounts: Object.fromEntries(viewer.players.map((player) => [player.id, player.playedKnights])),
-    trades: Object.fromEntries(viewer.trades.map((trade) => [trade.id, trade])),
-    eventSeq: viewer.eventSeq,
-    rng: { seed, index: 0, policy: "SEEDED_DETERMINISTIC" },
-  };
-  if (viewer.lastRoll) state.lastRoll = viewer.lastRoll;
-  if (viewer.longestRoadOwner) state.longestRoadOwner = viewer.longestRoadOwner;
-  if (viewer.largestArmyOwner) state.largestArmyOwner = viewer.largestArmyOwner;
-  if (viewer.thiefHexId) state.thiefHexId = viewer.thiefHexId;
-  return state;
-};
-
-const updateHiddenResourceCount = (count: number, event: GameEvent, playerId: PlayerId): number => {
-  switch (event.type) {
-    case "ROAD_BUILT":
-      return event.playerId === playerId ? Math.max(0, count - resourceCount(event.cost)) : count;
-    case "SETTLEMENT_BUILT":
-      return event.playerId === playerId ? Math.max(0, count - resourceCount(event.cost)) : count;
-    case "CITY_UPGRADED":
-      return event.playerId === playerId ? Math.max(0, count - resourceCount(event.cost)) : count;
-    case "SPECIAL_CARD_BOUGHT":
-      return event.playerId === playerId ? Math.max(0, count - resourceCount(event.cost)) : count;
-    case "RESOURCES_DISCARDED":
-      return event.playerId === playerId ? Math.max(0, count - resourceCount(event.resources)) : count;
-    case "THIEF_MOVED":
-      if (!event.stolenResource) return count;
-      if (event.playerId === playerId) return count + 1;
-      if (event.stealFromPlayerId === playerId) return Math.max(0, count - 1);
-      return count;
-    case "MONOPOLY_PLAYED":
-      if (event.playerId === playerId) return count + Object.values(event.collected).reduce((sum, value) => sum + value, 0);
-      return Math.max(0, count - (event.collected[playerId] ?? 0));
-    case "YEAR_OF_PLENTY_PLAYED":
-      return event.playerId === playerId ? count + 2 : count;
-    case "MARITIME_TRADED":
-      return event.playerId === playerId ? Math.max(0, count - event.ratio + 1) : count;
-    case "RESOURCES_PRODUCED":
-      return count + resourceCount({ ...emptyResources(), ...event.gains[playerId] });
-    case "TRADE_ACCEPTED":
-      if (event.fromPlayerId === playerId) return Math.max(0, count - resourceCount(event.offered) + resourceCount(event.requested));
-      if (event.toPlayerId === playerId) return Math.max(0, count + resourceCount(event.offered) - resourceCount(event.requested));
-      return count;
-    default:
-      return count;
-  }
-};
-
-const applyEventsToViewer = (
-  viewer: ViewerState,
-  events: readonly GameEvent[],
-  seed: string,
-  viewerId: PlayerId | "spectator",
-  configOverrides: Partial<Pick<GameConfig, "botDifficulty" | "rules">> = {},
-): ViewerState => {
-  const projected = serializeForViewer(applyEvents(viewerToGameState(viewer, seed, configOverrides), events), viewerId);
-  return {
-    ...projected,
-    resourceBank: viewer.resourceBank ?? projected.resourceBank,
-    players: projected.players.map((player) => {
-      if (player.resources) return player;
-      const previous = viewer.players.find((candidate) => candidate.id === player.id);
-      const resourceCount = events.reduce((count, event) => updateHiddenResourceCount(count, event, player.id), previous?.resourceCount ?? player.resourceCount);
-      return { ...player, resourceCount };
-    }),
-  };
 };
 
 const networkErrorMessage = (input: unknown): string => {
@@ -1477,7 +1362,7 @@ export const App = () => {
           lastServerSeqRef.current = Math.max(lastServerSeqRef.current, ...incomingEvents.map((event) => event.seq));
           setEvents((current) => [...current, ...incomingEvents]);
           if (!snapshot) {
-            setServerViewer((current) => current ? applyEventsToViewer(current, incomingEvents, canonicalRoomId, current.viewerId, currentConfigOptions()) : null);
+            setServerViewer((current) => current ? applyEventsToViewerProjection(current, incomingEvents, canonicalRoomId, current.viewerId, currentConfigOptions()) : null);
             setLiveState((current) => applyEvents(current, incomingEvents));
           }
           if (incomingEvents.some((event) => event.type === "GAME_OVER")) {
@@ -1485,7 +1370,7 @@ export const App = () => {
           }
         }
         if (snapshot) {
-          const projectedState = viewerToGameState(snapshot, canonicalRoomId, currentConfigOptions());
+          const projectedState = projectViewerToGameState(snapshot, canonicalRoomId, currentConfigOptions());
           setLiveState(projectedState);
           setServerViewer(snapshot);
           lastServerSeqRef.current = Math.max(lastServerSeqRef.current, snapshot.eventSeq);
@@ -1527,7 +1412,7 @@ export const App = () => {
           },
         };
         if (publicRoom.game) {
-          const projectedState = viewerToGameState(publicRoom.game, publicRoom.id, roomConfigOptions);
+          const projectedState = projectViewerToGameState(publicRoom.game, publicRoom.id, roomConfigOptions);
           setLiveState(projectedState);
           setServerViewer(publicRoom.game);
           lastServerSeqRef.current = Math.max(lastServerSeqRef.current, publicRoom.game.eventSeq, ...(publicRoom.events ?? []).map((event) => event.seq));

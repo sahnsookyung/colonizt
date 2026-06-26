@@ -87,6 +87,7 @@ flowchart TB
   subgraph local["local play"]
     localAutomation["Local automation"]
     replayUi["Replay projection"]
+    viewerProjection["viewer-projection.ts"]
   end
 
   subgraph sharedClient["shared domain"]
@@ -108,6 +109,7 @@ flowchart TB
   app --> socket
   app --> localAutomation
   app --> replayUi
+  app --> viewerProjection
 
   client --> protocol
   socket --> protocol
@@ -119,13 +121,14 @@ flowchart TB
   sidebar --> core
   postGame --> core
   replayUi --> core
+  viewerProjection --> core
   localAutomation --> bots
   localAutomation --> core
   demo --> core
   demo --> bots
 ```
 
-The web package owns screen state, local bot games, online lobby/gameplay, trade and special-card overlays, mobile HUD layout, post-game replay viewing, sounds, and analytics. It uses `protocol` for wire contracts and `game-core` for deterministic local projections; online rooms still treat the server as authoritative.
+The web package owns screen state, local bot games, online lobby/gameplay, trade and special-card overlays, mobile HUD layout, post-game replay viewing, sounds, and analytics. It uses `protocol` for wire contracts and `game-core` for deterministic local projections; online rooms still treat the server as authoritative. `viewer-projection.ts` is the only client boundary that converts a viewer-safe online payload into game-shaped UI state, so redacted opponent cards stay redacted even when incremental events arrive.
 
 ## Server Runtime Detail
 
@@ -140,6 +143,7 @@ flowchart TB
   subgraph authority["room authority"]
     manager["RoomManager"]
     lobby["lobby helpers"]
+    runtime["room-runtime helpers"]
     scheduler["Scheduler"]
     due["DueWorkIndex"]
     security["idempotency"]
@@ -153,6 +157,7 @@ flowchart TB
 
   subgraph stores["stores"]
     events["EventStore"]
+    storeValidation["store validation"]
     presence["PresenceStore"]
     leases["RoomOwnership"]
     metrics["observability"]
@@ -169,10 +174,12 @@ flowchart TB
   ws --> protocol
 
   manager --> lobby
+  manager --> runtime
   manager --> security
   manager --> core
   manager --> bots
   manager --> events
+  events --> storeValidation
   manager --> leases
   scheduler --> manager
   scheduler --> due
@@ -183,7 +190,7 @@ flowchart TB
   presence -. optional .-> redis
 ```
 
-`RoomManager` owns online room authority: seats, host actions, spectators, chat, reports, accepted commands, timers, persistence, and viewer-safe broadcasts. `RoomAutomationScheduler` drives due bot actions, trade deadlines, turn expiry, and cleanup callbacks without scanning every room blindly.
+`RoomManager` owns online room authority: seats, host actions, spectators, chat, reports, accepted commands, timers, persistence, and viewer-safe broadcasts. Shared room lifecycle/counting/timer derivation lives in `room-runtime.ts` so scheduler, metrics, and admin room-health reports use the same semantics. `RoomAutomationScheduler` drives due bot actions, trade deadlines, turn expiry, and cleanup callbacks without scanning every room blindly.
 
 ## Package Dependencies
 
@@ -375,7 +382,7 @@ flowchart TB
   commandResults["command_results<br/>idempotency"]
   roomRows["rooms<br/>code, seats, timers"]
   snapshots["server snapshots<br/>full GameState"]
-  validator["validateReplayLog"]
+  validator["validateReplayLog<br/>and store-validation"]
   tail["tail events<br/>seq greater than snapshot"]
   replay["game-core replay"]
   viewer["viewer-safe serialization"]
@@ -396,7 +403,7 @@ flowchart TB
   events --> activeRooms
 ```
 
-PostgreSQL is durable match truth when `DATABASE_URL` is configured. The server runs migrations on startup, hydrates recent sessions and rooms, preserves public room codes, lobby seats, trade deadlines, and active turn timers, validates stored replay rows, and reconstructs game state from persisted config, board, snapshots, and tail events. Full snapshots are server-only acceleration data; viewer APIs continue to receive redacted state and events.
+PostgreSQL is durable match truth when `DATABASE_URL` is configured. The server runs migrations on startup, hydrates recent sessions and rooms, preserves public room codes, lobby seats, trade deadlines, and active turn timers, validates stored room and command-result payloads before hydration, validates stored replay rows, and reconstructs game state from persisted config, board, snapshots, and tail events. Full snapshots are server-only acceleration data; viewer APIs continue to receive redacted state and events.
 
 ## Persistence Model
 
@@ -457,12 +464,14 @@ Local production-style compose starts PostgreSQL, the Fastify server, and the st
 - The browser can run a complete local bot game because `packages/web` imports `game-core`, `bots`, and `demo-state`; network rooms still use the server as the authority.
 - The server accepts player intent as commands and broadcasts only accepted, viewer-safe events and snapshots.
 - `packages/protocol` owns shared wire contracts and lobby readiness math. Server and web should not duplicate startability rules.
-- `RoomManager` owns authoritative room state: seats, host actions, spectators, pause/resume, chat, reports, command idempotency, automation progress, and persistence decisions.
+- `RoomManager` owns authoritative room state: seats, host actions, spectators, pause/resume, chat, reports, command idempotency, automation progress, and persistence decisions. `room-runtime.ts` owns shared room liveness, connected-user counts, and timer keys.
 - `lobby.ts` owns lobby settings transforms and startability; public online rooms remain bounded to 2-4 seats.
 - `RoomAutomationScheduler` owns recurring work: turn expiry, staged trade deadlines, due bot actions, and room cleanup callbacks.
 - `DueWorkIndex` keeps scheduler work scoped to due rooms rather than scanning every room blindly.
 - `observability.ts` owns structured logs, metrics counters, admin-gated metrics/leaderboard support, and the enforced single-node instance-mode guard.
+- `/admin/rooms/health` is admin-gated and reports room lifecycle, event progress, timers, connected-user counts, bots, spectators, and cleanup deadlines without exposing hands or hidden card data.
 - `PresenceStore` tracks sockets and room membership only. The memory adapter is default; the Redis adapter is optional and ephemeral.
 - `RoomOwnershipStore` guards active-room ownership. Memory is used for local/no-database runs; PostgreSQL leases are used when `DATABASE_URL` is configured.
+- `EventStore` adapters validate stored rooms, command results, snapshots, and replay logs before returning hydrated runtime records.
 - `packages/db` knows PostgreSQL tables but does not know Fastify, WebSocket sockets, React, or game rules.
 - `packages/test-utils` re-exports bots and demo state so tests and scripts can build deterministic scenarios without depending on the UI or server internals.

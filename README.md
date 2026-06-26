@@ -164,6 +164,7 @@ npm run test:unit
 npm run test:property
 npm run test:integration
 npm --workspace @colonizt/web run test
+npm run simulate:bots:gate
 npm run smoke:network
 ```
 
@@ -172,7 +173,9 @@ Before deploy, also run:
 ```bash
 npm run build
 npm run test:e2e -- --project=chromium
+npm run test:e2e -- --project=mobile
 npm run replay:fixtures
+npm run load:sockets
 ```
 
 Post-deploy smoke checks:

@@ -388,6 +388,16 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     return reply.header("content-type", "text/plain; version=0.0.4; charset=utf-8").send(metrics.render(manager, clients.size, presence.kind));
   });
 
+  app.get("/admin/rooms/health", async (request, reply) => {
+    if (!requireAdminToken(request, reply)) return;
+    return {
+      nodeId,
+      instanceMode,
+      generatedAt: new Date().toISOString(),
+      rooms: manager.roomHealthReport(),
+    };
+  });
+
   app.get("/config", async (request) => {
     const apiBaseUrl = externalBaseUrl(request, options.publicApiBaseUrl ?? process.env.PUBLIC_API_URL);
     const wsBaseUrl = (options.publicWsBaseUrl ?? process.env.PUBLIC_WS_URL ?? apiBaseUrl.replace(/^http/i, "ws")).replace(/\/$/, "");

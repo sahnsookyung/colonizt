@@ -30,6 +30,7 @@ import { MemoryEventStore, type EventStore, type StoredCommandResult, type Store
 import { applyLobbySettings, canStartLobby, publicSeatsForRoom, startableSeatsForRoom, type LobbySettingsUpdate } from "./lobby.js";
 import type { RoomOwnershipStore } from "./ownership.js";
 import { hydrateGameFromStoredMatch } from "./replay-hydration.js";
+import { connectedSeatedHumanCount, connectedUserCount, isActiveRoom, livenessStateForRoom, roomTimerKey } from "./room-runtime.js";
 import { hashCommandPayload } from "./security.js";
 
 const tradeResponseWindowMs = 15_000;
@@ -139,6 +140,30 @@ export interface Room {
 }
 
 export type RoomLivenessState = "ACTIVE" | "IDLE_LOBBY" | "PAUSED_EMPTY" | "STALLED" | "FINISHED_UNLOADED" | "CLOSED";
+
+export interface RoomHealthEntry {
+  roomId: string;
+  code: string;
+  status: RoomStatus;
+  liveness: RoomLivenessState;
+  hostUserId: PlayerId;
+  createdAt: string;
+  lastActivityAt?: string;
+  pausedAt?: string;
+  pauseReason?: RoomPauseReason;
+  cleanupReason?: string;
+  connectedHumans: number;
+  connectedUsers: number;
+  botCount: number;
+  spectatorCount: number;
+  eventSeq?: number;
+  turn?: number;
+  phase?: string;
+  activePlayerId?: PlayerId;
+  timer?: Room["timer"];
+  tradeDeadlineCount: number;
+  cleanupDueAt?: string;
+}
 
 type AutomationProgress = { key: string; repeats: number; seenAt: number };
 
@@ -291,7 +316,7 @@ export class RoomManager {
   }
 
   listRooms() {
-    return [...this.rooms.values()].filter((room) => this.isActiveRoom(room)).map((room) => this.publicRoomSummary(room));
+    return [...this.rooms.values()].filter((room) => isActiveRoom(room)).map((room) => this.publicRoomSummary(room));
   }
 
   publicRoomSummary(room: Room) {
@@ -624,7 +649,7 @@ export class RoomManager {
       if (nextHost) room.hostUserId = nextHost;
     }
 
-    if (this.connectedSeatedHumanCount(room) === 0) {
+    if (connectedSeatedHumanCount(room) === 0) {
       const nowIso = new Date(now).toISOString();
       if (room.status === "IN_GAME" && !room.pausedAt) {
         room.pausedAt = nowIso;
@@ -673,7 +698,7 @@ export class RoomManager {
         changed = true;
       }
     }
-    if (this.connectedSeatedHumanCount(room) === 0) {
+    if (connectedSeatedHumanCount(room) === 0) {
       if (room.status === "IN_GAME" && !room.pausedAt) {
         room.pausedAt = new Date(now).toISOString();
         room.pauseReason = "EMPTY_ROOM";
@@ -706,8 +731,8 @@ export class RoomManager {
       if (room.archivedAt) continue;
       if (!await this.claimRoom(room)) continue;
       const nowIso = new Date(now).toISOString();
-      const connectedSeatedHumans = this.connectedSeatedHumanCount(room);
-      const connectedUsers = this.connectedUserCount(room);
+      const connectedSeatedHumans = connectedSeatedHumanCount(room);
+      const connectedUsers = connectedUserCount(room);
       let changed = false;
 
       if (room.status === "LOBBY") {
@@ -782,16 +807,11 @@ export class RoomManager {
   }
 
   activeRoomCount(): number {
-    return [...this.rooms.values()].filter((room) => this.isActiveRoom(room)).length;
+    return [...this.rooms.values()].filter((room) => isActiveRoom(room)).length;
   }
 
   livenessState(room: Room): RoomLivenessState {
-    if (room.archivedAt && room.cleanupReason === "FINISHED_UNLOADED") return "FINISHED_UNLOADED";
-    if (room.archivedAt || room.status === "EXPIRED" || room.status === "ABANDONED") return "CLOSED";
-    if (room.pauseReason === "STALLED_AUTOMATION") return "STALLED";
-    if (room.pausedAt) return "PAUSED_EMPTY";
-    if (room.status === "LOBBY" && this.connectedSeatedHumanCount(room) === 0) return "IDLE_LOBBY";
-    return "ACTIVE";
+    return livenessStateForRoom(room);
   }
 
   livenessCounts(): Record<RoomLivenessState, number> {
@@ -813,6 +833,40 @@ export class RoomManager {
       if (room.pauseReason) counts[room.pauseReason] += 1;
     }
     return counts;
+  }
+
+  roomHealthReport(now = Date.now()): RoomHealthEntry[] {
+    return [...this.rooms.values()]
+      .filter((room) => isActiveRoom(room))
+      .map((room) => {
+        const cleanupDueAt = this.cleanupDueAt(room, now);
+        const entry: RoomHealthEntry = {
+          roomId: room.id,
+          code: room.code,
+          status: room.status,
+          liveness: this.livenessState(room),
+          hostUserId: room.hostUserId,
+          createdAt: room.createdAt,
+          connectedHumans: connectedSeatedHumanCount(room),
+          connectedUsers: connectedUserCount(room),
+          botCount: room.seats.filter((seat) => Boolean(seat.botId)).length,
+          spectatorCount: room.spectators.size,
+          tradeDeadlineCount: room.tradeResponseDeadlines.size,
+        };
+        if (room.lastActivityAt) entry.lastActivityAt = room.lastActivityAt;
+        if (room.pausedAt) entry.pausedAt = room.pausedAt;
+        if (room.pauseReason) entry.pauseReason = room.pauseReason;
+        if (room.cleanupReason) entry.cleanupReason = room.cleanupReason;
+        if (room.timer) entry.timer = room.timer;
+        if (Number.isFinite(cleanupDueAt)) entry.cleanupDueAt = new Date(cleanupDueAt).toISOString();
+        if (room.game) {
+          entry.eventSeq = room.game.eventSeq;
+          entry.turn = room.game.turn;
+          entry.phase = room.game.phase.type;
+          if ("activePlayerId" in room.game.phase) entry.activePlayerId = room.game.phase.activePlayerId;
+        }
+        return entry;
+      });
   }
 
   dueAutomationRoomIds(now = Date.now()): string[] {
@@ -1209,8 +1263,8 @@ export class RoomManager {
       delete room.timer;
       return;
     }
-    const nextKey = this.timerKey(room.game);
-    const previousKey = this.timerKey(previousState);
+    const nextKey = roomTimerKey(room.game);
+    const previousKey = roomTimerKey(previousState);
     if (room.timer && nextKey && nextKey === previousKey && room.timer.activePlayerId === room.game.phase.activePlayerId) {
       return;
     }
@@ -1224,11 +1278,6 @@ export class RoomManager {
     const room = this.rooms.get(roomId);
     if (room) this.updateRoomDueWork(room, now);
     else this.removeRoomDueWork(roomId);
-  }
-
-  private timerKey(state?: GameState): string | undefined {
-    if (!state || !("activePlayerId" in state.phase)) return undefined;
-    return `${state.config.matchId}:${state.turn}:${state.phase.type}:${state.phase.activePlayerId}`;
   }
 
   private createUniqueRoomCodeSync(): string {
@@ -1273,12 +1322,8 @@ export class RoomManager {
     await this.ownershipStore?.release(roomId, this.ownerId);
   }
 
-  private isActiveRoom(room: Room): boolean {
-    return !room.archivedAt && room.status !== "EXPIRED" && room.status !== "ABANDONED";
-  }
-
   private updateRoomDueWork(room: Room, now = Date.now()): void {
-    if (!this.isActiveRoom(room)) {
+    if (!isActiveRoom(room)) {
       this.removeRoomDueWork(room.id);
       return;
     }
@@ -1316,43 +1361,30 @@ export class RoomManager {
   }
 
   private cleanupDueAt(room: Room, now = Date.now()): number {
-    if (!this.isActiveRoom(room)) return Number.POSITIVE_INFINITY;
-    const connectedSeatedHumans = this.connectedSeatedHumanCount(room);
+    if (!isActiveRoom(room)) return Number.POSITIVE_INFINITY;
+    const connectedSeatedHumans = connectedSeatedHumanCount(room);
     if (room.status === "LOBBY" && connectedSeatedHumans === 0) {
       return room.emptySince ? Date.parse(room.emptySince) + this.cleanupPolicy.emptyLobbyTtlMs : now;
     }
     if (room.status === "IN_GAME" && connectedSeatedHumans === 0) {
       return room.emptySince ? Date.parse(room.emptySince) + this.cleanupPolicy.emptyGameTtlMs : now;
     }
-    if (room.status === "FINISHED" && this.connectedUserCount(room) === 0) {
+    if (room.status === "FINISHED" && connectedUserCount(room) === 0) {
       return room.emptySince ? Date.parse(room.emptySince) + this.cleanupPolicy.finishedRoomUnloadMs : now;
     }
     return Number.POSITIVE_INFINITY;
   }
 
-  private connectedSeatedHumanCount(room: Room): number {
-    return room.seats.filter((seat) => seat.userId && seat.connected).length;
-  }
-
-  private connectedUserCount(room: Room): number {
-    const connectedIds = new Set<PlayerId>();
-    for (const seat of room.seats) {
-      if (seat.userId && seat.connected) connectedIds.add(seat.userId);
-    }
-    for (const spectatorId of room.spectators) connectedIds.add(spectatorId);
-    return connectedIds.size;
-  }
-
   private resumeRoomIfNeeded(room: Room, now = Date.now()): boolean {
     if (room.pauseReason === "STALLED_AUTOMATION") return false;
     if (!room.pausedAt) {
-      if (room.emptySince && this.connectedSeatedHumanCount(room) > 0) {
+      if (room.emptySince && connectedSeatedHumanCount(room) > 0) {
         delete room.emptySince;
         return true;
       }
       return false;
     }
-    if (this.connectedSeatedHumanCount(room) === 0) return false;
+    if (connectedSeatedHumanCount(room) === 0) return false;
     const pausedDuration = Math.max(0, now - Date.parse(room.pausedAt));
     if (room.timer) room.timer.expiresAt += pausedDuration;
     for (const [tradeId, deadline] of room.tradeResponseDeadlines.entries()) {

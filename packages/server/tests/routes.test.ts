@@ -107,6 +107,8 @@ describe("REST routes", () => {
     const authorizedMetrics = await app.inject({ method: "GET", url: "/metrics", headers: { "x-admin-token": "secret-admin" } });
     const publicLeaderboard = await app.inject({ method: "GET", url: "/leaderboard" });
     const authorizedLeaderboard = await app.inject({ method: "GET", url: "/leaderboard", headers: { authorization: "Bearer secret-admin" } });
+    const publicHealth = await app.inject({ method: "GET", url: "/admin/rooms/health" });
+    const authorizedHealth = await app.inject({ method: "GET", url: "/admin/rooms/health", headers: { "x-admin-token": "secret-admin" } });
     await app.close();
 
     expect(publicMetrics.statusCode).toBe(403);
@@ -115,6 +117,32 @@ describe("REST routes", () => {
     expect(publicLeaderboard.statusCode).toBe(403);
     expect(authorizedLeaderboard.statusCode).toBe(200);
     expect(authorizedLeaderboard.json()).toMatchObject({ rankedPublicQueue: "deferred" });
+    expect(publicHealth.statusCode).toBe(403);
+    expect(authorizedHealth.statusCode).toBe(200);
+    expect(authorizedHealth.json()).toMatchObject({ nodeId: "local", instanceMode: "single", rooms: [] });
+  });
+
+  it("serves admin room health without exposing hidden game state", async () => {
+    const manager = new RoomManager();
+    const session = await manager.createSession("Host");
+    const room = await manager.createRoom(session, { mode: "CLASSIC", botFill: true, ranked: false });
+    await manager.setReady(room.id, session, true);
+    const app = await buildServer({ manager, adminToken: "secret-admin" });
+
+    const response = await app.inject({ method: "GET", url: "/admin/rooms/health", headers: { authorization: "Bearer secret-admin" } });
+    await app.close();
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.rooms[0]).toMatchObject({
+      roomId: room.id,
+      code: room.code,
+      connectedHumans: 1,
+      botCount: 3,
+      tradeDeadlineCount: 0,
+    });
+    expect(JSON.stringify(body)).not.toContain("resources");
+    expect(JSON.stringify(body)).not.toContain("developmentCards");
   });
 
   it("only records request DB failures for database-shaped errors", async () => {

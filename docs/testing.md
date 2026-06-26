@@ -16,13 +16,13 @@
 - `npm run smoke:cross-network` runs the deployed network and browser smokes. This is a release gate only when executed from two independent network egresses, such as separate CI runners or one local machine plus a remote runner. Two local browser contexts are a regression aid, not proof of cross-network connectivity.
 - `REDIS_URL=redis://127.0.0.1:6389 npm run smoke:network` exercises the Redis-backed ephemeral presence adapter.
 - `npm run smoke:local` runs migrations when `DATABASE_URL` is set, creates a bot-filled match, submits a command, starts a fresh manager, hydrates persisted rooms, and reconstructs replay from stored events.
-- `npm run docs:diagrams` validates Mermaid syntax and readability in `docs/architecture.md` and `README.md`, and is part of `npm run verify:local`.
+- `npm run docs:diagrams` validates Mermaid syntax and readability in `docs/architecture.md` and `README.md`, and runs in CI plus `npm run verify:local`.
 - `npm run simulate:ranked` verifies queue grouping, abandonment, match quality, and duplicate-ticket prevention.
 - `npm run simulate:rush` verifies first-valid-wins conflict resolution for simultaneous commands.
 
 ## Multiplayer Release Gates
 
-- PR gate: `npm run docs:diagrams`, `npm run lint`, `npm run typecheck`, `npm run test:unit`, `npm run test:property`, `npm run test:integration`, `npm run simulate:bots:gate`, `npm --workspace @colonizt/web run test`, and `npm run smoke:network`.
-- Pre-deploy gate: `npm run build`, `npm run test:e2e -- --project=chromium`, replay fixtures, and migration smoke.
+- PR gate: `npm run docs:diagrams`, `npm run lint`, `npm run typecheck`, `npm run test:unit`, `npm run test:property`, `npm run test:integration`, `npm run simulate:bots:gate`, `npm --workspace @colonizt/web run test`, `npm run smoke:network`, and desktop/mobile Playwright in CI.
+- Pre-deploy gate: `npm run build`, `npm run test:e2e -- --project=chromium`, `npm run test:e2e -- --project=mobile`, replay fixtures, `npm run load:sockets`, and migration smoke.
 - Post-deploy gate: `npm run smoke:deployed-network` and `npm run smoke:deployed-browser` with production public URLs.
-- Nightly/release gate: run `npm run smoke:cross-network` from distinct network egresses and record the logs. A pass requires connected human clients to observe the same canonical event sequence after host-start and reconnect.
+- Nightly/release gate: run `npm run smoke:cross-network`, `npm run simulate:bots:default-lineup`, and `npm run simulate:bots:difficulty` from distinct network egresses where applicable and record the logs. A pass requires connected human clients to observe the same canonical event sequence after host-start and reconnect.

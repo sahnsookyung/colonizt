@@ -43,6 +43,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run scan:branding
+      - run: npm run docs:diagrams
       - run: npm run lint
       - run: npm run typecheck
       - run: npm run test:unit
@@ -56,6 +57,7 @@ jobs:
       - run: npm run build
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e -- --project=chromium
+      - run: npm run test:e2e -- --project=mobile
       - run: npm --workspace @colonizt/db run migrate
       - run: npm run smoke:local
       - run: npm run smoke:network
