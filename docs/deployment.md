@@ -53,6 +53,8 @@ The preferred production path is GitHub Actions:
 
 The workflow runs automatically when the CD image-build workflow succeeds on the current `main` SHA. It can also be run manually from GitHub Actions with an optional full 40-character SHA for a deliberate rollback or redeploy. Production deploys use the GitHub `production` environment and the `colonizt-production` concurrency group, so only one promotion can run at a time.
 
+GitHub-hosted runners verify the production hostname against the OCI origin during deploy and route deployed smoke traffic directly to that origin. This keeps CI/CD deterministic when the public edge blocks runner IPs; validate the public edge separately from a normal client network after the workflow succeeds.
+
 Configure these GitHub environment secrets on `production`:
 
 | Secret | Purpose |

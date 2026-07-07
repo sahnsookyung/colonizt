@@ -41,21 +41,19 @@ restore_caddy_config() {
   remote "sudo docker exec jobscout-cloud-caddy caddy reload --config /etc/caddy/Caddyfile" || true
 }
 
-verify_public_endpoints_once() {
+verify_origin_endpoints_once() {
   curl -fsS --resolve "jobscout.sookyungahn.com:443:${SERVER_IP}" "https://jobscout.sookyungahn.com/" >/dev/null
   curl -kfsS --resolve "colonizt.sookyungahn.com:443:${SERVER_IP}" "https://colonizt.sookyungahn.com/health" | node -e "let data=''; process.stdin.on('data', c => data += c); process.stdin.on('end', () => { const json = JSON.parse(data); if (!json.ok || json.presence !== 'memory') process.exit(1); console.log(JSON.stringify({ origin: true, ...json })); });"
   curl -kfsS --resolve "colonizt.sookyungahn.com:443:${SERVER_IP}" "https://colonizt.sookyungahn.com/config" | node -e "let data=''; process.stdin.on('data', c => data += c); process.stdin.on('end', () => { const json = JSON.parse(data); if (json.apiBaseUrl !== 'https://colonizt.sookyungahn.com' || json.wsBaseUrl !== 'wss://colonizt.sookyungahn.com') process.exit(1); console.log(JSON.stringify({ origin: true, apiBaseUrl: json.apiBaseUrl, wsBaseUrl: json.wsBaseUrl })); });"
-  curl -fsS "https://colonizt.sookyungahn.com/health" | node -e "let data=''; process.stdin.on('data', c => data += c); process.stdin.on('end', () => { const json = JSON.parse(data); if (!json.ok || json.presence !== 'memory') process.exit(1); console.log(JSON.stringify({ public: true, ...json })); });"
-  curl -fsS "https://colonizt.sookyungahn.com/config" | node -e "let data=''; process.stdin.on('data', c => data += c); process.stdin.on('end', () => { const json = JSON.parse(data); if (json.apiBaseUrl !== 'https://colonizt.sookyungahn.com' || json.wsBaseUrl !== 'wss://colonizt.sookyungahn.com') process.exit(1); console.log(JSON.stringify({ public: true, apiBaseUrl: json.apiBaseUrl, wsBaseUrl: json.wsBaseUrl })); });"
 }
 
-verify_public_endpoints() {
+verify_origin_endpoints() {
   local attempt
   for attempt in {1..12}; do
-    if verify_public_endpoints_once; then
+    if verify_origin_endpoints_once; then
       return 0
     fi
-    echo "Endpoint verification attempt ${attempt}/12 failed; retrying..." >&2
+    echo "Origin endpoint verification attempt ${attempt}/12 failed; retrying..." >&2
     sleep 5
   done
   return 1
@@ -130,8 +128,8 @@ if ! remote "sudo docker exec jobscout-cloud-caddy caddy reload --config /etc/ca
   fail "Caddy reload failed"
 fi
 
-echo "==> Verifying public endpoints"
-if ! verify_public_endpoints; then
+echo "==> Verifying origin endpoints"
+if ! verify_origin_endpoints; then
   restore_caddy_config
   fail "Endpoint verification failed"
 fi

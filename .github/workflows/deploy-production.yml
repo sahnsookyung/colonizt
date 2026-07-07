@@ -173,6 +173,18 @@ jobs:
           COLONIZT_ENV_FILE="$RUNNER_TEMP/colonizt.env" \
           ./ops/scripts/deploy-oci.sh "$COLONIZT_PRODUCTION_HOST" "$IMAGE_TAG"
 
+      - name: Route deployed smoke traffic to OCI origin
+        if: steps.target.outputs.deploy == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          origin_ip="$(getent ahostsv4 "$COLONIZT_PRODUCTION_HOST" | awk 'NR == 1 { print $1 }')"
+          if [[ -z "$origin_ip" ]]; then
+            origin_ip="$COLONIZT_PRODUCTION_HOST"
+          fi
+          printf '%s %s\n' "$origin_ip" "colonizt.sookyungahn.com" | sudo tee -a /etc/hosts
+          getent hosts colonizt.sookyungahn.com
+
       - name: Run deployed network smoke
         if: steps.target.outputs.deploy == 'true'
         run: ./ops/scripts/smoke-oci.sh

@@ -42,6 +42,8 @@ assertContains(deployWorkflowPath, deployWorkflow, "COLONIZT_PRODUCTION_ENV_B64"
 assertContains(deployWorkflowPath, deployWorkflow, "docker manifest inspect \"ghcr.io/sahnsookyung/colonizt-server:${IMAGE_TAG}\"");
 assertContains(deployWorkflowPath, deployWorkflow, "docker manifest inspect \"ghcr.io/sahnsookyung/colonizt-web:${IMAGE_TAG}\"");
 assertContains(deployWorkflowPath, deployWorkflow, "./ops/scripts/deploy-oci.sh \"$COLONIZT_PRODUCTION_HOST\" \"$IMAGE_TAG\"");
+assertContains(deployWorkflowPath, deployWorkflow, "Route deployed smoke traffic to OCI origin");
+assertContains(deployWorkflowPath, deployWorkflow, "colonizt.sookyungahn.com\" | sudo tee -a /etc/hosts");
 assertContains(deployWorkflowPath, deployWorkflow, "./ops/scripts/smoke-oci.sh");
 assertContains(deployWorkflowPath, deployWorkflow, "npm run smoke:deployed-browser");
 
@@ -49,6 +51,7 @@ assertContains(cdWorkflowPath, cdWorkflow, "ghcr.io/sahnsookyung/${{ matrix.imag
 assertContains(cdWorkflowPath, cdWorkflow, "platforms: linux/arm64");
 
 assertContains(deployScriptPath, deployScript, "Refusing to deploy mutable latest");
+assertContains(deployScriptPath, deployScript, "Verifying origin endpoints");
 assertMatches(deployScriptPath, deployScript, /\[\[ ! "\$IMAGE_TAG" =~ \^\[0-9a-fA-F\]\{40\}\$ \]\]/, "a full 40-character image tag guard");
 assertContains(awaitGatesPath, awaitGates, 'const ghExecutable = "/usr/bin/gh";');
 if (awaitGates.includes('spawnSync("gh"')) {
