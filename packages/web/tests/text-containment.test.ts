@@ -30,8 +30,8 @@ describe("text containment CSS", () => {
   });
 
   it("keeps dynamic game text inside compact controls", () => {
-    expectRuleToContain(".board-action span", ["overflow: hidden", "overflow-wrap: anywhere", "white-space: normal"]);
-    expectRuleToContain(".board-action.special-action", ["grid-template-rows: 28px auto 16px", "padding-bottom: 5px"]);
+    expectRuleToContain(".board-action span", ["overflow: hidden", "overflow-wrap: normal", "word-break: normal"]);
+    expectRuleToContain(".board-action.special-action", ["grid-template-rows: 26px minmax(10px, auto) 14px", "padding-bottom: 4px"]);
     expectRuleToContain(".board-action.special-action .action-cost-icons", ["position: static", "grid-row: 3"]);
     expectRuleToContain(".player-heading strong", ["overflow: hidden", "text-overflow: ellipsis", "white-space: nowrap"]);
     expectRuleToContain(".player-stats .stat-chip", ["overflow: hidden", "white-space: nowrap"]);
