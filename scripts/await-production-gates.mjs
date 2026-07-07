@@ -3,6 +3,7 @@
 import { spawnSync } from "node:child_process";
 
 const activeStatuses = new Set(["queued", "in_progress", "requested", "waiting", "pending"]);
+const ghExecutable = "/usr/bin/gh";
 const targetSha = process.argv[2];
 const gateSpecs = process.argv.slice(3);
 const timeoutSeconds = Number(process.env.AWAIT_WORKFLOW_GATES_TIMEOUT_SECONDS ?? 2700);
@@ -30,7 +31,7 @@ const gates = gateSpecs.map((spec) => {
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 const listRuns = (workflow) => {
-  const result = spawnSync("gh", [
+  const result = spawnSync(ghExecutable, [
     "run",
     "list",
     "--workflow",

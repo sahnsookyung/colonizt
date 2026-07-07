@@ -19,10 +19,12 @@ const assertMatches = (path, content, pattern, description) => {
 const deployWorkflowPath = ".github/workflows/deploy-production.yml";
 const cdWorkflowPath = ".github/workflows/cd.yml";
 const deployScriptPath = "ops/scripts/deploy-oci.sh";
+const awaitGatesPath = "scripts/await-production-gates.mjs";
 
 const deployWorkflow = read(deployWorkflowPath);
 const cdWorkflow = read(cdWorkflowPath);
 const deployScript = read(deployScriptPath);
+const awaitGates = read(awaitGatesPath);
 
 assertContains(deployWorkflowPath, deployWorkflow, "workflow_run:");
 assertContains(deployWorkflowPath, deployWorkflow, 'workflows: ["CD - Build & Push Images"]');
@@ -48,5 +50,9 @@ assertContains(cdWorkflowPath, cdWorkflow, "platforms: linux/arm64");
 
 assertContains(deployScriptPath, deployScript, "Refusing to deploy mutable latest");
 assertMatches(deployScriptPath, deployScript, /\[\[ ! "\$IMAGE_TAG" =~ \^\[0-9a-fA-F\]\{40\}\$ \]\]/, "a full 40-character image tag guard");
+assertContains(awaitGatesPath, awaitGates, 'const ghExecutable = "/usr/bin/gh";');
+if (awaitGates.includes('spawnSync("gh"')) {
+  throw new Error(`${awaitGatesPath} must use a fixed gh executable path.`);
+}
 
 console.log("Validated production deploy workflow contract.");
