@@ -177,6 +177,33 @@ test("action controls use solid contained colors", async ({ page, isMobile }) =>
   }
 });
 
+test("special card action keeps cost icons clear of the label", async ({ page, isMobile }) => {
+  test.skip(isMobile, "desktop project only");
+  await page.goto("/");
+  await page.getByRole("button", { name: /Bot Match/ }).click();
+
+  const metrics = await page.evaluate(() => {
+    const special = document.querySelector<HTMLElement>(".board-action.special-action");
+    const label = special?.querySelector<HTMLElement>(":scope > span:not(.action-cost-icons)");
+    const costIcons = special?.querySelector<HTMLElement>(".action-cost-icons");
+    if (!special || !label || !costIcons) throw new Error("Missing special action parts");
+    const rect = (element: HTMLElement) => {
+      const box = element.getBoundingClientRect();
+      return { bottom: box.bottom, height: box.height, left: box.left, right: box.right, top: box.top, width: box.width };
+    };
+    return {
+      button: rect(special),
+      label: rect(label),
+      costIcons: rect(costIcons),
+    };
+  });
+
+  expect(metrics.label.bottom).toBeLessThanOrEqual(metrics.costIcons.top + 1);
+  expect(metrics.costIcons.bottom).toBeLessThanOrEqual(metrics.button.bottom + 1);
+  expect(metrics.label.height).toBeGreaterThan(8);
+  expect(metrics.costIcons.height).toBeGreaterThan(10);
+});
+
 test("dynamic UI text stays contained without overlapping controls", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: /Bot Match/ }).click();
@@ -192,7 +219,7 @@ test("dynamic UI text stays contained without overlapping controls", async ({ pa
     setText(".player-heading strong", "Player");
     setText(".phase-card strong", "Panel");
     setText(".phase-card > span:not(.eyebrow)", "Status");
-    setText(".board-action span", "Action");
+    setText(".board-action > span:not(.action-cost-icons)", "Action");
     setText(".game-log-panel li", "Event");
   });
 

@@ -18,8 +18,21 @@ const expectRuleToContain = (selector: string, declarations: string[]) => {
 };
 
 describe("text containment CSS", () => {
+  it("keeps button labels from splitting words apart", () => {
+    expectRuleToContain("button,\nselect", ["hyphens: none", "overflow-wrap: normal", "word-break: normal"]);
+    expectRuleToContain(".lobby-settings .difficulty-options button", [
+      "font-size: 13px",
+      "hyphens: none",
+      "overflow-wrap: normal",
+      "word-break: normal",
+    ]);
+    expectRuleToContain(".lobby-settings .option-row > span", ["overflow-wrap: normal", "word-break: normal"]);
+  });
+
   it("keeps dynamic game text inside compact controls", () => {
     expectRuleToContain(".board-action span", ["overflow: hidden", "overflow-wrap: anywhere", "white-space: normal"]);
+    expectRuleToContain(".board-action.special-action", ["grid-template-rows: 28px auto 16px", "padding-bottom: 5px"]);
+    expectRuleToContain(".board-action.special-action .action-cost-icons", ["position: static", "grid-row: 3"]);
     expectRuleToContain(".player-heading strong", ["overflow: hidden", "text-overflow: ellipsis", "white-space: nowrap"]);
     expectRuleToContain(".player-stats .stat-chip", ["overflow: hidden", "white-space: nowrap"]);
     expectRuleToContain(".player-mobile-stats span", ["overflow: hidden", "text-overflow: ellipsis", "white-space: nowrap"]);

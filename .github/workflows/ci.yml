@@ -43,6 +43,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run scan:branding
+      - run: npm run ops:workflows
       - run: npm run docs:diagrams
       - run: npm run lint
       - run: npm run typecheck

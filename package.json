@@ -35,6 +35,7 @@
     "smoke:deployed-browser": "playwright test --config=playwright.deployed.config.ts",
     "smoke:cross-network": "npm run smoke:deployed-network && npm run smoke:deployed-browser",
     "scan:branding": "tsx scripts/scan-branding.ts",
+    "ops:workflows": "node scripts/check-deploy-workflows.mjs",
     "docs:diagrams": "node scripts/check-mermaid.mjs",
     "verify:local": "bash scripts/verify-local.sh"
   },

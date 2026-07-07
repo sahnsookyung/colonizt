@@ -1,0 +1,182 @@
+name: Deploy Production
+
+on:
+  workflow_run:
+    workflows: ["CD - Build & Push Images"]
+    branches:
+      - main
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Full 40-character Git SHA image tag to deploy. Leave blank for current main."
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  packages: read
+
+concurrency:
+  group: colonizt-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy Colonizt to OCI
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment:
+      name: production
+      url: https://colonizt.sookyungahn.com
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+      PUBLIC_WEB_URL: ${{ vars.COLONIZT_PUBLIC_WEB_URL || 'https://colonizt.sookyungahn.com' }}
+      PUBLIC_API_URL: ${{ vars.COLONIZT_PUBLIC_API_URL || 'https://colonizt.sookyungahn.com' }}
+      PUBLIC_WS_URL: ${{ vars.COLONIZT_PUBLIC_WS_URL || 'wss://colonizt.sookyungahn.com' }}
+      PUBLIC_WEB_ORIGIN: ${{ vars.COLONIZT_PUBLIC_WEB_ORIGIN || 'https://colonizt.sookyungahn.com' }}
+      COLONIZT_PRODUCTION_HOST: ${{ secrets.COLONIZT_PRODUCTION_HOST }}
+      COLONIZT_PRODUCTION_USER: ${{ secrets.COLONIZT_PRODUCTION_USER || 'opc' }}
+      COLONIZT_DEPLOY_KEY: ${{ secrets.COLONIZT_DEPLOY_KEY }}
+      COLONIZT_PRODUCTION_ENV_B64: ${{ secrets.COLONIZT_PRODUCTION_ENV_B64 }}
+      COLONIZT_GHCR_SECRET: ${{ secrets.COLONIZT_GHCR_SECRET }}
+      COLONIZT_GHCR_USER: ${{ secrets.COLONIZT_GHCR_USER || 'sahnsookyung' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Resolve immutable image tag
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_run" ]]; then
+            image_tag="${{ github.event.workflow_run.head_sha }}"
+            current_main="$(git rev-parse origin/main)"
+            if [[ "$image_tag" != "$current_main" ]]; then
+              echo "Skipping stale CD run for $image_tag; current main is $current_main." | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "deploy=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            image_tag="${{ inputs.image_tag }}"
+            if [[ -z "$image_tag" ]]; then
+              image_tag="$(git rev-parse origin/main)"
+            else
+              image_tag="$(git rev-parse "${image_tag}^{commit}")"
+            fi
+          fi
+
+          if [[ ! "$image_tag" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::Deploy image tag must resolve to a full 40-character Git SHA."
+            exit 1
+          fi
+
+          echo "deploy=true" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
+          echo "Deploy target: $image_tag" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Wait for upstream gates
+        if: steps.target.outputs.deploy == 'true'
+        env:
+          IMAGE_TAG: ${{ steps.target.outputs.image_tag }}
+          AWAIT_WORKFLOW_GATES_TIMEOUT_SECONDS: "3600"
+          AWAIT_WORKFLOW_GATES_POLL_SECONDS: "30"
+        run: |
+          node scripts/await-production-gates.mjs "$IMAGE_TAG" \
+            "CI=ci.yml" \
+            "SonarCloud=sonarcloud.yml" \
+            "CD image build=cd.yml"
+
+      - name: Verify required production secrets
+        if: steps.target.outputs.deploy == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in COLONIZT_PRODUCTION_HOST COLONIZT_PRODUCTION_USER COLONIZT_DEPLOY_KEY COLONIZT_PRODUCTION_ENV_B64; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::$name is required in the production environment."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Verify GHCR images exist
+        if: steps.target.outputs.deploy == 'true'
+        env:
+          IMAGE_TAG: ${{ steps.target.outputs.image_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "$COLONIZT_GHCR_SECRET" ]]; then
+            printf '%s' "$COLONIZT_GHCR_SECRET" | docker login ghcr.io -u "$COLONIZT_GHCR_USER" --password-stdin >/dev/null
+          else
+            printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null
+          fi
+
+          docker manifest inspect "ghcr.io/sahnsookyung/colonizt-server:${IMAGE_TAG}" >/dev/null
+          docker manifest inspect "ghcr.io/sahnsookyung/colonizt-web:${IMAGE_TAG}" >/dev/null
+
+      - name: Install dependencies
+        if: steps.target.outputs.deploy == 'true'
+        run: npm ci
+
+      - name: Install Playwright browser
+        if: steps.target.outputs.deploy == 'true'
+        run: npx playwright install --with-deps chromium
+
+      - name: Prepare production deploy credentials
+        if: steps.target.outputs.deploy == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$COLONIZT_DEPLOY_KEY" > "$RUNNER_TEMP/colonizt_deploy_key"
+          chmod 600 "$RUNNER_TEMP/colonizt_deploy_key"
+          cat > "$HOME/.ssh/config" <<EOF
+          Host $COLONIZT_PRODUCTION_HOST
+            IdentityFile $RUNNER_TEMP/colonizt_deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking accept-new
+          EOF
+
+          printf '%s' "$COLONIZT_PRODUCTION_ENV_B64" | base64 --decode > "$RUNNER_TEMP/colonizt.env"
+          chmod 600 "$RUNNER_TEMP/colonizt.env"
+
+      - name: Deploy to OCI
+        if: steps.target.outputs.deploy == 'true'
+        env:
+          IMAGE_TAG: ${{ steps.target.outputs.image_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          REMOTE_USER="$COLONIZT_PRODUCTION_USER" \
+          GHCR_USER="$COLONIZT_GHCR_USER" \
+          COLONIZT_GHCR_SECRET="$COLONIZT_GHCR_SECRET" \
+          COLONIZT_ENV_FILE="$RUNNER_TEMP/colonizt.env" \
+          ./ops/scripts/deploy-oci.sh "$COLONIZT_PRODUCTION_HOST" "$IMAGE_TAG"
+
+      - name: Run deployed network smoke
+        if: steps.target.outputs.deploy == 'true'
+        run: ./ops/scripts/smoke-oci.sh
+
+      - name: Run deployed browser smoke
+        if: steps.target.outputs.deploy == 'true'
+        run: npm run smoke:deployed-browser

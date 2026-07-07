@@ -43,6 +43,39 @@ This starts PostgreSQL, the Fastify server on `http://127.0.0.1:8787`, and the s
 
 Colonizt can run beside JobScout on the existing OCI host without sharing app state. The deployment uses separate containers and data under `/srv/colonizt`; the only shared surface is the existing Caddy reverse proxy and its certificate storage.
 
+## GitHub Actions Production Deploy
+
+The preferred production path is GitHub Actions:
+
+1. `CI` and `SonarCloud` must pass for the target commit.
+2. `CD - Build & Push Images` builds and pushes `linux/arm64` images to GHCR with the full `github.sha` tag.
+3. `Deploy Production` waits for those gates, verifies both SHA-tagged GHCR images exist, writes the production `.env` from a protected GitHub secret, runs `ops/scripts/deploy-oci.sh`, then runs deployed network and browser smokes.
+
+The workflow runs automatically when the CD image-build workflow succeeds on the current `main` SHA. It can also be run manually from GitHub Actions with an optional full 40-character SHA for a deliberate rollback or redeploy. Production deploys use the GitHub `production` environment and the `colonizt-production` concurrency group, so only one promotion can run at a time.
+
+Configure these GitHub environment secrets on `production`:
+
+| Secret | Purpose |
+| --- | --- |
+| `COLONIZT_PRODUCTION_HOST` | OCI host or IP passed to `ops/scripts/deploy-oci.sh`. |
+| `COLONIZT_PRODUCTION_USER` | SSH user, usually `opc`. |
+| `COLONIZT_DEPLOY_KEY` | Private SSH key with access to the OCI host. |
+| `COLONIZT_PRODUCTION_ENV_B64` | Base64-encoded production `.env` uploaded to the host for Docker Compose. |
+| `COLONIZT_GHCR_SECRET` | Optional GHCR token for the runner and remote Docker host to pull private images. |
+| `COLONIZT_GHCR_USER` | Optional GHCR username; defaults to `sahnsookyung`. |
+
+Optional GitHub environment variables can override public smoke defaults: `COLONIZT_PUBLIC_WEB_URL`, `COLONIZT_PUBLIC_API_URL`, `COLONIZT_PUBLIC_WS_URL`, and `COLONIZT_PUBLIC_WEB_ORIGIN`.
+
+The production `.env` secret can be prepared from the same file used by local deploy fallback:
+
+```bash
+base64 -w0 .env
+```
+
+Use the output as `COLONIZT_PRODUCTION_ENV_B64`. On macOS, use `base64 < .env | tr -d '\n'`.
+
+## Manual Fallback
+
 JobScout owns the root Caddyfile and Caddy data volumes. Its Caddyfile imports
 `/etc/caddy/sites/*.Caddyfile`, and colocated apps install their own site
 snippets there. Colonizt only writes `/srv/jobscout-cloud/ops/caddy/sites/colonizt.Caddyfile`;
@@ -51,7 +84,7 @@ JobScout shared-sites Caddy mount before running the Colonizt deploy script on a
 fresh host.
 
 ```bash
-./ops/scripts/deploy-oci.sh <jobscout-oci-ip> <git-sha-image-tag>
+./ops/scripts/deploy-oci.sh <jobscout-oci-ip> <full-40-character-git-sha-image-tag>
 ./ops/scripts/smoke-oci.sh
 ```
 

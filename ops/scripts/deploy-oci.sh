@@ -53,8 +53,8 @@ if [[ "$IMAGE_TAG" == "latest" ]]; then
   fail "Refusing to deploy mutable latest; use the Git SHA image tag."
 fi
 
-if [[ ! "$IMAGE_TAG" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
-  fail "IMAGE_TAG must look like an immutable Git SHA."
+if [[ ! "$IMAGE_TAG" =~ ^[0-9a-fA-F]{40}$ ]]; then
+  fail "IMAGE_TAG must be the full 40-character immutable Git SHA image tag."
 fi
 
 [[ -f "$ENV_FILE" ]] || fail "$ENV_FILE not found"

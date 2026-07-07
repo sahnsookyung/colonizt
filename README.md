@@ -145,10 +145,12 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up --build postg
 
 This starts PostgreSQL, the server on `http://127.0.0.1:8787`, and the static web container on `http://127.0.0.1:8080`.
 
-Deployment details live in [docs/deployment.md](docs/deployment.md). The OCI path uses immutable GHCR image tags:
+Deployment details live in [docs/deployment.md](docs/deployment.md). The preferred production path is the `Deploy Production` GitHub Actions workflow: it waits for CI, SonarCloud, and the GHCR image build, promotes the full SHA-tagged images to OCI, then runs deployed network and browser smokes.
+
+The local OCI script remains an emergency fallback and uses immutable GHCR image tags:
 
 ```bash
-./ops/scripts/deploy-oci.sh <server-ip> <git-sha-image-tag>
+./ops/scripts/deploy-oci.sh <server-ip> <full-40-character-git-sha-image-tag>
 ./ops/scripts/smoke-oci.sh
 ```
 
