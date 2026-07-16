@@ -16,7 +16,6 @@ import {
   randomLegalBot,
   resolveBotOfferCommand,
   tradeFullyAnswered,
-  tradeShapeKey,
   type BotController,
 } from "@colonizt/bots";
 import type { Room } from "./room-manager.js";
@@ -108,4 +107,4 @@ export const chooseBotTurnCommand = (room: Room, active: PlayerId): GameCommand 
   return command;
 };
 
-export { tradeShapeKey };
+export { tradeShapeKey } from "@colonizt/bots";

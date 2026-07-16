@@ -108,8 +108,8 @@ export const MatchAnalysis = ({ state, players, events, botPlayerIds, tab, onTab
   return (
     <AccessibleDialog className="game-over-overlay" label="Victory analysis">
       <div className="confetti-layer" aria-hidden="true">
-        {confettiPieces.map((piece, index) => (
-          <span key={index} style={{
+        {confettiPieces.map((piece) => (
+          <span key={`${piece.left}:${piece.delay}:${piece.duration}:${piece.rotate}`} style={{
             "--confetti-left": piece.left,
             "--confetti-delay": piece.delay,
             "--confetti-duration": piece.duration,

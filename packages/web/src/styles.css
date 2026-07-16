@@ -20,6 +20,15 @@
   box-sizing: border-box;
 }
 
+.accessible-dialog {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  max-width: none;
+  max-height: none;
+  color: inherit;
+}
+
 body {
   margin: 0;
   background:

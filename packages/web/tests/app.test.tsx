@@ -1561,7 +1561,7 @@ describe("App", () => {
     const retry = screen.getByRole("button", { name: "Retry" });
     expect(retry).toBeEnabled();
     fireEvent.click(retry);
-    await waitFor(() => expect(sockets.length).toBe(2));
+    await waitFor(() => expect(sockets).toHaveLength(2));
   });
 
   it("offers a retry when the initial websocket ticket request fails", async () => {

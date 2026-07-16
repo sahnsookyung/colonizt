@@ -50,7 +50,7 @@ interface AccessibleDialogProps {
 }
 
 export const AccessibleDialog = ({ className, label, children, modal = true, onClose }: AccessibleDialogProps) => {
-  const dialogRef = useRef<HTMLDivElement>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -69,7 +69,7 @@ export const AccessibleDialog = ({ className, label, children, modal = true, onC
     };
   }, [modal]);
 
-  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+  const onKeyDown = (event: KeyboardEvent<HTMLDialogElement>) => {
     if (event.key === "Escape" && onClose) {
       event.preventDefault();
       event.stopPropagation();
@@ -96,16 +96,16 @@ export const AccessibleDialog = ({ className, label, children, modal = true, onC
   };
 
   return (
-    <div
+    <dialog
+      open
       ref={dialogRef}
-      className={className}
-      role="dialog"
+      className={`accessible-dialog ${className}`}
       aria-modal={modal}
       aria-label={label}
       tabIndex={-1}
       onKeyDown={onKeyDown}
     >
       {children}
-    </div>
+    </dialog>
   );
 };
