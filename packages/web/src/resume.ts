@@ -1,4 +1,5 @@
 import type { PlayerId } from "@colonizt/game-core";
+import { z } from "zod";
 
 export interface NetworkResumeState {
   token: string;
@@ -11,10 +12,23 @@ export interface NetworkResumeState {
 
 export const resumeStorageKey = "colonizt.resume";
 
+const networkResumeStateSchema = z.object({
+  token: z.string().min(1),
+  userId: z.string().min(1),
+  roomId: z.string().min(1),
+  roomCode: z.string().min(1).optional(),
+  clientSeq: z.number().int().nonnegative(),
+  lastSeq: z.number().int().nonnegative(),
+});
+
 export const readResumeState = (storage: Pick<Storage, "getItem"> = localStorage): NetworkResumeState | null => {
   try {
     const raw = storage.getItem(resumeStorageKey);
-    return raw ? JSON.parse(raw) as NetworkResumeState : null;
+    if (!raw) return null;
+    const parsed = networkResumeStateSchema.safeParse(JSON.parse(raw));
+    if (!parsed.success) return null;
+    const { roomCode, ...required } = parsed.data;
+    return roomCode ? { ...required, roomCode } : required;
   } catch {
     return null;
   }

@@ -6,6 +6,9 @@ import { PostgresEventStore } from "../src/event-store.js";
 import { RoomManager } from "../src/room-manager.js";
 
 const testDatabaseUrl = process.env.COLONIZT_TEST_DATABASE_URL;
+if (process.env.CI && !testDatabaseUrl) {
+  throw new Error("COLONIZT_TEST_DATABASE_URL is required in CI; PostgreSQL integration tests must not be skipped");
+}
 const describePostgres = testDatabaseUrl ? describe : describe.skip;
 
 describePostgres("PostgresEventStore integration", () => {
@@ -139,5 +142,24 @@ describePostgres("PostgresEventStore integration", () => {
       { user_id: host.userId, seat_index: 0 },
       { user_id: guest.userId, seat_index: 1 },
     ]);
+  });
+
+  it("persists lobby host transfers and removes seats after shrinking", async () => {
+    const store = new PostgresEventStore(pool);
+    const manager = new RoomManager(store);
+    const host = await manager.createSession("Original Host");
+    const guest = await manager.createSession("New Host");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 4 });
+    expect((await manager.joinRoom(room.id, guest)).ok).toBe(true);
+    expect((await manager.leaveRoom(room.id, host)).ok).toBe(true);
+    expect((await manager.updateRoomSettings(room.id, guest, { maxPlayers: 2 })).ok).toBe(true);
+
+    const restarted = new RoomManager(store);
+    await restarted.hydrateFromStore();
+    const recovered = restarted.roomForRef(room.id);
+
+    expect(recovered?.hostUserId).toBe(guest.userId);
+    expect(recovered?.seats).toHaveLength(2);
+    expect(recovered?.seats.some((seat) => seat.userId === guest.userId)).toBe(true);
   });
 });

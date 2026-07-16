@@ -304,12 +304,27 @@ describe("REST routes", () => {
     const app = await buildServer({ manager: new RoomManager() });
     const responses = [];
     for (let index = 0; index < 21; index += 1) {
-      responses.push(await app.inject({ method: "POST", url: "/sessions", payload: { displayName: `Guest ${index}` } }));
+      responses.push(await app.inject({
+        method: "POST",
+        url: "/sessions",
+        headers: { "x-forwarded-for": `203.0.113.${index + 1}` },
+        payload: { displayName: `Guest ${index}` },
+      }));
     }
     await app.close();
 
     expect(responses.slice(0, 20).every((response) => response.statusCode === 200)).toBe(true);
     expect(responses[20]?.statusCode).toBe(429);
+  });
+
+  it("supports an explicit in-process session limit for load harnesses", async () => {
+    const app = await buildServer({ manager: new RoomManager(), rateLimits: { sessionsPerMinutePerIp: 2 } });
+    const first = await app.inject({ method: "POST", url: "/sessions", payload: { displayName: "One" } });
+    const second = await app.inject({ method: "POST", url: "/sessions", payload: { displayName: "Two" } });
+    const limited = await app.inject({ method: "POST", url: "/sessions", payload: { displayName: "Three" } });
+    await app.close();
+
+    expect([first.statusCode, second.statusCode, limited.statusCode]).toEqual([200, 200, 429]);
   });
 
   it("returns short room codes and resolves rooms by code", async () => {
@@ -432,5 +447,83 @@ describe("REST routes", () => {
     expect(room.status).toBe("IN_GAME");
     expect(room.game?.playerOrder).toEqual(sessions.map((session) => session.userId));
     expect(room.seats.some((seat) => seat.botId)).toBe(false);
+  });
+
+  it("returns capacity, replay authorization, missing-record, and populated leaderboard contracts", async () => {
+    const manager = new RoomManager(new MemoryEventStore(), { maxActiveRooms: 1 });
+    const host = await manager.createSession("Replay Host");
+    const outsider = await manager.createSession("Outsider");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: true, ranked: false });
+    const ready = await manager.setReady(room.id, host, true);
+    if (!ready.ok || !room.game) throw new Error("expected started room");
+    room.events.push({ schemaVersion: room.game.schemaVersion, seq: 1, type: "GAME_OVER", winnerId: host.userId, reason: "VICTORY_POINTS" });
+    const app = await buildServer({ manager, adminToken: "admin" });
+
+    const capacity = await app.inject({
+      method: "POST", url: "/rooms", headers: { "x-session-token": outsider.token },
+      payload: { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 },
+    });
+    const missingMatch = await app.inject({ method: "GET", url: "/matches/missing" });
+    const missingReplay = await app.inject({ method: "GET", url: "/matches/missing/replay", headers: { "x-session-token": host.token } });
+    const forbiddenReplay = await app.inject({ method: "GET", url: `/matches/${room.id}/replay`, headers: { "x-session-token": outsider.token } });
+    const loadedReplay = await app.inject({ method: "GET", url: `/matches/${room.id}/replay`, headers: { "x-session-token": host.token } });
+    const leaderboard = await app.inject({ method: "GET", url: "/leaderboard", headers: { "x-admin-token": "admin" } });
+    await app.close();
+
+    expect(capacity.statusCode).toBe(503);
+    expect(capacity.json()).toMatchObject({ code: "ROOM_CAPACITY_REACHED" });
+    expect(missingMatch.statusCode).toBe(404);
+    expect(missingReplay.statusCode).toBe(404);
+    expect(missingReplay.json()).toMatchObject({ code: "REPLAY_NOT_FOUND" });
+    expect(forbiddenReplay.statusCode).toBe(403);
+    expect(forbiddenReplay.json()).toMatchObject({ code: "REPLAY_FORBIDDEN" });
+    expect(loadedReplay.statusCode).toBe(200);
+    expect(loadedReplay.json().events).toEqual([expect.objectContaining({ type: "GAME_OVER" })]);
+    expect(leaderboard.json().rows).toEqual(expect.arrayContaining([expect.objectContaining({ userId: host.userId })]));
+  });
+
+  it("enforces independent REST budgets for room lists, websocket tickets, and reports", async () => {
+    const manager = new RoomManager();
+    const session = await manager.createSession("Budgeted");
+    const room = await manager.createRoom(session, { mode: "CLASSIC", botFill: true, ranked: false });
+    const app = await buildServer({ manager });
+
+    const roomLists = [];
+    for (let index = 0; index < 121; index += 1) roomLists.push(await app.inject({ method: "GET", url: "/rooms" }));
+    const tickets = [];
+    for (let index = 0; index < 61; index += 1) tickets.push(await app.inject({ method: "POST", url: "/ws-tickets", headers: { "x-session-token": session.token } }));
+    const reports = [];
+    for (let index = 0; index < 11; index += 1) {
+      reports.push(await app.inject({
+        method: "POST", url: `/rooms/${room.id}/reports`, headers: { "x-session-token": session.token },
+        payload: { reportedUserId: "bot_2", reason: `report ${index}` },
+      }));
+    }
+    await app.close();
+
+    expect(roomLists.at(-1)?.statusCode).toBe(429);
+    expect(tickets.at(-1)?.statusCode).toBe(429);
+    expect(reports.at(-1)?.statusCode).toBe(429);
+  });
+
+  it("limits repeated room creation by the same authenticated session", async () => {
+    const manager = new RoomManager();
+    const session = await manager.createSession("Room Spammer");
+    const app = await buildServer({ manager });
+    const responses = [];
+
+    for (let index = 0; index < 13; index += 1) {
+      responses.push(await app.inject({
+        method: "POST",
+        url: "/rooms",
+        headers: { "x-session-token": session.token },
+        payload: { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 2 },
+      }));
+    }
+    await app.close();
+
+    expect(responses.slice(0, 12).every((response) => response.statusCode === 200)).toBe(true);
+    expect(responses[12]?.statusCode).toBe(429);
+    expect(responses[12]?.json()).toMatchObject({ code: "RATE_LIMITED" });
   });
 });

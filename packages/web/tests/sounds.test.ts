@@ -118,6 +118,51 @@ describe("sound cues", () => {
     ]);
   });
 
+  it("recognizes every way a trade can affect the human player", async () => {
+    const { selectSoundCueForEvents } = await import("../src/sounds.js");
+    const events = [
+      { type: "TRADE_RESPONSE_RECORDED", tradeId: "t1", fromPlayerId: "p1" },
+      { type: "TRADE_RESPONSE_RECORDED", tradeId: "t2", playerId: "p1" },
+      { type: "TRADE_RESPONSE_RECORDED", tradeId: "t3", recipientIds: ["p1"] },
+      { type: "TRADE_ACCEPTED", tradeId: "t4", fromPlayerId: "p1", toPlayerId: "p2", offered: emptyBundle(), requested: emptyBundle() },
+      { type: "TRADE_ACCEPTED", tradeId: "t5", fromPlayerId: "p2", toPlayerId: "p1", offered: emptyBundle(), requested: emptyBundle() },
+      { type: "TRADE_CANCELLED", tradeId: "t6", playerId: "p1" },
+      { type: "TRADE_REJECTED", tradeId: "t7", playerId: "p1" },
+      { type: "TRADE_EXPIRED", tradeId: "t8", playerId: "p1" },
+      { type: "TRADE_CLOSED", tradeId: "t9", playerId: "p1", reason: "TTL" },
+    ] as GameEvent[];
+
+    for (const event of events) {
+      expect(selectSoundCueForEvents([event], "p1"), event.type).toBe("trade");
+    }
+    expect(selectSoundCueForEvents([
+      { type: "TRADE_ACCEPTED", tradeId: "other", fromPlayerId: "p2", toPlayerId: "p3", offered: emptyBundle(), requested: emptyBundle() },
+    ] as GameEvent[], "p1")).toBeNull();
+  });
+
+  it("alerts the human when shared game events directly affect them", async () => {
+    const { selectSoundCueForEvents } = await import("../src/sounds.js");
+
+    expect(selectSoundCueForEvents([{ type: "DISCARD_REQUIRED", rollerId: "p2", pending: { p1: 3 } }] as GameEvent[], "p1")).toBe("discard");
+    expect(selectSoundCueForEvents([{ type: "THIEF_MOVED", playerId: "p2", toHexId: "h1", reason: "ROLL_7", stealFromPlayerId: "p1" }] as GameEvent[], "p1")).toBe("thief");
+    expect(selectSoundCueForEvents([{ type: "PLIGHT_STRUCK", destroyed: [{ playerId: "p1", vertexId: "v1", buildingType: "city" }] }] as GameEvent[], "p1")).toBe("thief");
+    expect(selectSoundCueForEvents([{ type: "LARGEST_ARMY_UPDATED", playerId: "p1", knightCount: 3 }] as GameEvent[], "p1")).toBe("devCard");
+    expect(selectSoundCueForEvents([{ type: "LONGEST_ROAD_UPDATED", playerId: "p1", length: 5 }] as GameEvent[], "p1")).toBe("buildRoad");
+
+    expect(selectSoundCueForEvents([{ type: "DISCARD_REQUIRED", rollerId: "p2", pending: { p1: 0 } }] as GameEvent[], "p1")).toBeNull();
+    expect(selectSoundCueForEvents([{ type: "LARGEST_ARMY_UPDATED", knightCount: 2 }] as GameEvent[], "p1")).toBeNull();
+  });
+
+  it("supports single-event playback and treats a human seven as a dice event", async () => {
+    const { playSoundForEvent, selectSoundCueForEvents } = await import("../src/sounds.js");
+
+    playSoundForEvent({ type: "GAME_OVER", winnerId: "p2", reason: "VICTORY_POINTS" } as GameEvent, "p1");
+    expect(createdAudio.map((audio) => audio.src)).toEqual(["/sounds/game-over.wav"]);
+    expect(selectSoundCueForEvents([
+      { type: "SEVEN_ROLLED", playerId: "p1" },
+    ] as GameEvent[], "p1")).toBe("dice");
+  });
+
   it("does not play sound in jsdom-like user agents", async () => {
     const { playSound } = await import("../src/sounds.js");
     setUserAgent("jsdom");
@@ -125,6 +170,16 @@ describe("sound cues", () => {
     playSound("select");
 
     expect(createdAudio).toHaveLength(0);
+  });
+
+  it("keeps gameplay running when the browser rejects playback", async () => {
+    const { playSound } = await import("../src/sounds.js");
+    playSound("select");
+    createdAudio[0]!.play.mockRejectedValueOnce(new Error("autoplay blocked"));
+
+    expect(() => playSound("select")).not.toThrow();
+    await Promise.resolve();
+    expect(createdAudio[0]?.play).toHaveBeenCalledTimes(2);
   });
 
   it("has every configured sound asset checked in", async () => {

@@ -29,6 +29,111 @@ describe("RoomAutomationScheduler", () => {
     vi.useRealTimers();
   });
 
+  it("keeps scheduling automation after a transient tick failure", async () => {
+    vi.useFakeTimers();
+    const manager = new RoomManager();
+    const dueWork = vi.spyOn(manager, "dueAutomationRoomIds")
+      .mockImplementationOnce(() => { throw new Error("transient automation failure"); })
+      .mockReturnValue([]);
+    const scheduler = new RoomAutomationScheduler({
+      manager,
+      cleanupPolicy: defaultRoomCleanupPolicy,
+      automationIntervalMs: 10,
+      cleanupIntervalMs: 100_000,
+      logger: silentLogger,
+      metrics: new MetricsRegistry("test", "single"),
+      onEvents: () => undefined,
+      onRoomClosed: () => undefined,
+    });
+
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(dueWork).toHaveBeenCalledTimes(2);
+    scheduler.stop();
+    vi.useRealTimers();
+  });
+
+  it("keeps scheduling cleanup after a transient tick failure", async () => {
+    vi.useFakeTimers();
+    const manager = new RoomManager();
+    vi.spyOn(manager, "dueCleanupRoomIds").mockReturnValue(["room-failure"]);
+    const cleanup = vi.spyOn(manager, "cleanupRooms")
+      .mockRejectedValueOnce(new Error("transient cleanup failure"))
+      .mockResolvedValue([]);
+    const scheduler = new RoomAutomationScheduler({
+      manager,
+      cleanupPolicy: defaultRoomCleanupPolicy,
+      automationIntervalMs: 100_000,
+      cleanupIntervalMs: 10,
+      logger: silentLogger,
+      metrics: new MetricsRegistry("test", "single"),
+      onEvents: () => undefined,
+      onRoomClosed: () => undefined,
+    });
+
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(cleanup).toHaveBeenCalledTimes(2);
+    scheduler.stop();
+    vi.useRealTimers();
+  });
+
+  it("continues processing and requeues later automation rooms after one room fails", async () => {
+    const manager = new RoomManager();
+    vi.spyOn(manager, "dueAutomationRoomIds").mockReturnValue(["room-first", "room-second"]);
+    const expireTurn = vi.spyOn(manager, "expireTurn").mockImplementation(async (roomId) => {
+      if (roomId === "room-first") throw new Error("first room failed");
+      return undefined;
+    });
+    const runBots = vi.spyOn(manager, "runDueBotAutomation").mockResolvedValue(undefined);
+    const refresh = vi.spyOn(manager, "refreshRoomDueWork").mockImplementation(() => undefined);
+    vi.spyOn(manager, "nextAutomationDueAt").mockReturnValue(undefined);
+    const scheduler = new RoomAutomationScheduler({
+      manager,
+      cleanupPolicy: defaultRoomCleanupPolicy,
+      logger: silentLogger,
+      metrics: new MetricsRegistry("test", "single"),
+      onEvents: () => undefined,
+      onRoomClosed: () => undefined,
+    });
+
+    await scheduler.tickAutomation();
+
+    expect(expireTurn).toHaveBeenCalledWith("room-second", expect.any(Number));
+    expect(runBots).toHaveBeenCalledWith("room-second", expect.any(Number));
+    expect(refresh.mock.calls.map(([roomId]) => roomId)).toEqual(["room-first", "room-second"]);
+  });
+
+  it("continues cleanup after one claimed room fails and requeues every claim", async () => {
+    const manager = new RoomManager();
+    vi.spyOn(manager, "dueCleanupRoomIds").mockReturnValue(["room-first", "room-second"]);
+    const cleanup = vi.spyOn(manager, "cleanupRooms").mockImplementation(async (_now, roomIds) => {
+      if (roomIds[0] === "room-first") throw new Error("first cleanup failed");
+      return [{ roomId: "room-second", code: "SECOND", status: "EXPIRED", cleanupReason: "EMPTY_LOBBY_TTL" }];
+    });
+    const refresh = vi.spyOn(manager, "refreshRoomDueWork").mockImplementation(() => undefined);
+    vi.spyOn(manager, "nextCleanupDueAt").mockReturnValue(undefined);
+    const closed: string[] = [];
+    const scheduler = new RoomAutomationScheduler({
+      manager,
+      cleanupPolicy: defaultRoomCleanupPolicy,
+      logger: silentLogger,
+      metrics: new MetricsRegistry("test", "single"),
+      onEvents: () => undefined,
+      onRoomClosed: (room) => closed.push(room.roomId),
+    });
+
+    await scheduler.tickCleanup();
+
+    expect(cleanup.mock.calls.map(([, roomIds]) => roomIds)).toEqual([["room-first"], ["room-second"]]);
+    expect(refresh.mock.calls.map(([roomId]) => roomId)).toEqual(["room-first", "room-second"]);
+    expect(closed).toEqual(["room-second"]);
+  });
+
   it("broadcasts due turn expiry events through the callback", async () => {
     const manager = new RoomManager();
     const session = await manager.createSession("Host");

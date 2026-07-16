@@ -1,4 +1,5 @@
 import type { RoomManager } from "./room-manager.js";
+import type { HydrationOutcome, RoomDiagnostics } from "./room-diagnostics.js";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -54,7 +55,7 @@ const metricLine = (name: string, labels: Record<string, string>, value: number)
   return `${name}{${labelText}} ${Number.isFinite(value) ? value : 0}`;
 };
 
-export class MetricsRegistry {
+export class MetricsRegistry implements RoomDiagnostics {
   private readonly counters = new Map<string, number>();
   private commandLatencyTotalMs = 0;
   private commandLatencyCount = 0;
@@ -95,6 +96,22 @@ export class MetricsRegistry {
 
   recordScheduler(event: string): void {
     this.increment("scheduler_events_total", { event });
+  }
+
+  recordHydration(outcome: HydrationOutcome): void {
+    this.increment("room_hydration_total", { outcome });
+  }
+
+  recordStoreValidationFailure(recordType: "room" | "command_result"): void {
+    this.increment("store_validation_failures_total", { record_type: recordType });
+  }
+
+  recordCommandConflict(path: "accepted" | "rejected"): void {
+    this.increment("command_result_conflicts_total", { path });
+  }
+
+  recordAutomationPause(reason: "budget" | "stalled"): void {
+    this.increment("automation_pauses_total", { reason });
   }
 
   render(manager: RoomManager, socketCount: number, presenceKind: string): string {

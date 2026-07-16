@@ -23,7 +23,7 @@ This project is a portfolio and interview-preparation codebase. It does not copy
 - **Protocol:** Shared Zod schemas in `@colonizt/protocol` for REST/WebSocket payload validation.
 - **Persistence:** PostgreSQL via `pg` and forward-only migrations in `@colonizt/db`.
 - **Presence/fanout:** In-memory by default, optional Redis adapter for ephemeral socket presence.
-- **Quality gates:** Vitest, fast-check property tests, Playwright, ESLint, TypeScript, Docker, GitHub Actions, SonarCloud.
+- **Quality gates:** Vitest, fast-check property tests, Playwright, Stryker mutation testing, ESLint, TypeScript, dependency audit, CodeQL, Docker, GitHub Actions, SonarCloud.
 - **Deployment:** Docker images for server/web, Nginx static web runtime, Caddy reverse proxy snippets for OCI colocated deployment.
 
 ## Quick Start
@@ -66,7 +66,11 @@ npm --workspace @colonizt/web run dev -- --host 127.0.0.1
 | `npm run test:integration` | Test server, WebSocket, event-store, room, and route behavior. |
 | `npm --workspace @colonizt/web run test` | Run React/web unit tests. |
 | `npm run test:e2e` | Run Playwright browser tests. |
+| `npm run test:multiplayer` | Run a real local two-browser create/join/start/reconnect/resync journey. |
+| `npm run test:coverage` | Enforce 95% statement coverage, 95.5% line/function coverage, and 85% branch coverage. |
+| `npm run test:mutation` | Mutation-test replay, invariants, room lifecycle, and command idempotency. |
 | `npm run smoke:network` | Start a real local API/WSS flow and verify four clients plus reconnect/resync. |
+| `npm run load:sockets:soak` | Run the thresholded 20-room WebSocket reconnect/load soak. |
 | `npm run replay:fixtures` | Rebuild known replay fixtures from stored event logs. |
 | `npm run build` | Typecheck and build the production web bundle. |
 | `npm run verify:local` | Run the main local verification gate. |

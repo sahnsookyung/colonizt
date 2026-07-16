@@ -3,6 +3,8 @@ dist/
 coverage/
 playwright-report/
 test-results/
+.stryker-tmp/
+reports/
 .env
 .env.*
 !.env.example

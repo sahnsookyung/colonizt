@@ -1,4 +1,4 @@
-import { assertValidReplayLog, type BoardGraph, type GameConfig, type GameEvent, type GameState } from "@colonizt/game-core";
+import { assertValidReplayLog, isGameEvent, type BoardGraph, type GameConfig, type GameEvent, type GameState } from "@colonizt/game-core";
 import { createRoomSchema } from "@colonizt/protocol";
 import { z } from "zod";
 import type { StoredCommandResult, StoredRoomRecord } from "./event-store.js";
@@ -30,7 +30,7 @@ const storedMatchSchema = z.object({
   id: z.string().min(1),
   config: z.custom<GameConfig>((value) => typeof value === "object" && value !== null, "match config must be an object"),
   board: z.custom<BoardGraph>((value) => typeof value === "object" && value !== null, "match board must be an object"),
-  events: z.array(z.custom<GameEvent>((value) => typeof value === "object" && value !== null, "event must be an object")),
+  events: z.array(z.custom<GameEvent>(isGameEvent, "event payload is invalid")),
   snapshot: matchSnapshotSchema.optional(),
   endedAt: z.string().optional(),
   winnerUserId: z.string().optional(),
@@ -55,11 +55,7 @@ const storedRoomRecordSchema = z.object({
   match: storedMatchSchema.optional(),
 });
 
-const commandEventSchema = z.object({
-  schemaVersion: z.number().int().positive(),
-  seq: z.number().int().positive(),
-  type: z.string().min(1),
-}).passthrough();
+const commandEventSchema = z.custom<GameEvent>(isGameEvent, "event payload is invalid");
 
 const storedCommandResultSchema = z.object({
   roomId: z.string().min(1),
@@ -106,17 +102,6 @@ export const validateStoredRoomRecord = (record: StoredRoomRecord): StoredRoomRe
       board: stored.match.board,
       events: stored.match.events,
     });
-    if (stored.match.snapshot) {
-      assertValidReplayLog({
-        config: stored.match.config,
-        board: stored.match.board,
-        snapshot: {
-          seq: stored.match.snapshot.seq,
-          state: stored.match.snapshot.state,
-        },
-        events: stored.match.events.filter((event) => event.seq > stored.match!.snapshot!.seq),
-      });
-    }
   }
   return stored;
 };

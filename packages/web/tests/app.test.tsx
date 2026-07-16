@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { StrictMode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { completeSetup, createDemoGame, withResources } from "@colonizt/demo-state";
-import { applyCommand, cityCost, emptyResources, serializeForViewer, type GameCommand, type GameState } from "@colonizt/game-core";
-import { App } from "../src/App.js";
-import { clearResumeState } from "../src/resume.js";
+import { applyCommand, cityCost, emptyResources, getLegalActions, serializeForViewer, type GameCommand, type GameEvent, type GameState } from "@colonizt/game-core";
+import { App, networkErrorMessage } from "../src/App.js";
+import { clearResumeState, writeResumeState } from "../src/resume.js";
 
 afterEach(() => {
   cleanup();
@@ -57,8 +58,9 @@ const moveRobberIfPrompted = () => {
   if (target) fireEvent.click(target);
 };
 
-const renderOnlineGame = async (game: GameState) => {
+const renderOnlineGame = async (game: GameState, options: { replayResponse?: () => Response | Promise<Response> } = {}) => {
   const sentMessages: Array<{ type: string; command?: unknown }> = [];
+  const sockets: FakeWebSocket[] = [];
   const room = {
     id: `room_${game.config.matchId}`,
     code: "PLAY01",
@@ -83,6 +85,7 @@ const renderOnlineGame = async (game: GameState) => {
 
     constructor(readonly url: string) {
       super();
+      sockets.push(this);
       queueMicrotask(() => this.dispatchEvent(new Event("open")));
     }
 
@@ -97,6 +100,10 @@ const renderOnlineGame = async (game: GameState) => {
     close(): void {
       this.dispatchEvent(new Event("close"));
     }
+
+    receive(message: unknown): void {
+      this.dispatchEvent(new MessageEvent("message", { data: typeof message === "string" ? message : JSON.stringify(message) }));
+    }
   }
 
   vi.stubGlobal("WebSocket", FakeWebSocket);
@@ -105,17 +112,51 @@ const renderOnlineGame = async (game: GameState) => {
     if (url.endsWith("/sessions")) return new Response(JSON.stringify({ token: "s_host", userId: "p1", displayName: "Browser Host" }), { status: 200 });
     if (url.endsWith("/rooms")) return new Response(JSON.stringify(room), { status: 200 });
     if (url.endsWith("/ws-tickets")) return new Response(JSON.stringify({ ticket: "wst_1", expiresAt: "2026-06-22T00:00:00.000Z", ttlMs: 30_000 }), { status: 201 });
-    if (url.includes("/matches/") && url.endsWith("/replay")) return new Response(JSON.stringify({ config: game.config, board: game.board, events: [] }), { status: 200 });
+    if (url.includes("/matches/") && url.endsWith("/replay")) {
+      return options.replayResponse?.() ?? new Response(JSON.stringify({ config: game.config, board: game.board, events: [] }), { status: 200 });
+    }
     return new Response("not found", { status: 404 });
   }));
 
   render(<App />);
   fireEvent.click(screen.getByRole("button", { name: /Player Match/ }));
   expect(await screen.findByLabelText("Game board and actions")).toBeInTheDocument();
-  return { room, sentMessages };
+  return { room, sentMessages, sockets };
 };
 
 describe("App", () => {
+  it("translates stable network failure codes and preserves useful fallback messages", () => {
+    expect([
+      "ROOM_NOT_FOUND",
+      "ROOM_EXPIRED",
+      "ROOM_ABANDONED",
+      "ROOM_CLOSED",
+      "ROOM_FULL",
+      "ROOM_PAUSED",
+      "REPLAY_NOT_READY",
+      "REPLAY_FORBIDDEN",
+      "REPLAY_NOT_FOUND",
+      "RATE_LIMITED",
+      "UNAUTHORIZED",
+    ].map((code) => networkErrorMessage({ code }))).toEqual([
+      "Room not found",
+      "Room expired",
+      "Room abandoned",
+      "Room closed",
+      "Room is full",
+      "Room is paused",
+      "Replay is available after the game is finished",
+      "Replay is only available to players in this match",
+      "Replay not found",
+      "Too many attempts. Try again shortly.",
+      "Session expired",
+    ]);
+    expect(networkErrorMessage(new Error("socket failed"))).toBe("socket failed");
+    expect(networkErrorMessage({ message: "server explained the failure" })).toBe("server explained the failure");
+    expect(networkErrorMessage({ code: "NEW_SERVER_CODE" })).toBe("NEW_SERVER_CODE");
+    expect(networkErrorMessage(null)).toBe("Online action failed");
+  });
+
   it("renders the match setup menu first", () => {
     render(<App />);
     expect(screen.getByRole("heading", { name: "Colonizt" })).toBeInTheDocument();
@@ -140,6 +181,9 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "hard" }));
     fireEvent.click(screen.getByLabelText("Dice doubles x2"));
     fireEvent.click(screen.getByLabelText("Plight on turn 20"));
+    fireEvent.click(screen.getByLabelText("Random special card cost"));
+    expect(screen.getByLabelText("Random special card cost")).toBeChecked();
+    fireEvent.click(screen.getByLabelText("Random special card cost"));
     fireEvent.click(screen.getByRole("button", { name: /Bot Match/ }));
 
     expect(screen.getByText("Difficulty hard · Map Standard · Doubles x2 · Plight turn 20")).toBeInTheDocument();
@@ -321,11 +365,35 @@ describe("App", () => {
     expect(screen.getByText("Place setup road")).toBeInTheDocument();
     expect(screen.getByRole("img", { name: /Pending setup settlement at corner/ })).toBeInTheDocument();
 
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByText("Place setup settlement")).toBeInTheDocument();
+
+    fireEvent.click(screen.getAllByRole("button", { name: /Place setup settlement at corner/ })[0]!);
+
     fireEvent.click(screen.getByLabelText("Resource board"));
 
     expect(screen.getByText("Place setup settlement")).toBeInTheDocument();
     expect(screen.queryByRole("img", { name: /Pending setup settlement at corner/ })).not.toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: /Place setup settlement at corner/ }).length).toBeGreaterThan(0);
+
+    const legalVertices = screen.getAllByRole("button", { name: /Place setup settlement at corner/ });
+    fireEvent.click(legalVertices[0]!);
+    fireEvent.click(legalVertices[1]!);
+    expect(screen.getByText("Place setup settlement")).toBeInTheDocument();
+  });
+
+  it("uses the SVG hit regions for pointer setup placement", () => {
+    const { container } = render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: /Bot Match/ }));
+    const vertexHit = container.querySelector<SVGRectElement>(".vertex-target.legal-target .vertex-hit");
+    if (!vertexHit) throw new Error("expected a legal vertex hit region");
+    fireEvent.click(vertexHit);
+    expect(screen.getByText("Place setup road")).toBeInTheDocument();
+
+    const edgeHit = container.querySelector<SVGRectElement>(".edge-build-control .edge-build-target");
+    if (!edgeHit) throw new Error("expected a legal edge hit region");
+    fireEvent.click(edgeHit);
+    expect(screen.getByText("Active: Briar")).toBeInTheDocument();
   });
 
   it("autoplays bot turns without a manual bots button", () => {
@@ -423,6 +491,8 @@ describe("App", () => {
     const sidebar = screen.getByLabelText("Match information and players");
     expect(within(sidebar).queryByLabelText("Development cards")).not.toBeInTheDocument();
     expect(within(sidebar).getByLabelText("Gameplay log")).toBeInTheDocument();
+    fireEvent.click(within(sidebar).getByRole("button", { name: "Details" }));
+    expect(within(sidebar).getByRole("button", { name: "Hide" })).toHaveAttribute("aria-expanded", "true");
   });
 
   it("keeps online room actions out of the information sidebar", async () => {
@@ -450,13 +520,42 @@ describe("App", () => {
     };
     game = withResources(game, "p1", { timber: 1, brick: 1, fiber: 1 });
 
-    await renderOnlineGame(game);
+    const { sentMessages } = await renderOnlineGame(game);
 
     const specialButton = screen.getByRole("button", { name: "Draw special card. Cost: 1 Timber, 1 Brick, 1 Fiber" });
     expect(specialButton).toHaveAttribute("data-tooltip", "Special card cost: 1 Timber, 1 Brick, 1 Fiber");
     expect(specialButton.querySelector(".action-cost-icons .resource-icon-timber")).not.toBeNull();
     expect(specialButton.querySelector(".action-cost-icons .resource-icon-brick")).not.toBeNull();
     expect(specialButton.querySelector(".action-cost-icons .resource-icon-fiber")).not.toBeNull();
+    fireEvent.click(specialButton);
+    await waitFor(() => expect(sentMessages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "COMMAND", command: { type: "BUY_SPECIAL_CARD", playerId: "p1" } }),
+    ])));
+  });
+
+  it("submits settlement and road construction from their explicit board modes", async () => {
+    let game = completeSetup(createDemoGame("web-construction-actions")).state;
+    game.phase = { type: "ACTION_PHASE", activePlayerId: "p1" };
+    game = withResources(game, "p1", { timber: 10, brick: 10, grain: 10, fiber: 10, ore: 10 });
+    let road = getLegalActions(game, "p1").find((action) => action.type === "BUILD_ROAD");
+    for (let index = 0; index < 8 && !getLegalActions(game, "p1").some((action) => action.type === "BUILD_SETTLEMENT"); index += 1) {
+      if (road?.type !== "BUILD_ROAD" || !road.edges[0]) break;
+      game = applyOrThrow(game, { type: "BUILD_ROAD", playerId: "p1", edgeId: road.edges[0] });
+      road = getLegalActions(game, "p1").find((action) => action.type === "BUILD_ROAD");
+    }
+    const { sentMessages } = await renderOnlineGame(game);
+    const actionBar = screen.getByLabelText("Turn actions");
+    const settlementButton = within(actionBar).getByRole("button", { name: "Build settlement" });
+    expect(settlementButton).toBeEnabled();
+    fireEvent.click(settlementButton);
+    fireEvent.click(screen.getAllByRole("button", { name: /Build settlement at corner/ })[0]!);
+    fireEvent.click(within(actionBar).getByRole("button", { name: "Build road" }));
+    fireEvent.click(screen.getAllByRole("button", { name: /Build road here/ })[0]!);
+
+    await waitFor(() => expect(sentMessages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "COMMAND", command: expect.objectContaining({ type: "BUILD_SETTLEMENT" }) }),
+      expect.objectContaining({ type: "COMMAND", command: expect.objectContaining({ type: "BUILD_ROAD" }) }),
+    ])));
   });
 
   it("enables city upgrades before city mode is selected", async () => {
@@ -479,6 +578,34 @@ describe("App", () => {
         command: expect.objectContaining({ type: "UPGRADE_CITY", playerId: "p1" }),
       }),
     ])));
+  });
+
+  it("falls back from stale city and settlement modes after canonical resource changes", async () => {
+    let game = completeSetup(createDemoGame("web-build-mode-fallback")).state;
+    game.phase = { type: "ACTION_PHASE", activePlayerId: "p1" };
+    game = withResources(game, "p1", { timber: 10, brick: 10, grain: 10, fiber: 10, ore: 10 });
+    for (let index = 0; index < 8 && !getLegalActions(game, "p1").some((action) => action.type === "BUILD_SETTLEMENT"); index += 1) {
+      const road = getLegalActions(game, "p1").find((action) => action.type === "BUILD_ROAD");
+      if (road?.type !== "BUILD_ROAD" || !road.edges[0]) break;
+      game = applyOrThrow(game, { type: "BUILD_ROAD", playerId: "p1", edgeId: road.edges[0] });
+    }
+    const { room, sockets } = await renderOnlineGame(game);
+    const socket = sockets[0];
+    if (!socket) throw new Error("expected online socket");
+    const actions = screen.getByLabelText("Turn actions");
+    const roadButton = within(actions).getByRole("button", { name: "Build road" });
+
+    fireEvent.click(within(actions).getByRole("button", { name: "Upgrade city" }));
+    const roadOnly = withResources(game, "p1", { timber: 10, brick: 10, grain: 0, fiber: 0, ore: 0 });
+    act(() => socket.receive({ type: "ROOM_STATE", room: { ...room, game: serializeForViewer(roadOnly, "p1") } }));
+    await waitFor(() => expect(roadButton).toHaveClass("selected"));
+
+    act(() => socket.receive({ type: "ROOM_STATE", room: { ...room, game: serializeForViewer(game, "p1") } }));
+    const settlementButton = within(actions).getByRole("button", { name: "Build settlement" });
+    await waitFor(() => expect(settlementButton).toBeEnabled());
+    fireEvent.click(settlementButton);
+    act(() => socket.receive({ type: "ROOM_STATE", room: { ...room, game: serializeForViewer(roadOnly, "p1") } }));
+    await waitFor(() => expect(roadButton).toHaveClass("selected"));
   });
 
   it("renders settlement houses from ownership when building details are absent", async () => {
@@ -528,9 +655,18 @@ describe("App", () => {
     expect(within(handDevCards).getByRole("button", { name: "Road Building: 0/2 roads" })).toBeInTheDocument();
     expect(within(handDevCards).queryByRole("button", { name: /^e\d+$/ })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getAllByRole("button", { name: /Build road here/ })[0]!);
+    const firstRoad = screen.getAllByRole("button", { name: /Build road here/ })[0]!;
+    fireEvent.click(firstRoad);
     expect(within(handDevCards).getByRole("button", { name: "Road Building: 1/2 roads" })).toBeInTheDocument();
-    fireEvent.click(screen.getAllByRole("button", { name: /Build road here/ })[0]!);
+    const selectedRoad = document.querySelector<SVGElement>(".edge-build-target.selected")?.closest<SVGElement>(".edge-build-control");
+    if (!selectedRoad) throw new Error("expected the selected Road Building edge");
+    fireEvent.click(selectedRoad);
+    expect(within(handDevCards).getByRole("button", { name: "Road Building: 0/2 roads" })).toBeInTheDocument();
+    const refreshedFirstRoad = screen.getAllByRole("button", { name: /Build road here/ })[0]!;
+    fireEvent.click(refreshedFirstRoad);
+    const secondRoad = screen.getAllByRole("button", { name: /Build road here/ }).find((button) => button !== refreshedFirstRoad);
+    if (!secondRoad) throw new Error("expected a second Road Building edge");
+    fireEvent.click(secondRoad);
 
     await waitFor(() => expect(sentMessages).toEqual(expect.arrayContaining([
       expect.objectContaining({
@@ -567,7 +703,7 @@ describe("App", () => {
     game.players.p1!.specialCards = 1;
     game.resourceBank = { ...emptyResources(), timber: 1, brick: 2, grain: 1, fiber: 1, ore: 0 };
 
-    await renderOnlineGame(game);
+    const { sentMessages } = await renderOnlineGame(game);
 
     const handDevCards = screen.getByLabelText("Your development cards in hand");
     fireEvent.click(within(handDevCards).getByRole("button", { name: "Year of Plenty: Ready" }));
@@ -578,6 +714,11 @@ describe("App", () => {
     fireEvent.click(within(overlay).getByRole("button", { name: "Choose Timber as first Year of Plenty resource" }));
     expect(within(overlay).queryByRole("button", { name: "Choose Timber as second Year of Plenty resource" })).not.toBeInTheDocument();
     expect(within(overlay).getByRole("button", { name: "Choose Brick as second Year of Plenty resource" })).toBeInTheDocument();
+    fireEvent.click(within(overlay).getByRole("button", { name: "Choose Brick as second Year of Plenty resource" }));
+    fireEvent.click(within(overlay).getByRole("button", { name: "Take resources" }));
+    await waitFor(() => expect(sentMessages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "COMMAND", command: { type: "PLAY_YEAR_OF_PLENTY", playerId: "p1", cardId: "plenty-card", resources: ["timber", "brick"] } }),
+    ])));
   });
 
   it("uses the board robber chooser for Knight targeting", async () => {
@@ -594,7 +735,10 @@ describe("App", () => {
     expect(screen.queryByRole("button", { name: /Steal from/ })).not.toBeInTheDocument();
     const targetHex = screen.getAllByRole("button", { name: /Select robber destination on/ })[0];
     expect(targetHex).toBeDefined();
-    fireEvent.click(targetHex!);
+    fireEvent.keyDown(targetHex!, { key: "Enter" });
+    fireEvent.click(within(screen.getByLabelText("Choose player to rob")).getByRole("button", { name: "Close robber chooser" }));
+    expect(screen.queryByLabelText("Choose player to rob")).not.toBeInTheDocument();
+    fireEvent.keyDown(targetHex!, { key: "Enter" });
     const chooser = screen.getByLabelText("Choose player to rob");
     fireEvent.click(within(chooser).getAllByRole("button", { name: /Steal from/ })[0]!);
 
@@ -606,12 +750,31 @@ describe("App", () => {
     ])));
   });
 
+  it("moves the robber immediately when no adjacent player has a card to steal", async () => {
+    const game = completeSetup(createDemoGame("web-empty-robber-target")).state;
+    game.phase = { type: "MOVING_THIEF", activePlayerId: "p1", rollerId: "p1" };
+    for (const player of Object.values(game.players)) player.resources = emptyResources();
+    const { sentMessages } = await renderOnlineGame(game);
+
+    const targetHex = screen.getAllByRole("button", { name: /Move robber to/ })[0];
+    if (!targetHex) throw new Error("expected an empty robber destination");
+    fireEvent.click(targetHex);
+
+    expect(screen.queryByLabelText("Choose player to rob")).not.toBeInTheDocument();
+    await waitFor(() => expect(sentMessages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "COMMAND",
+        command: expect.objectContaining({ type: "MOVE_THIEF", playerId: "p1" }),
+      }),
+    ])));
+  });
+
   it("selects discard cards from the hand rack instead of opening trade", async () => {
     const game = completeSetup(createDemoGame("web-discard-hand")).state;
     game.players.p1!.resources = { ...emptyResources(), timber: 8 };
     game.phase = { type: "DISCARDING", activePlayerId: "p1", rollerId: "p2", pending: { p1: 4 }, submitted: {} };
 
-    await renderOnlineGame(game);
+    const { sentMessages } = await renderOnlineGame(game);
 
     expect(screen.getByLabelText("Discard resources")).toBeInTheDocument();
     const discardPanel = screen.getByLabelText("Discard resources");
@@ -622,6 +785,13 @@ describe("App", () => {
     expect(screen.getByText("x1")).toBeInTheDocument();
     expect(within(discardPanel).getByRole("button", { name: "Clear" })).toBeInTheDocument();
     expect(within(discardPanel).queryByRole("button", { name: "+" })).not.toBeInTheDocument();
+    fireEvent.click(within(discardPanel).getByRole("button", { name: "Clear" }));
+    expect(screen.queryByText("x1")).not.toBeInTheDocument();
+    for (let index = 0; index < 4; index += 1) fireEvent.click(screen.getByRole("button", { name: "Select Timber to discard" }));
+    fireEvent.click(within(discardPanel).getByRole("button", { name: "Discard" }));
+    await waitFor(() => expect(sentMessages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "COMMAND", command: expect.objectContaining({ type: "DISCARD_RESOURCES", resources: expect.objectContaining({ timber: 4 }) }) }),
+    ])));
   });
 
   it("lets online offerers finalize staged trades without seeing responder resources", async () => {
@@ -653,6 +823,27 @@ describe("App", () => {
     ])));
   });
 
+  it("lets an online offerer cancel a staged trade", async () => {
+    let game = completeSetup(createDemoGame("web-online-trade-cancel")).state;
+    game = applyOrThrow(game, { type: "ROLL_DICE", playerId: "p1" });
+    game = withResources({ ...game, phase: { type: "ACTION_PHASE", activePlayerId: "p1" } }, "p1", { timber: 1 });
+    game = applyOrThrow(game, {
+      type: "OFFER_TRADE",
+      playerId: "p1",
+      tradeId: "online-cancel",
+      offered: { ...emptyResources(), timber: 1 },
+      requested: { ...emptyResources(), ore: 1 },
+      recipients: "ANY",
+    });
+    const { sentMessages } = await renderOnlineGame(game);
+
+    fireEvent.click(within(screen.getByLabelText("Trade interface")).getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => expect(sentMessages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "COMMAND", command: { type: "CANCEL_TRADE", playerId: "p1", tradeId: "online-cancel" } }),
+    ])));
+  });
+
   it("auto-rolls and auto-ends when phase timers expire", () => {
     vi.useFakeTimers();
     render(<App />);
@@ -673,10 +864,13 @@ describe("App", () => {
   });
 
   it("shows replay only after game over and opens finished replay controls", async () => {
-    const game = completeSetup(createDemoGame("web-finished-replay")).state;
+    const completed = completeSetup(createDemoGame("web-finished-replay"));
+    const game = completed.state;
     game.phase = { type: "GAME_OVER", winnerId: "p1", reason: "VICTORY_POINTS" };
 
-    await renderOnlineGame(game);
+    await renderOnlineGame(game, {
+      replayResponse: () => new Response(JSON.stringify({ config: game.config, board: game.board, events: completed.events }), { status: 200 }),
+    });
 
     expect(screen.getByLabelText("Victory analysis")).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
@@ -691,7 +885,34 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Replay" }));
 
     expect(await screen.findByLabelText("Replay controls")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Live" })).toBeInTheDocument();
+    const eventCount = completed.events.length;
+    fireEvent.click(screen.getByRole("button", { name: "Prev" }));
+    expect(screen.getByText(`${eventCount - 1}/${eventCount}`)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(screen.getByText(`${eventCount}/${eventCount}`)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Live" }));
+    expect(screen.queryByLabelText("Replay controls")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open replay" }));
+    expect(await screen.findByLabelText("Replay controls")).toBeInTheDocument();
+  });
+
+  it("surfaces replay hydration and explicit replay-loading failures", async () => {
+    const game = completeSetup(createDemoGame("web-replay-failure")).state;
+    game.phase = { type: "GAME_OVER", winnerId: "p1", reason: "VICTORY_POINTS" };
+    let replayRequests = 0;
+    await renderOnlineGame(game, {
+      replayResponse: () => {
+        replayRequests += 1;
+        return Promise.reject(new Error("replay request failed"));
+      },
+    });
+
+    await waitFor(() => expect(replayRequests).toBe(1));
+    fireEvent.click(screen.getByRole("button", { name: "Replay" }));
+
+    await waitFor(() => expect(replayRequests).toBe(2));
+    expect(await screen.findByText("replay request failed")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Replay controls")).not.toBeInTheDocument();
   });
 
   it("renders multiplayer lobbies without stale local game state or resync failures", async () => {
@@ -998,6 +1219,75 @@ describe("App", () => {
     ]));
   });
 
+  it("rejects lobby mutations that race with a disconnected socket and still leaves cleanly", async () => {
+    const sentMessages: Array<{ type: string }> = [];
+    const lobbyRoom = {
+      id: "room_race", code: "RACE01", status: "LOBBY", hostUserId: "u_host",
+      settings: { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 4, botDifficulty: "medium", rules: { mapPreset: "standard" } },
+      seats: [
+        { seatIndex: 0, userId: "u_host", displayName: "Host", ready: true, connected: true },
+        { seatIndex: 1, userId: "u_guest", displayName: "Guest", ready: true, connected: true },
+        { seatIndex: 2, botId: "bot_3", displayName: "Bot 3", ready: true, connected: true },
+        { seatIndex: 3, ready: false, connected: false },
+      ],
+      spectatorCount: 0, events: [],
+    };
+    class FakeWebSocket extends EventTarget {
+      static readonly OPEN = 1;
+      static latest: FakeWebSocket | undefined;
+      readyState = FakeWebSocket.OPEN;
+      constructor(readonly url: string) {
+        super();
+        FakeWebSocket.latest = this;
+        queueMicrotask(() => this.dispatchEvent(new Event("open")));
+      }
+      send(payload: string): void {
+        const message = JSON.parse(payload) as { type: string };
+        sentMessages.push(message);
+        if (message.type === "JOIN_ROOM") queueMicrotask(() => this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "ROOM_STATE", room: lobbyRoom }) })));
+      }
+      close(): void {
+        this.readyState = 3;
+        this.dispatchEvent(new Event("close"));
+      }
+    }
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/sessions")) return new Response(JSON.stringify({ token: "s_host", userId: "u_host", displayName: "Host" }), { status: 200 });
+      if (url.endsWith("/rooms")) return new Response(JSON.stringify(lobbyRoom), { status: 200 });
+      if (url.endsWith("/ws-tickets")) return new Response(JSON.stringify({ ticket: "wst_race", expiresAt: "2026-07-16T00:01:00.000Z", ttlMs: 30_000 }), { status: 201 });
+      return new Response("not found", { status: 404 });
+    }));
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: /Player Match/ }));
+    expect(await screen.findByLabelText("Online lobby")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Your name"), { target: { value: "   " } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(screen.getByText("Name cannot be empty")).toBeInTheDocument();
+
+    const socket = FakeWebSocket.latest;
+    if (!socket) throw new Error("expected lobby socket");
+    socket.readyState = 3;
+    fireEvent.change(screen.getByLabelText("Your name"), { target: { value: "Host Again" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    fireEvent.click(screen.getByRole("button", { name: "Unready" }));
+    fireEvent.click(screen.getByRole("button", { name: "Go" }));
+    const bots = within(screen.getByRole("group", { name: "Lobby bots" }));
+    fireEvent.click(bots.getByRole("button", { name: "Add Bot" }));
+    fireEvent.click(bots.getByRole("button", { name: "Remove Bot" }));
+    fireEvent.click(within(screen.getByRole("group", { name: "Lobby map" })).getByRole("button", { name: "Continent" }));
+    expect(screen.getByText("Online room is not connected yet")).toBeInTheDocument();
+    expect(sentMessages.filter((message) => message.type !== "JOIN_ROOM")).toEqual([]);
+
+    socket.readyState = FakeWebSocket.OPEN;
+    fireEvent.click(screen.getByRole("button", { name: "Leave" }));
+    expect(sentMessages).toContainEqual({ type: "LEAVE_ROOM", roomId: "RACE01" });
+    expect(screen.getByLabelText("Match setup")).toBeInTheDocument();
+  });
+
   it("sends host Go for a two-player ready lobby without waiting for all seats", async () => {
     const sentMessages: unknown[] = [];
     const lobbyRoom = {
@@ -1052,10 +1342,328 @@ describe("App", () => {
 
     const go = screen.getByRole("button", { name: "Go" });
     expect(go).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Unready" }));
     fireEvent.click(go);
 
     expect(sentMessages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "READY", roomId: "GO1234", ready: false }),
       expect.objectContaining({ type: "START_ROOM", roomId: "GO1234" }),
     ]));
+  });
+
+  it("applies ordered server events, requests a resync for gaps, and accepts canonical snapshots", async () => {
+    const game = completeSetup(createDemoGame("online-event-stream")).state;
+    const { sentMessages, sockets } = await renderOnlineGame(game);
+    const socket = sockets[0];
+    if (!socket) throw new Error("expected online socket");
+    const rolled = applyCommand(game, { type: "ROLL_DICE", playerId: "p1" });
+    if (!rolled.ok) throw new Error(rolled.error.message);
+
+    act(() => socket.receive({ type: "EVENTS", events: rolled.value.events }));
+    await waitFor(() => expect(screen.getByText("ACTION PHASE")).toBeInTheDocument());
+
+    const lastSeq = rolled.value.events.at(-1)?.seq ?? game.eventSeq;
+    const gapEvent: GameEvent = {
+      schemaVersion: game.schemaVersion,
+      seq: lastSeq + 2,
+      type: "TURN_ENDED",
+      playerId: "p1",
+      nextPlayerId: "p2",
+    };
+    act(() => socket.receive({ type: "EVENTS", events: [gapEvent] }));
+    expect(sentMessages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "RESYNC", roomId: "PLAY01", lastSeq }),
+    ]));
+
+    const canonical = serializeForViewer(rolled.value.nextState, "p1");
+    act(() => socket.receive({ type: "RESYNC", events: [], snapshot: canonical }));
+    await waitFor(() => expect(screen.getByLabelText("Game board and actions")).toBeInTheDocument());
+
+    act(() => socket.receive({ type: "COMMAND_ACK" }));
+    act(() => socket.receive("{"));
+    expect(await screen.findByText("BAD_JSON")).toBeInTheDocument();
+  });
+
+  it("hydrates a finished online replay and closes terminal rooms on server errors", async () => {
+    const game = completeSetup(createDemoGame("online-game-over")).state;
+    const { sockets } = await renderOnlineGame(game);
+    const socket = sockets[0];
+    if (!socket) throw new Error("expected online socket");
+    const gameOver: GameEvent = {
+      schemaVersion: game.schemaVersion,
+      seq: game.eventSeq + 1,
+      type: "GAME_OVER",
+      winnerId: "p1",
+      reason: "VICTORY_POINTS",
+    };
+
+    act(() => socket.receive({ type: "EVENTS", events: [gameOver] }));
+    await waitFor(() => expect(screen.getAllByText("Game over").length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Replay" })).toBeEnabled());
+
+    act(() => socket.receive({ type: "COMMAND_REJECTED", code: "ROOM_CLOSED", message: "closed by server" }));
+    await waitFor(() => expect(screen.getAllByText("Room closed").length).toBeGreaterThan(0));
+  });
+
+  it("surfaces room lookup and online creation failures without entering a stale lobby", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/rooms/EXPIRE")) {
+        return new Response(JSON.stringify({ code: "ROOM_EXPIRED", status: "EXPIRED", cleanupReason: "EMPTY_LOBBY_TTL" }), { status: 404 });
+      }
+      return new Response("not found", { status: 404 });
+    }));
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("Room code"), { target: { value: "expire" } });
+    fireEvent.click(screen.getByRole("button", { name: "Join" }));
+    expect(await screen.findByText("Room expired")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Online lobby")).not.toBeInTheDocument();
+
+    cleanup();
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("unavailable", { status: 503 })));
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: /Player Match/ }));
+    expect(await screen.findByText("Session creation failed")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Online lobby")).not.toBeInTheDocument();
+  });
+
+  it("surfaces a thrown room lookup failure without creating a session", async () => {
+    const fetchSpy = vi.fn(async () => {
+      throw new Error("room lookup transport failed");
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("Room code"), { target: { value: "throw1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Join" }));
+
+    expect(await screen.findByText("room lookup transport failed")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Online lobby")).not.toBeInTheDocument();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("activates, cancels, and submits Monopoly from the development-card rack", async () => {
+    const game = completeSetup(createDemoGame("web-monopoly-choice")).state;
+    game.phase = { type: "ACTION_PHASE", activePlayerId: "p1" };
+    game.players.p1!.developmentCards = [{ id: "monopoly-card", type: "MONOPOLY", ownerId: "p1", boughtTurn: game.turn - 1 }];
+    game.players.p1!.specialCards = 1;
+    const { sentMessages } = await renderOnlineGame(game);
+    const hand = screen.getByLabelText("Your development cards in hand");
+
+    fireEvent.click(within(hand).getByRole("button", { name: "Monopoly: Ready" }));
+    expect(screen.getByLabelText("Monopoly card choice")).toBeInTheDocument();
+    fireEvent.click(within(screen.getByLabelText("Monopoly card choice")).getByRole("button", { name: "Close Monopoly chooser" }));
+    expect(screen.queryByLabelText("Monopoly card choice")).not.toBeInTheDocument();
+
+    fireEvent.click(within(hand).getByRole("button", { name: "Monopoly: Ready" }));
+    fireEvent.click(within(screen.getByLabelText("Monopoly card choice")).getByRole("button", { name: "Choose Ore for Monopoly" }));
+    await waitFor(() => expect(sentMessages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "COMMAND", command: { type: "PLAY_MONOPOLY", playerId: "p1", cardId: "monopoly-card", resource: "ore" } }),
+    ])));
+  });
+
+  it("edits, clears, offers, and submits bank trades from actual resource holdings", async () => {
+    let game = completeSetup(createDemoGame("web-trade-controls")).state;
+    game = withResources(game, "p1", { timber: 6 });
+    game.phase = { type: "ACTION_PHASE", activePlayerId: "p1" };
+    const { sentMessages } = await renderOnlineGame(game);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open trade" }));
+    const panel = screen.getByLabelText("Trade interface");
+    fireEvent.click(within(panel).getByRole("button", { name: "Close trade" }));
+    expect(screen.queryByLabelText("Trade interface")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open trade" }));
+    const reopenedPanel = screen.getByLabelText("Trade interface");
+    fireEvent.click(within(reopenedPanel).getByRole("button", { name: "Offer Timber" }));
+    fireEvent.click(within(reopenedPanel).getByRole("button", { name: "Request Grain" }));
+    const enabledRemoveGrain = within(reopenedPanel).getAllByRole("button", { name: "Remove Grain" })
+      .find((button) => !(button as HTMLButtonElement).disabled);
+    if (!enabledRemoveGrain) throw new Error("expected selected grain to be removable");
+    fireEvent.click(enabledRemoveGrain);
+    fireEvent.click(within(reopenedPanel).getByRole("button", { name: "Request Grain" }));
+    const enabledRemoveTimber = within(reopenedPanel).getAllByRole("button", { name: "Remove Timber" })
+      .find((button) => !(button as HTMLButtonElement).disabled);
+    if (!enabledRemoveTimber) throw new Error("expected selected timber to be removable");
+    fireEvent.click(enabledRemoveTimber);
+    expect(within(reopenedPanel).getByRole("button", { name: "Offer" })).toBeDisabled();
+
+    fireEvent.click(within(reopenedPanel).getByRole("button", { name: "Offer Timber" }));
+    fireEvent.click(within(reopenedPanel).getByRole("button", { name: "Clear" }));
+    expect(within(reopenedPanel).getByRole("button", { name: "Clear" })).toBeDisabled();
+
+    for (let count = 0; count < 4; count += 1) fireEvent.click(within(reopenedPanel).getByRole("button", { name: "Offer Timber" }));
+    fireEvent.click(within(reopenedPanel).getByRole("button", { name: "Request Grain" }));
+    expect(within(reopenedPanel).getByRole("button", { name: "Bank" })).toBeEnabled();
+    fireEvent.click(within(reopenedPanel).getByRole("button", { name: "Bank" }));
+    await waitFor(() => expect(sentMessages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "COMMAND", command: { type: "MARITIME_TRADE", playerId: "p1", offered: "timber", requested: "grain" } }),
+    ])));
+
+    fireEvent.click(screen.getByRole("button", { name: "Open trade" }));
+    const reopened = screen.getByLabelText("Trade interface");
+    fireEvent.click(within(reopened).getByRole("button", { name: "Offer Timber" }));
+    fireEvent.click(within(reopened).getByRole("button", { name: "Request Grain" }));
+    fireEvent.click(within(reopened).getByRole("button", { name: "Offer" }));
+    await waitFor(() => expect(sentMessages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "COMMAND", command: expect.objectContaining({ type: "OFFER_TRADE", playerId: "p1", recipients: "ANY" }) }),
+    ])));
+  });
+
+  it("joins invite links, copies fallback invites, and retries a dropped lobby socket", async () => {
+    const sentMessages: Array<{ type: string }> = [];
+    const sockets: FakeWebSocket[] = [];
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { userAgent: window.navigator.userAgent, maxTouchPoints: 0, clipboard: { writeText } });
+    const lobbyRoom = {
+      id: "room_joined", code: "JOIN01", status: "LOBBY", hostUserId: "host",
+      settings: { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 4, botDifficulty: "medium", rules: { mapPreset: "standard" } },
+      seats: [{ seatIndex: 0, userId: "host", displayName: "Host", ready: false, connected: true }, { seatIndex: 1, userId: "guest", displayName: "Guest", ready: false, connected: true }],
+      spectatorCount: 0, events: [],
+    };
+    class FakeWebSocket extends EventTarget {
+      static readonly OPEN = 1;
+      readyState = FakeWebSocket.OPEN;
+      constructor(readonly url: string) {
+        super();
+        sockets.push(this);
+        queueMicrotask(() => this.dispatchEvent(new Event("open")));
+      }
+      send(payload: string): void {
+        const message = JSON.parse(payload) as { type: string };
+        sentMessages.push(message);
+        if (message.type === "JOIN_ROOM") queueMicrotask(() => this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "ROOM_STATE", room: lobbyRoom }) })));
+      }
+      close(): void {
+        this.readyState = 3;
+        this.dispatchEvent(new Event("close"));
+      }
+    }
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/rooms/JOIN01")) return new Response(JSON.stringify(lobbyRoom), { status: 200 });
+      if (url.endsWith("/sessions")) return new Response(JSON.stringify({ token: "s_guest", userId: "guest", displayName: "Guest" }), { status: 200 });
+      if (url.endsWith("/ws-tickets")) return new Response(JSON.stringify({ ticket: `wst_${sockets.length}`, expiresAt: "2026-07-14T00:01:00.000Z", ttlMs: 30_000 }), { status: 201 });
+      return new Response("not found", { status: 404 });
+    }));
+    window.history.replaceState({}, "", "/?room=join01");
+
+    render(<StrictMode><App /></StrictMode>);
+    expect(await screen.findByLabelText("Online lobby")).toBeInTheDocument();
+    expect(sentMessages).toEqual(expect.arrayContaining([expect.objectContaining({ type: "JOIN_ROOM" })]));
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy Invite" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(`${window.location.origin}/?room=JOIN01`));
+    writeText.mockRejectedValueOnce(new Error("clipboard blocked"));
+    fireEvent.click(screen.getByRole("button", { name: "Copy Invite" }));
+    expect(await screen.findByText(`${window.location.origin}/?room=JOIN01`)).toBeInTheDocument();
+
+    act(() => sockets[0]?.close());
+    const retry = screen.getByRole("button", { name: "Retry" });
+    expect(retry).toBeEnabled();
+    fireEvent.click(retry);
+    await waitFor(() => expect(sockets.length).toBe(2));
+  });
+
+  it("offers a retry when the initial websocket ticket request fails", async () => {
+    const sockets: FakeWebSocket[] = [];
+    let ticketRequests = 0;
+    const lobbyRoom = {
+      id: "room_retry", code: "RETRY1", status: "LOBBY", hostUserId: "host",
+      settings: { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 4, botDifficulty: "medium", rules: { mapPreset: "standard" } },
+      seats: [{ seatIndex: 0, userId: "host", displayName: "Host", ready: false, connected: true }, { seatIndex: 1, ready: false, connected: false }],
+      spectatorCount: 0, events: [],
+    };
+    class FakeWebSocket extends EventTarget {
+      static readonly OPEN = 1;
+      readyState = FakeWebSocket.OPEN;
+      constructor(readonly url: string) {
+        super();
+        sockets.push(this);
+        queueMicrotask(() => this.dispatchEvent(new Event("open")));
+      }
+      send(payload: string): void {
+        const message = JSON.parse(payload) as { type: string };
+        if (message.type === "JOIN_ROOM") queueMicrotask(() => this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "ROOM_STATE", room: lobbyRoom }) })));
+      }
+      close(): void {
+        this.readyState = 3;
+        this.dispatchEvent(new Event("close"));
+      }
+    }
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/rooms/RETRY1")) return new Response(JSON.stringify(lobbyRoom), { status: 200 });
+      if (url.endsWith("/sessions")) return new Response(JSON.stringify({ token: "s_guest", userId: "guest", displayName: "Guest" }), { status: 200 });
+      if (url.endsWith("/ws-tickets")) {
+        ticketRequests += 1;
+        if (ticketRequests === 1) return new Response(JSON.stringify({ code: "UNAVAILABLE" }), { status: 503 });
+        return new Response(JSON.stringify({ ticket: "wst_retry", expiresAt: "2026-07-16T00:01:00.000Z", ttlMs: 30_000 }), { status: 201 });
+      }
+      return new Response("not found", { status: 404 });
+    }));
+    window.history.replaceState({}, "", "/?room=RETRY1");
+
+    render(<App />);
+
+    expect(await screen.findByLabelText("Online lobby")).toBeInTheDocument();
+    const retry = await screen.findByRole("button", { name: "Retry" });
+    expect(screen.getByText("WebSocket ticket creation failed")).toBeInTheDocument();
+    fireEvent.click(retry);
+    await waitFor(() => expect(ticketRequests).toBe(2));
+    await waitFor(() => expect(sockets).toHaveLength(1));
+  });
+
+  it("resumes a saved online room without creating a replacement session", async () => {
+    const sentMessages: Array<{ type: string; roomId?: string }> = [];
+    const savedValues = new Map<string, string>();
+    const resumeStorage = {
+      getItem: (key: string) => savedValues.get(key) ?? null,
+      setItem: (key: string, value: string) => savedValues.set(key, value),
+      removeItem: (key: string) => savedValues.delete(key),
+    };
+    vi.stubGlobal("localStorage", resumeStorage);
+    const lobbyRoom = {
+      id: "room_resumed", code: "RESUME", status: "LOBBY", hostUserId: "u_saved",
+      settings: { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2, maxPlayers: 4, botDifficulty: "medium", rules: { mapPreset: "standard" } },
+      seats: [{ seatIndex: 0, userId: "u_saved", displayName: "Saved", ready: false, connected: true }, { seatIndex: 1, ready: false, connected: false }],
+      spectatorCount: 0, events: [],
+    };
+    class FakeWebSocket extends EventTarget {
+      static readonly OPEN = 1;
+      readyState = FakeWebSocket.OPEN;
+      constructor(readonly url: string) {
+        super();
+        queueMicrotask(() => this.dispatchEvent(new Event("open")));
+      }
+      send(payload: string): void {
+        const message = JSON.parse(payload) as { type: string; roomId?: string };
+        sentMessages.push(message);
+        if (message.type === "JOIN_ROOM") queueMicrotask(() => this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "ROOM_STATE", room: lobbyRoom }) })));
+      }
+      close(): void {
+        this.readyState = 3;
+        this.dispatchEvent(new Event("close"));
+      }
+    }
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/ws-tickets")) return new Response(JSON.stringify({ ticket: "wst_resumed", expiresAt: "2026-07-16T00:01:00.000Z", ttlMs: 30_000 }), { status: 201 });
+      return new Response("unexpected", { status: 500 });
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+    writeResumeState(
+      { token: "s_saved", userId: "u_saved", roomId: lobbyRoom.id, roomCode: lobbyRoom.code, clientSeq: 7, lastSeq: 3 },
+      resumeStorage,
+    );
+    expect(resumeStorage.getItem("colonizt.resume")).not.toBeNull();
+
+    render(<App />);
+
+    expect(await screen.findByLabelText("Online lobby")).toBeInTheDocument();
+    expect(sentMessages).toContainEqual({ type: "JOIN_ROOM", roomId: "RESUME" });
+    expect(fetchSpy.mock.calls.some(([input]) => String(input).endsWith("/sessions"))).toBe(false);
+    expect(screen.getByText("RESUME")).toBeInTheDocument();
   });
 });

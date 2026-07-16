@@ -172,7 +172,7 @@ const chooseCommand = (state: GameState, playerId: PlayerId, options: DemoGameOp
   return bot.chooseCommand(view, (prefix: string) => createBotTradeId(state, playerId, bot.profile) || prefix);
 };
 
-const fallbackCommand = (state: GameState, playerId: PlayerId): GameCommand | undefined => {
+export const chooseFallbackCommand = (state: GameState, playerId: PlayerId): GameCommand | undefined => {
   if (state.phase.type === "DISCARDING") {
     const count = state.phase.pending[playerId] ?? 0;
     return count > 0 ? { type: "DISCARD_RESOURCES", playerId, resources: deterministicDiscard(state, playerId, count) } : undefined;
@@ -209,7 +209,7 @@ export const playBotGame = (seed = "bot-game", maxCommands = 300, options: DemoG
 
   for (let step = 0; step < maxCommands && current.phase.type !== "GAME_OVER"; step += 1) {
     if (!("activePlayerId" in current.phase)) break;
-    let command = chooseCommand(current, current.phase.activePlayerId, options) ?? fallbackCommand(current, current.phase.activePlayerId);
+    let command = chooseCommand(current, current.phase.activePlayerId, options) ?? chooseFallbackCommand(current, current.phase.activePlayerId);
     if (!command) break;
     if (command.type === "PLACE_SETUP") {
       const setupCommand = command;
@@ -220,7 +220,7 @@ export const playBotGame = (seed = "bot-game", maxCommands = 300, options: DemoG
     if (!result.ok) {
       invalidCommands += 1;
       const active = "activePlayerId" in current.phase ? current.phase.activePlayerId : current.playerOrder[0]!;
-      const fallback = fallbackCommand(current, active);
+      const fallback = chooseFallbackCommand(current, active);
       if (!fallback) break;
       const fallbackResult = applyCommand(current, fallback);
       if (!fallbackResult.ok) break;

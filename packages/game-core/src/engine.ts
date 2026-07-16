@@ -1,5 +1,8 @@
 import { createBoardForRules, validateBoard } from "./board.js";
 import { randomIntAt, rollSeededDice, seededShuffle } from "./rng.js";
+import { reduceGameEvent } from "./event-reducer.js";
+import { classicDevelopmentDeck, maxCitiesPerPlayer, maxRoadsPerPlayer, maxSettlementsPerPlayer } from "./game-constants.js";
+import { assertInvariants } from "./invariants.js";
 import {
   addResources,
   emptyResources,
@@ -9,14 +12,11 @@ import {
   resourceBundle,
   cityCost,
   classicResourceBank,
-  classicResourceBankSize,
   defaultSpecialCardCost,
-  normalizedResources,
   randomizedSpecialCardCost,
   roadCost,
   settlementCost,
   specialCardCost,
-  subtractResources,
 } from "./resources.js";
 import {
   resources,
@@ -44,22 +44,11 @@ import {
   type VertexId,
 } from "./types.js";
 
-export const maxRoadsPerPlayer = 15;
-export const maxSettlementsPerPlayer = 5;
-export const maxCitiesPerPlayer = 4;
 export const longestRoadMinimum = 5;
 export const longestRoadBonus = 2;
 export const largestArmyMinimum = 3;
 export const largestArmyBonus = 2;
 const defaultPlightTurn = 20;
-
-export const classicDevelopmentDeck: DevelopmentCardType[] = [
-  ...Array.from({ length: 14 }, () => "KNIGHT" as const),
-  ...Array.from({ length: 5 }, () => "VICTORY_POINT" as const),
-  ...Array.from({ length: 2 }, () => "ROAD_BUILDING" as const),
-  ...Array.from({ length: 2 }, () => "MONOPOLY" as const),
-  ...Array.from({ length: 2 }, () => "YEAR_OF_PLENTY" as const),
-];
 
 export const createDevelopmentDeck = (seed: string): DevelopmentCardType[] =>
   seededShuffle(classicDevelopmentDeck, `${seed}:development-deck:v3`);
@@ -167,18 +156,6 @@ export const projectedResourceBank = (state: Pick<GameState, "players">): Resour
     for (const resource of resources) bank[resource] -= player.resources[resource];
   }
   return bank;
-};
-
-const ensureResourceBank = (state: GameState): void => {
-  state.resourceBank = normalizedResources(state.resourceBank ?? projectedResourceBank(state));
-};
-
-const returnToBank = (state: GameState, bundle: Partial<ResourceBundle>): void => {
-  state.resourceBank = addResources(state.resourceBank, bundle);
-};
-
-const takeFromBank = (state: GameState, bundle: Partial<ResourceBundle>): void => {
-  state.resourceBank = subtractResources(state.resourceBank, normalizedResources(bundle));
 };
 
 const cardVictoryPoints = (player: GameState["players"][PlayerId], includeHidden = true): number =>
@@ -630,9 +607,6 @@ const validateThiefMove = (state: GameState, playerId: PlayerId, hexId: HexId, s
   if (stealFromPlayerId && !eligible.includes(stealFromPlayerId)) return error("INVALID_THIEF_MOVE", "Choose an eligible player to steal from");
   return null;
 };
-
-const normalizeExactBundle = (bundle: Partial<ResourceBundle>): ResourceBundle =>
-  ({ ...emptyResources(), ...bundle });
 
 const closeTradeEvents = (
   state: GameState,
@@ -1203,295 +1177,17 @@ export const validateCommand = (state: GameState, command: GameCommand): Validat
 export const applyEvents = (state: GameState, events: readonly GameEvent[]): GameState =>
   events.reduce((current, event) => applyEvent(current, event), state);
 
-export const applyEvent = (state: GameState, event: GameEvent): GameState => {
-  const next = cloneState(state);
-  next.developmentDeck ??= createDevelopmentDeck(next.config.seed);
-  next.developmentDeckCursor ??= 0;
-  next.playedKnightCounts ??= {};
-  ensureResourceBank(next);
-  for (const player of Object.values(next.players)) {
-    player.developmentCards ??= [];
-    player.playedKnights ??= next.playedKnightCounts[player.id] ?? 0;
-    player.hasLargestArmy ??= next.largestArmyOwner === player.id;
-    player.specialCards = normalizedCardCount(player);
-  }
-  next.eventSeq = Math.max(next.eventSeq, event.seq);
-  switch (event.type) {
-    case "SETUP_PLACED": {
-      next.settlements[event.vertexId] = event.playerId;
-      next.buildings[event.vertexId] = { owner: event.playerId, type: "settlement" };
-      next.roads[event.edgeId] = event.playerId;
-      next.players[event.playerId]!.resources = addResources(next.players[event.playerId]!.resources, event.startingResources);
-      takeFromBank(next, event.startingResources);
-      next.players[event.playerId]!.score += 1;
-      refreshLongestRoad(next);
-      const setupIndex = next.phase.type === "SETUP_PLACEMENT" ? next.phase.setupIndex + 1 : 0;
-      const nextPlayer = setupOrder(next.playerOrder)[setupIndex];
-      next.phase = nextPlayer
-        ? { type: "SETUP_PLACEMENT", activePlayerId: nextPlayer, setupIndex }
-        : { type: "WAITING_FOR_ROLL", activePlayerId: next.playerOrder[0] as PlayerId };
-      break;
-    }
-    case "DICE_ROLLED":
-      next.rng.index = event.rngIndex + 2;
-      next.lastRoll = { dice: event.dice, sum: event.sum, ...(event.doublesMultiplier ? { doublesMultiplier: event.doublesMultiplier } : {}) };
-      next.phase = { type: "ACTION_PHASE", activePlayerId: event.playerId };
-      break;
-    case "SEVEN_ROLLED":
-      next.phase = { type: "MOVING_THIEF", activePlayerId: event.playerId, rollerId: event.playerId, reason: "ROLL_7" };
-      break;
-    case "DISCARD_REQUIRED": {
-      const activeDiscarder = nextPendingDiscardPlayer(event.pending, {});
-      next.phase = {
-        type: "DISCARDING",
-        activePlayerId: activeDiscarder ?? event.rollerId,
-        rollerId: event.rollerId,
-        pending: event.pending,
-        submitted: {},
-      };
-      break;
-    }
-    case "RESOURCES_DISCARDED": {
-      next.players[event.playerId]!.resources = subtractResources(next.players[event.playerId]!.resources, event.resources);
-      returnToBank(next, event.resources);
-      if (next.phase.type === "DISCARDING") {
-        const submitted = { ...next.phase.submitted, [event.playerId]: event.resources };
-        const activeDiscarder = nextPendingDiscardPlayer(next.phase.pending, submitted);
-        next.phase = activeDiscarder
-          ? { ...next.phase, activePlayerId: activeDiscarder, submitted }
-          : { type: "MOVING_THIEF", activePlayerId: next.phase.rollerId, rollerId: next.phase.rollerId, reason: "ROLL_7" };
-      }
-      break;
-    }
-    case "THIEF_MOVED":
-      next.thiefHexId = event.toHexId;
-      if (event.stealFromPlayerId && event.stolenResource) {
-        next.players[event.stealFromPlayerId]!.resources = subtractResources(next.players[event.stealFromPlayerId]!.resources, resourceBundle(event.stolenResource, 1));
-        next.players[event.playerId]!.resources = addResources(next.players[event.playerId]!.resources, resourceBundle(event.stolenResource, 1));
-      }
-      if (event.reason === "ROLL_7") {
-        next.phase = { type: "ACTION_PHASE", activePlayerId: event.playerId };
-      }
-      break;
-    case "RESOURCES_PRODUCED":
-      for (const [playerId, gains] of Object.entries(event.gains)) {
-        next.players[playerId]!.resources = addResources(next.players[playerId]!.resources, gains);
-        takeFromBank(next, gains);
-      }
-      break;
-    case "ROAD_BUILT":
-      next.roads[event.edgeId] = event.playerId;
-      next.players[event.playerId]!.resources = subtractResources(next.players[event.playerId]!.resources, event.cost);
-      returnToBank(next, event.cost);
-      refreshLongestRoad(next);
-      break;
-    case "SETTLEMENT_BUILT":
-      next.settlements[event.vertexId] = event.playerId;
-      next.buildings[event.vertexId] = { owner: event.playerId, type: "settlement" };
-      next.players[event.playerId]!.resources = subtractResources(next.players[event.playerId]!.resources, event.cost);
-      returnToBank(next, event.cost);
-      next.players[event.playerId]!.score += 1;
-      refreshLongestRoad(next);
-      break;
-    case "CITY_UPGRADED":
-      next.buildings[event.vertexId] = { owner: event.playerId, type: "city" };
-      next.settlements[event.vertexId] = event.playerId;
-      next.players[event.playerId]!.resources = subtractResources(next.players[event.playerId]!.resources, event.cost);
-      returnToBank(next, event.cost);
-      next.players[event.playerId]!.score += 1;
-      break;
-    case "SPECIAL_CARD_BOUGHT":
-      next.players[event.playerId]!.resources = subtractResources(next.players[event.playerId]!.resources, event.cost);
-      returnToBank(next, event.cost);
-      if (event.cardId && event.cardType) {
-        next.players[event.playerId]!.developmentCards = [
-          ...(next.players[event.playerId]!.developmentCards ?? []),
-          {
-            id: event.cardId,
-            type: event.cardType,
-            ownerId: event.playerId,
-            boughtTurn: next.turn,
-            ...(event.cardType === "VICTORY_POINT" && next.phase.type === "GAME_OVER" ? { revealed: true } : {}),
-          },
-        ];
-        next.developmentDeckCursor = Math.max(next.developmentDeckCursor, (event.deckIndex ?? next.developmentDeckCursor) + 1);
-        next.players[event.playerId]!.specialCards = normalizedCardCount(next.players[event.playerId]!);
-      } else {
-        next.players[event.playerId]!.specialCards += 1;
-      }
-      break;
-    case "DEVELOPMENT_CARD_PLAYED": {
-      const player = next.players[event.playerId]!;
-      const card = player.developmentCards.find((candidate) => candidate.id === event.cardId);
-      if (card) {
-        card.playedTurn = next.turn;
-        card.revealed = true;
-      }
-      player.playedDevelopmentCardTurn = next.turn;
-      if (event.cardType === "KNIGHT") {
-        player.playedKnights += 1;
-        next.playedKnightCounts[event.playerId] = (next.playedKnightCounts[event.playerId] ?? 0) + 1;
-      }
-      player.specialCards = normalizedCardCount(player);
-      break;
-    }
-    case "ROAD_BUILDING_PLAYED":
-      break;
-    case "MONOPOLY_PLAYED": {
-      const total = Object.entries(event.collected).reduce((sum, [, count]) => sum + count, 0);
-      for (const [playerId, count] of Object.entries(event.collected)) {
-        next.players[playerId]!.resources = subtractResources(next.players[playerId]!.resources, resourceBundle(event.resource, count));
-      }
-      next.players[event.playerId]!.resources = addResources(next.players[event.playerId]!.resources, resourceBundle(event.resource, total));
-      break;
-    }
-    case "YEAR_OF_PLENTY_PLAYED": {
-      const gained = event.resources.reduce<ResourceBundle>((bundle, resource) => addResources(bundle, resourceBundle(resource, 1)), emptyResources());
-      next.players[event.playerId]!.resources = addResources(next.players[event.playerId]!.resources, gained);
-      takeFromBank(next, gained);
-      break;
-    }
-    case "LARGEST_ARMY_UPDATED":
-      refreshLargestArmy(next);
-      break;
-    case "LONGEST_ROAD_UPDATED":
-      break;
-    case "MARITIME_TRADED":
-      next.players[event.playerId]!.resources = subtractResources(next.players[event.playerId]!.resources, resourceBundle(event.offered, event.ratio));
-      returnToBank(next, resourceBundle(event.offered, event.ratio));
-      next.players[event.playerId]!.resources = addResources(next.players[event.playerId]!.resources, resourceBundle(event.requested, 1));
-      takeFromBank(next, resourceBundle(event.requested, 1));
-      break;
-    case "TRADE_OFFERED":
-      next.trades[event.trade.id] = event.trade;
-      break;
-    case "TRADE_CANCELLED":
-      next.trades[event.tradeId]!.status = "CANCELLED";
-      break;
-    case "TRADE_RESPONSE_RECORDED": {
-      const trade = next.trades[event.tradeId];
-      if (!trade || !event.playerId || !event.response) break;
-      trade.responses = trade.responses ?? initialTradeResponses(next, trade);
-      trade.responses[event.playerId] = { playerId: event.playerId, status: event.response, respondedAtSeq: event.seq };
-      break;
-    }
-    case "TRADE_REJECTED":
-      next.trades[event.tradeId]!.status = "REJECTED";
-      break;
-    case "TRADE_ACCEPTED":
-      next.players[event.fromPlayerId]!.resources = subtractResources(next.players[event.fromPlayerId]!.resources, event.offered);
-      next.players[event.toPlayerId]!.resources = addResources(next.players[event.toPlayerId]!.resources, event.offered);
-      next.players[event.toPlayerId]!.resources = subtractResources(next.players[event.toPlayerId]!.resources, event.requested);
-      next.players[event.fromPlayerId]!.resources = addResources(next.players[event.fromPlayerId]!.resources, event.requested);
-      next.trades[event.tradeId]!.status = "ACCEPTED";
-      break;
-    case "TRADE_EXPIRED":
-      next.trades[event.tradeId]!.status = "EXPIRED";
-      break;
-    case "TRADE_CLOSED":
-      next.trades[event.tradeId]!.status = "CLOSED";
-      next.trades[event.tradeId]!.closedReason = event.reason;
-      break;
-    case "PLIGHT_STRUCK":
-      next.plightApplied = true;
-      for (const destroyed of event.destroyed) {
-        delete next.settlements[destroyed.vertexId];
-        delete next.buildings[destroyed.vertexId];
-        next.players[destroyed.playerId]!.score = Math.max(0, next.players[destroyed.playerId]!.score - (destroyed.buildingType === "city" ? 2 : 1));
-      }
-      refreshLongestRoad(next);
-      break;
-    case "TURN_ENDED":
-      next.turn += 1;
-      next.phase = { type: "WAITING_FOR_ROLL", activePlayerId: event.nextPlayerId };
-      break;
-    case "GAME_OVER":
-      for (const player of Object.values(next.players)) {
-        for (const card of player.developmentCards ?? []) {
-          if (card.type === "VICTORY_POINT") card.revealed = true;
-        }
-        player.specialCards = normalizedCardCount(player);
-      }
-      next.phase = { type: "GAME_OVER", winnerId: event.winnerId, reason: event.reason };
-      break;
-  }
-  return next;
-};
+export const applyEvent = (state: GameState, event: GameEvent): GameState =>
+  reduceGameEvent(state, event, {
+    createDevelopmentDeck,
+    normalizedCardCount,
+    refreshLargestArmy,
+    refreshLongestRoad,
+    setupOrder,
+    nextPendingDiscardPlayer,
+    initialTradeResponses,
+  });
 
-export const assertInvariants = (state: GameState): Result<true, ValidationError> => {
-  const boardErrors = validateBoard(state.board);
-  if (boardErrors.length > 0) return { ok: false, error: error("INVALID_BOARD", boardErrors.join("; ")) };
-  if (state.thiefHexId && !state.board.hexes[state.thiefHexId]) return { ok: false, error: error("INVARIANT_VIOLATION", "thief is on an unknown hex") };
-  if (!isNonNegativeBundle(state.resourceBank ?? emptyResources())) return { ok: false, error: error("INVARIANT_VIOLATION", "bank has negative resources") };
-  const seenCards = new Set<DevelopmentCardId>();
-  for (const player of Object.values(state.players)) {
-    if (!isNonNegativeBundle(player.resources)) return { ok: false, error: error("INVARIANT_VIOLATION", `${player.id} has negative resources`) };
-    if (!Number.isInteger(player.specialCards) || player.specialCards < 0) return { ok: false, error: error("INVARIANT_VIOLATION", `${player.id} has invalid special cards`) };
-    if (!Array.isArray(player.developmentCards)) return { ok: false, error: error("INVARIANT_VIOLATION", `${player.id} has invalid development cards`) };
-    for (const card of player.developmentCards) {
-      if (seenCards.has(card.id)) return { ok: false, error: error("INVARIANT_VIOLATION", `duplicate development card ${card.id}`) };
-      seenCards.add(card.id);
-      if (card.ownerId !== player.id) return { ok: false, error: error("INVARIANT_VIOLATION", `development card ${card.id} owner mismatch`) };
-      if (!classicDevelopmentDeck.includes(card.type)) return { ok: false, error: error("INVARIANT_VIOLATION", `development card ${card.id} has invalid type`) };
-    }
-    if (player.score < 0) return { ok: false, error: error("INVARIANT_VIOLATION", `${player.id} has negative score`) };
-  }
-  for (const [edgeId, playerId] of Object.entries(state.roads)) {
-    if (!state.board.edges[edgeId]) return { ok: false, error: error("INVARIANT_VIOLATION", `road on unknown edge ${edgeId}`) };
-    if (!state.players[playerId]) return { ok: false, error: error("INVARIANT_VIOLATION", `road owned by unknown player ${playerId}`) };
-  }
-  for (const [vertexId, playerId] of Object.entries(state.settlements)) {
-    if (!state.board.vertices[vertexId]) return { ok: false, error: error("INVARIANT_VIOLATION", `settlement on unknown vertex ${vertexId}`) };
-    if (!state.players[playerId]) return { ok: false, error: error("INVARIANT_VIOLATION", `settlement owned by unknown player ${playerId}`) };
-    const building = state.buildings[vertexId];
-    if (!building || building.owner !== playerId) return { ok: false, error: error("INVARIANT_VIOLATION", `building state missing for ${vertexId}`) };
-    for (const neighbor of adjacentVertices(state, vertexId as VertexId)) {
-      if (state.settlements[neighbor]) return { ok: false, error: error("INVARIANT_VIOLATION", `settlement distance violation at ${vertexId}`) };
-    }
-  }
-  for (const [vertexId, building] of Object.entries(state.buildings)) {
-    if (!state.board.vertices[vertexId]) return { ok: false, error: error("INVARIANT_VIOLATION", `building on unknown vertex ${vertexId}`) };
-    if (!state.players[building.owner]) return { ok: false, error: error("INVARIANT_VIOLATION", `building owned by unknown player ${building.owner}`) };
-    if (state.settlements[vertexId] !== building.owner) return { ok: false, error: error("INVARIANT_VIOLATION", `settlement owner mismatch at ${vertexId}`) };
-  }
-  for (const trade of Object.values(state.trades)) {
-    if (!state.players[trade.fromPlayerId]) return { ok: false, error: error("INVARIANT_VIOLATION", `trade owned by unknown player ${trade.fromPlayerId}`) };
-    if (trade.status !== "COLLECTING_RESPONSES") continue;
-    const recipients = tradeRecipientIds(state, trade);
-    const responseIds = Object.keys(trade.responses ?? {});
-    if (responseIds.length !== recipients.length || recipients.some((playerId) => !trade.responses?.[playerId])) {
-      return { ok: false, error: error("INVARIANT_VIOLATION", `trade ${trade.id} has invalid response entries`) };
-    }
-    for (const response of Object.values(trade.responses ?? {})) {
-      if (!recipients.includes(response.playerId)) return { ok: false, error: error("INVARIANT_VIOLATION", `trade ${trade.id} has an invalid responder`) };
-      if (response.status !== "PENDING" && response.status !== "WANTS_ACCEPT" && response.status !== "REJECTED") {
-        return { ok: false, error: error("INVARIANT_VIOLATION", `trade ${trade.id} has invalid response status`) };
-      }
-    }
-  }
-  for (const playerId of state.playerOrder) {
-    if (countRoads(state, playerId) > maxRoadsPerPlayer) return { ok: false, error: error("INVARIANT_VIOLATION", `${playerId} has too many roads`) };
-    if (countBuildings(state, playerId, "settlement") > maxSettlementsPerPlayer) return { ok: false, error: error("INVARIANT_VIOLATION", `${playerId} has too many settlements`) };
-    if (countBuildings(state, playerId, "city") > maxCitiesPerPlayer) return { ok: false, error: error("INVARIANT_VIOLATION", `${playerId} has too many cities`) };
-  }
-  for (const resource of resources) {
-    const held = Object.values(state.players).reduce((sum, player) => sum + player.resources[resource], 0);
-    if (held + (state.resourceBank?.[resource] ?? 0) !== classicResourceBankSize) {
-      return { ok: false, error: error("INVARIANT_VIOLATION", `${resource} bank accounting mismatch`) };
-    }
-  }
-  if (state.phase.type === "DISCARDING") {
-    for (const [playerId, count] of Object.entries(state.phase.pending)) {
-      if (!state.players[playerId] || count <= 0) return { ok: false, error: error("INVARIANT_VIOLATION", "invalid discard pending entry") };
-      const submitted = state.phase.submitted[playerId];
-      if (submitted && resourceCount(normalizeExactBundle(submitted)) !== count) return { ok: false, error: error("INVARIANT_VIOLATION", "invalid discard submission") };
-    }
-  }
-  if (state.phase.type === "GAME_OVER" && state.phase.reason !== "TURN_LIMIT" && trueVictoryPoints(state, state.phase.winnerId) < state.config.victoryPoints) {
-    return { ok: false, error: error("INVARIANT_VIOLATION", "game over before victory threshold") };
-  }
-  return { ok: true, value: true };
-};
 
 export const getLegalActions = (state: GameState, playerId: PlayerId): LegalAction[] => {
   if (!state.players[playerId] || state.phase.type === "GAME_OVER") return [];

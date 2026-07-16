@@ -1,5 +1,7 @@
 export * from "./board.js";
 export * from "./engine.js";
+export * from "./game-constants.js";
+export * from "./invariants.js";
 export * from "./replay.js";
 export * from "./resources.js";
 export * from "./rng.js";

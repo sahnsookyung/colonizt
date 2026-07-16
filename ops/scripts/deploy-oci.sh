@@ -10,6 +10,7 @@ CADDY_SITES_DIR="${JOBSCOUT_ROOT}/ops/caddy/sites"
 CADDY_IMPORT_LINE="import /etc/caddy/sites/*.Caddyfile"
 GHCR_USER="${GHCR_USER:-sahnsookyung}"
 GHCR_PAT="${COLONIZT_GHCR_SECRET:-${JOBSCOUT_IMAGE_GHCR_PAT:-${GHCR_PAT:-}}}"
+SSH_KNOWN_HOSTS_FILE="${COLONIZT_SSH_KNOWN_HOSTS_FILE:-${HOME}/.ssh/known_hosts}"
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ENV_FILE="${COLONIZT_ENV_FILE:-$REPO_ROOT/.env}"
@@ -21,9 +22,17 @@ CADDY_ROOT_BACKUP="${JOBSCOUT_ROOT}/ops/caddy/Caddyfile.pre-colonizt.${DEPLOY_ST
 CADDY_SITE_BACKUP="${CADDY_SITES_DIR}/colonizt.Caddyfile.pre-colonizt.${DEPLOY_STAMP}"
 CADDY_SITE_EMPTY_MARKER="${CADDY_SITES_DIR}/colonizt.Caddyfile.pre-colonizt.${DEPLOY_STAMP}.empty"
 CADDY_SITE_INSTALL="install -m 0644"
+APP_ROLLBACK_ROOT="${REMOTE_ROOT}/deploy/rollback-${DEPLOY_STAMP}"
+APP_ENV_BACKUP="${APP_ROLLBACK_ROOT}/colonizt.env"
+APP_ENV_EMPTY_MARKER="${APP_ROLLBACK_ROOT}/colonizt.env.empty"
+APP_COMPOSE_BACKUP="${APP_ROLLBACK_ROOT}/docker-compose.oci.yml"
+APP_COMPOSE_EMPTY_MARKER="${APP_ROLLBACK_ROOT}/docker-compose.oci.yml.empty"
+STAGING_CREATED=0
+APP_CONFIG_TOUCHED=0
+CADDY_CONFIG_TOUCHED=0
 
-SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${REMOTE_USER}@${SERVER_IP}")
-SCP=(scp -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=${SSH_KNOWN_HOSTS_FILE}" "${REMOTE_USER}@${SERVER_IP}")
+SCP=(scp -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=${SSH_KNOWN_HOSTS_FILE}")
 
 fail() {
   echo "ERROR: $*" >&2
@@ -40,6 +49,37 @@ restore_caddy_config() {
   remote "if [ -f ${CADDY_SITE_EMPTY_MARKER} ]; then sudo rm -f ${CADDY_SITES_DIR}/colonizt.Caddyfile ${CADDY_SITE_EMPTY_MARKER}; elif [ -f ${CADDY_SITE_BACKUP} ]; then sudo cp ${CADDY_SITE_BACKUP} ${CADDY_SITES_DIR}/colonizt.Caddyfile; fi" || true
   remote "sudo docker exec jobscout-cloud-caddy caddy reload --config /etc/caddy/Caddyfile" || true
 }
+
+restore_application_stack() {
+  echo "==> Restoring previous Colonizt compose configuration and stack" >&2
+  remote "if sudo test -f ${REMOTE_ROOT}/deploy/compose/.env && sudo test -f ${REMOTE_ROOT}/deploy/compose/docker-compose.oci.yml; then cd ${REMOTE_ROOT}/deploy/compose && sudo docker compose --env-file .env -f docker-compose.oci.yml down --remove-orphans; fi" || true
+  remote "if sudo test -f ${APP_ENV_EMPTY_MARKER}; then sudo rm -f ${REMOTE_ROOT}/deploy/compose/.env; elif sudo test -f ${APP_ENV_BACKUP}; then sudo install -m 0600 ${APP_ENV_BACKUP} ${REMOTE_ROOT}/deploy/compose/.env; fi" || true
+  remote "if sudo test -f ${APP_COMPOSE_EMPTY_MARKER}; then sudo rm -f ${REMOTE_ROOT}/deploy/compose/docker-compose.oci.yml; elif sudo test -f ${APP_COMPOSE_BACKUP}; then sudo install -m 0644 ${APP_COMPOSE_BACKUP} ${REMOTE_ROOT}/deploy/compose/docker-compose.oci.yml; fi" || true
+  remote "if sudo test -f ${REMOTE_ROOT}/deploy/compose/.env && sudo test -f ${REMOTE_ROOT}/deploy/compose/docker-compose.oci.yml; then cd ${REMOTE_ROOT}/deploy/compose && sudo docker compose --env-file .env -f docker-compose.oci.yml config --quiet && sudo docker compose --env-file .env -f docker-compose.oci.yml up -d --remove-orphans; fi" || true
+}
+
+on_exit() {
+  local status=$?
+  trap - EXIT
+  set +e
+  if (( status != 0 )); then
+    if (( APP_CONFIG_TOUCHED == 1 )); then
+      restore_application_stack
+    fi
+    if (( CADDY_CONFIG_TOUCHED == 1 )); then
+      restore_caddy_config
+    fi
+  fi
+  if (( STAGING_CREATED == 1 )); then
+    remote "rm -rf ${REMOTE_STAGING}" || true
+  fi
+  if (( status == 0 )); then
+    remote "sudo rm -rf ${APP_ROLLBACK_ROOT}" || true
+  fi
+  exit "$status"
+}
+
+trap on_exit EXIT
 
 verify_origin_endpoints_once() {
   curl -fsS --resolve "jobscout.sookyungahn.com:443:${SERVER_IP}" "https://jobscout.sookyungahn.com/" >/dev/null
@@ -70,6 +110,7 @@ fi
 [[ -f "$ENV_FILE" ]] || fail "$ENV_FILE not found"
 [[ -f "$COMPOSE_FILE" ]] || fail "$COMPOSE_FILE not found"
 [[ -f "$CADDY_SITE_FILE" ]] || fail "$CADDY_SITE_FILE not found"
+[[ -s "$SSH_KNOWN_HOSTS_FILE" ]] || fail "$SSH_KNOWN_HOSTS_FILE is missing or empty; pin the production SSH host key before deploying"
 
 echo "==> Preflight: JobScout public route before Colonizt deploy"
 curl -fsS --resolve "jobscout.sookyungahn.com:443:${SERVER_IP}" "https://jobscout.sookyungahn.com/" >/dev/null
@@ -86,11 +127,18 @@ fi
 echo "==> Preparing remote Colonizt directories"
 remote "sudo mkdir -p ${REMOTE_ROOT}/deploy/compose ${REMOTE_ROOT}/ops/caddy ${REMOTE_ROOT}/data/postgres ${CADDY_SITES_DIR}"
 remote "sudo rm -rf ${REMOTE_STAGING} && mkdir -p ${REMOTE_STAGING}"
+STAGING_CREATED=1
+
+echo "==> Capturing rollback configuration"
+remote "sudo rm -rf ${APP_ROLLBACK_ROOT} && sudo mkdir -p ${APP_ROLLBACK_ROOT}"
+remote "if sudo test -f ${REMOTE_ROOT}/deploy/compose/.env; then sudo cp ${REMOTE_ROOT}/deploy/compose/.env ${APP_ENV_BACKUP}; else sudo touch ${APP_ENV_EMPTY_MARKER}; fi"
+remote "if sudo test -f ${REMOTE_ROOT}/deploy/compose/docker-compose.oci.yml; then sudo cp ${REMOTE_ROOT}/deploy/compose/docker-compose.oci.yml ${APP_COMPOSE_BACKUP}; else sudo touch ${APP_COMPOSE_EMPTY_MARKER}; fi"
 
 echo "==> Syncing Colonizt compose and env"
 "${SCP[@]}" "$ENV_FILE" "${REMOTE_USER}@${SERVER_IP}:${REMOTE_STAGING}/.env"
 "${SCP[@]}" "$COMPOSE_FILE" "${REMOTE_USER}@${SERVER_IP}:${REMOTE_STAGING}/docker-compose.oci.yml"
 "${SCP[@]}" "$CADDY_SITE_FILE" "${REMOTE_USER}@${SERVER_IP}:${REMOTE_STAGING}/colonizt.Caddyfile"
+APP_CONFIG_TOUCHED=1
 remote "sudo install -m 0600 ${REMOTE_STAGING}/.env ${REMOTE_ROOT}/deploy/compose/.env"
 remote "sudo install -m 0644 ${REMOTE_STAGING}/docker-compose.oci.yml ${REMOTE_ROOT}/deploy/compose/docker-compose.oci.yml"
 remote "sudo install -m 0644 ${REMOTE_STAGING}/colonizt.Caddyfile ${REMOTE_ROOT}/ops/caddy/colonizt.Caddyfile"
@@ -116,24 +164,21 @@ remote "cd ${REMOTE_ROOT}/deploy/compose && sudo docker compose --env-file .env 
 echo "==> Installing Colonizt Caddy site without changing JobScout routes"
 remote "sudo cp ${JOBSCOUT_ROOT}/ops/caddy/Caddyfile ${CADDY_ROOT_BACKUP}"
 remote "if [ -f ${CADDY_SITES_DIR}/colonizt.Caddyfile ]; then sudo cp ${CADDY_SITES_DIR}/colonizt.Caddyfile ${CADDY_SITE_BACKUP}; else sudo touch ${CADDY_SITE_EMPTY_MARKER}; fi"
+CADDY_CONFIG_TOUCHED=1
 remote "sudo ${CADDY_SITE_INSTALL} ${REMOTE_STAGING}/colonizt.Caddyfile ${CADDY_SITES_DIR}/colonizt.Caddyfile"
 remote "tmp=\$(mktemp); sudo awk 'BEGIN{skip=0} /# BEGIN COLONIZT SITE/{skip=1; next} /# END COLONIZT SITE/{skip=0; next} !skip{print}' ${JOBSCOUT_ROOT}/ops/caddy/Caddyfile > \"\$tmp\" && sudo install -m 0644 \"\$tmp\" ${JOBSCOUT_ROOT}/ops/caddy/Caddyfile; rm -f \"\$tmp\""
 remote "if ! sudo grep -Fxq '${CADDY_IMPORT_LINE}' ${JOBSCOUT_ROOT}/ops/caddy/Caddyfile; then printf '\n# Colocated apps own snippets under /etc/caddy/sites. Keep this import stable so\n# deploys do not rewrite app-owned routes or Caddy certificate storage.\n${CADDY_IMPORT_LINE}\n' | sudo tee -a ${JOBSCOUT_ROOT}/ops/caddy/Caddyfile >/dev/null; fi"
 if ! remote "sudo docker exec jobscout-cloud-caddy caddy validate --config /etc/caddy/Caddyfile"; then
-  restore_caddy_config
   fail "Caddy validation failed"
 fi
 if ! remote "sudo docker exec jobscout-cloud-caddy caddy reload --config /etc/caddy/Caddyfile"; then
-  restore_caddy_config
   fail "Caddy reload failed"
 fi
 
 echo "==> Verifying origin endpoints"
 if ! verify_origin_endpoints; then
-  restore_caddy_config
   fail "Endpoint verification failed"
 fi
 
 remote "sudo rm -f ${CADDY_ROOT_BACKUP} ${CADDY_SITE_BACKUP} ${CADDY_SITE_EMPTY_MARKER}"
-remote "rm -rf ${REMOTE_STAGING}"
 echo "Colonizt deployed successfully at https://colonizt.sookyungahn.com"

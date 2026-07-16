@@ -31,7 +31,7 @@ export const PlayerStatsList = ({
       return (
         <article key={player.id} className={`player ${player.id === activePlayerId ? "active" : ""} ${isBot ? "bot-player" : "human-player"}`} style={{ borderColor: player.color }}>
           <div className="player-heading">
-            <span className="player-kind" style={{ color: player.color }} aria-label={isBot ? `${player.name} is a bot` : `${player.name} is a player`}>
+            <span className="player-kind" style={{ color: player.color }} role="img" aria-label={isBot ? `${player.name} is a bot` : `${player.name} is a player`}>
               {isBot ? <BotSymbol /> : <HumanSymbol />}
             </span>
             <strong>{player.name}</strong>

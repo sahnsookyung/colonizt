@@ -74,4 +74,33 @@ describe("stored runtime validation", () => {
 
     expect(() => validateStoredCommandResult(result)).toThrow(/expected contiguous event seq 2/);
   });
+
+  it("rejects unknown event types in stored command results", () => {
+    const result = {
+      roomId: "room_valid",
+      matchId: "match_valid",
+      userId: "u_host",
+      clientSeq: 1,
+      commandHash: "hash",
+      ok: true,
+      events: [{ schemaVersion: 3, seq: 1, type: "UNKNOWN_EVENT" }],
+    } as unknown as StoredCommandResult;
+
+    expect(() => validateStoredCommandResult(result)).toThrow(/event payload is invalid/);
+  });
+
+  it("rejects malformed events in stored room replay logs", () => {
+    const state = {
+      ...validStoredRoom(),
+      status: "IN_GAME",
+      match: {
+        id: "match_valid",
+        config: {},
+        board: {},
+        events: [{ schemaVersion: 3, seq: 1, type: "TURN_ENDED", playerId: "u_host" }],
+      },
+    } as unknown as StoredRoomRecord;
+
+    expect(() => validateStoredRoomRecord(state)).toThrow(/event payload is invalid/);
+  });
 });

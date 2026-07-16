@@ -18,6 +18,10 @@
     "test:property": "vitest run packages/game-core/tests/property.test.ts",
     "test:integration": "vitest run packages/server packages/db",
     "test:e2e": "playwright test",
+    "test:a11y": "playwright test packages/web/tests/accessibility.spec.ts",
+    "test:multiplayer": "LOCAL_MULTIPLAYER=true playwright test --config=playwright.multiplayer.config.ts",
+    "test:mutation": "stryker run",
+    "test:mutation:dry": "stryker run --dryRunOnly",
     "replay:fixtures": "tsx scripts/replay-fixtures.ts",
     "build": "tsc -b && npm --workspace @colonizt/web run build",
     "simulate:bots": "tsx scripts/simulate-bots.ts",
@@ -29,13 +33,15 @@
     "simulate:ranked": "tsx scripts/ranked-simulation.ts",
     "simulate:rush": "tsx scripts/rush-simulation.ts",
     "load:sockets": "tsx scripts/load-sockets.ts",
+    "load:sockets:soak": "LOAD_ROOMS=20 LOAD_PLAYERS_PER_ROOM=4 LOAD_SPECTATORS_PER_ROOM=2 LOAD_RECONNECTS_PER_ROOM=2 LOAD_MAX_P95_MS=750 LOAD_MAX_P99_MS=1500 LOAD_MAX_HEAP_GROWTH_MB=96 tsx scripts/load-sockets.ts",
     "smoke:local": "tsx scripts/smoke-local.ts",
     "smoke:network": "tsx scripts/network-smoke.ts",
     "smoke:deployed-network": "tsx scripts/deployed-network-smoke.ts",
     "smoke:deployed-browser": "playwright test --config=playwright.deployed.config.ts",
     "smoke:cross-network": "npm run smoke:deployed-network && npm run smoke:deployed-browser",
     "scan:branding": "tsx scripts/scan-branding.ts",
-    "ops:workflows": "node scripts/check-deploy-workflows.mjs",
+    "ops:workflows": "node scripts/check-deploy-workflows.mjs && node scripts/check-workflow-actions.mjs",
+    "ops:diagnose": "tsx scripts/room-diagnostics.ts",
     "docs:diagrams": "node scripts/check-mermaid.mjs",
     "verify:local": "bash scripts/verify-local.sh"
   },
@@ -60,8 +66,11 @@
     "zod": "^4.2.0"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.12.1",
     "@eslint/js": "^9.39.1",
     "@playwright/test": "^1.57.0",
+    "@stryker-mutator/core": "9.6.1",
+    "@stryker-mutator/vitest-runner": "9.6.1",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.1",
     "@types/node": "^25.0.1",
@@ -75,5 +84,8 @@
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.50.0",
     "vitest": "^4.0.15"
+  },
+  "overrides": {
+    "qs": "6.15.3"
   }
 }

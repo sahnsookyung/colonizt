@@ -1,10 +1,9 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   applyCommand,
   applyEvents,
   canBuildRoad,
   emptyResources,
-  eligibleStealTargets,
   getLegalActions,
   hasResources,
   cityCost,
@@ -38,23 +37,17 @@ import {
   BoardHousePiece,
   BoardIcon,
   BotSymbol,
-  DevelopmentCardIcon,
   DicePanel,
   EndTurnSymbol,
   EventLine,
   HouseSymbol,
   HumanSymbol,
-  KnightStatSymbol,
   ResourceCard,
   ResourceIcon,
   RobberSymbol,
   RoadSymbol,
-  RoadStatSymbol,
   SpecialSymbol,
-  TradeBundle,
-  TradeResourceButton,
   TradeSymbol,
-  VictoryPointStatSymbol,
   formatCost,
   formatTimer,
   resourceLabels,
@@ -63,14 +56,31 @@ import {
 import { HandRack, type DevelopmentCardGroupView } from "./components/hand-rack.js";
 import { LobbyScreen, type LobbySettingsInput } from "./components/lobby-screen.js";
 import { PlayerStatsList } from "./components/player-stats-list.js";
+import { MatchAnalysis, victoryPointAria, victoryPointText, type GameOverTab } from "./components/match-analysis.js";
+import { SpecialCardOverlays } from "./components/special-card-overlays.js";
+import { TradeOverlay } from "./components/trade-overlay.js";
+import { AccessibleDialog } from "./components/accessible-dialog.js";
 import { useLocalAutomation } from "./hooks/useLocalAutomation.js";
 import { useNetworkRoom } from "./hooks/useNetworkRoom.js";
+import { useReplayController } from "./hooks/useReplayController.js";
 import { useSyncedRef } from "./hooks/useSyncedRef.js";
 import { useTradeDraft } from "./hooks/useTradeDraft.js";
-import { useTurnTimer } from "./hooks/useTurnTimer.js";
+import { turnDeadlineKey, useTurnTimer } from "./hooks/useTurnTimer.js";
+import { developmentCardTypes } from "./game-analysis.js";
+import {
+  activeRuleLabels,
+  displayPlayersForViewer,
+  selectMaritimeTradeDraft,
+  selectYearOfPlentyDraft,
+  visiblePlayerResourceCount as selectVisiblePlayerResourceCount,
+  visibleStealTargets as selectVisibleStealTargets,
+} from "./game-view-model.js";
+import { boardBounds, firstStealTarget, roadBuildingCandidateEdgesFor } from "./board-interactions.js";
 import { defaultMatchOptions, mapPresetLabels, onlineRoomCapacityText, toPlayerCount, type MatchOptions } from "./match-options.js";
 import { createNetworkClient } from "./network.js";
-import { replayAtIndex, type ReplayLogState } from "./replay-state.js";
+import { networkErrorMessage } from "./network-errors.js";
+import { canSubmitDiscardDraft, incrementDiscardDraft } from "./discard-policy.js";
+import { buildUnavailableReason, selectActionHint, type BuildMode } from "./game-guidance.js";
 import { clearResumeState, readResumeState, writeResumeState } from "./resume.js";
 import { playSound, playSoundForEvents } from "./sounds.js";
 import { normalizeTradeDraft, type TradeDraft } from "./trade-draft.js";
@@ -80,9 +90,7 @@ const diceAnimationMs = 820;
 const rollDeadlineMs = 60_000;
 const actionDeadlineMs = 240_000;
 
-type BuildMode = "road" | "settlement" | "city";
 type AppScreen = "setup" | "localGame" | "onlineLobby" | "onlineGame";
-type GameOverTab = "overview" | "dice" | "resources" | "development";
 type SpecialBoardMode =
   | { type: "roadBuilding"; cardId: string }
   | { type: "knight"; cardId: string }
@@ -105,66 +113,6 @@ const developmentCardShortLabels: Record<DevelopmentCard["type"], string> = {
   VICTORY_POINT: "+1 VP",
 };
 
-const developmentCardTypes: DevelopmentCard["type"][] = ["KNIGHT", "VICTORY_POINT", "MONOPOLY", "YEAR_OF_PLENTY", "ROAD_BUILDING"];
-
-const gameOverTabs: Array<{ id: GameOverTab; label: string }> = [
-  { id: "overview", label: "Overview" },
-  { id: "dice", label: "Dice Stats" },
-  { id: "resources", label: "Resource Cards" },
-  { id: "development", label: "Development Cards" },
-];
-
-const confettiColors = ["#22c55e", "#f97316", "#f43f5e", "#3b82f6", "#facc15", "#14b8a6", "#8b5cf6"];
-const confettiPieces = Array.from({ length: 42 }, (_, index) => ({
-  left: `${(index * 23 + 7) % 100}%`,
-  delay: `${-(index % 11) * 0.22}s`,
-  duration: `${2.4 + (index % 6) * 0.22}s`,
-  rotate: `${(index * 31) % 360}deg`,
-  color: confettiColors[index % confettiColors.length]!,
-}));
-
-const victoryPointText = (player: ViewerState["players"][number], compact = false): string => {
-  const secret = player.secretVictoryPoints ?? 0;
-  const total = player.visibleVictoryPoints ?? player.score;
-  const publicPoints = player.publicVictoryPoints ?? Math.max(0, total - secret);
-  if (secret <= 0 || total === publicPoints) return compact ? `${total}VP` : `${total} VP`;
-  return compact ? `${publicPoints}(${total})VP` : `${publicPoints} (${total}) VP`;
-};
-
-const victoryPointAria = (player: ViewerState["players"][number]): string => {
-  const secret = player.secretVictoryPoints ?? 0;
-  const total = player.visibleVictoryPoints ?? player.score;
-  if (secret <= 0) return `${total} victory points`;
-  return `${total} victory points, including ${secret} secret victory point${secret === 1 ? "" : "s"}`;
-};
-
-const firstStealTarget = (state: GameState, playerId: PlayerId, hexId: HexId): PlayerId | undefined =>
-  eligibleStealTargets(state, playerId, hexId)
-    .sort((left, right) =>
-      (state.players[right]?.score ?? 0) - (state.players[left]?.score ?? 0)
-      || resourceCount(state.players[right]?.resources ?? emptyResources()) - resourceCount(state.players[left]?.resources ?? emptyResources())
-      || state.playerOrder.indexOf(left) - state.playerOrder.indexOf(right),
-    )[0];
-
-const roadBuildingCandidateEdgesFor = (options: EdgeId[][], selected: EdgeId[], requiredCount: number): EdgeId[] => {
-  if (selected.length === 0) return [...new Set(options.map((option) => option[0]).filter((edgeId): edgeId is EdgeId => Boolean(edgeId)))];
-  if (selected.length >= requiredCount) return [];
-  return [...new Set(options
-    .filter((option) => option[0] === selected[0])
-    .map((option) => option[1])
-    .filter((edgeId): edgeId is EdgeId => Boolean(edgeId)))];
-};
-
-const boardBounds = (state: GameState) => {
-  const vertices = Object.values(state.board.vertices);
-  const xs = vertices.map((vertex) => vertex.x);
-  const ys = vertices.map((vertex) => vertex.y);
-  const minX = Math.min(...xs) - 1.1;
-  const maxX = Math.max(...xs) + 1.1;
-  const minY = Math.min(...ys) - 1.1;
-  const maxY = Math.max(...ys) + 3.0;
-  return { minX, minY, width: maxX - minX, height: maxY - minY };
-};
 
 const bundlesEqual = (left: ResourceBundle, right: ResourceBundle): boolean =>
   resources.every((resource) => left[resource] === right[resource]);
@@ -181,39 +129,7 @@ const issueCommand = (state: GameState, command: GameCommand): { state: GameStat
   return { state: result.value.nextState, events: result.value.events };
 };
 
-const networkErrorMessage = (input: unknown): string => {
-  const code = typeof input === "object" && input && "code" in input ? String((input as { code?: unknown }).code) : "";
-  switch (code) {
-    case "ROOM_NOT_FOUND":
-      return "Room not found";
-    case "ROOM_EXPIRED":
-      return "Room expired";
-    case "ROOM_ABANDONED":
-      return "Room abandoned";
-    case "ROOM_CLOSED":
-      return "Room closed";
-    case "ROOM_FULL":
-      return "Room is full";
-    case "ROOM_PAUSED":
-      return "Room is paused";
-    case "REPLAY_NOT_READY":
-      return "Replay is available after the game is finished";
-    case "REPLAY_FORBIDDEN":
-      return "Replay is only available to players in this match";
-    case "REPLAY_NOT_FOUND":
-      return "Replay not found";
-    case "RATE_LIMITED":
-      return "Too many attempts. Try again shortly.";
-    case "UNAUTHORIZED":
-      return "Session expired";
-    default:
-      if (input instanceof Error) return input.message;
-      if (typeof input === "object" && input && "message" in input && typeof (input as { message?: unknown }).message === "string") {
-        return (input as { message: string }).message;
-      }
-      return code || "Online action failed";
-  }
-};
+export { networkErrorMessage } from "./network-errors.js";
 
 export const App = () => {
   const [liveState, setLiveState] = useState<GameState>(() => createDemoGame("web-local"));
@@ -225,8 +141,6 @@ export const App = () => {
   const [error, setError] = useState<string | null>(null);
   const [joinCode, setJoinCode] = useState("");
   const [playerDisplayName, setPlayerDisplayName] = useState("Player");
-  const [replayLog, setReplayLog] = useState<ReplayLogState | null>(null);
-  const [replayIndex, setReplayIndex] = useState<number | null>(null);
   const [networkRoom, setNetworkRoom] = useState<PublicRoomPayload | null>(null);
   const [lobbyPending, setLobbyPending] = useState({ ready: false, settings: false, start: false, name: false });
   const [networkSocketOpen, setNetworkSocketOpen] = useState(false);
@@ -265,15 +179,12 @@ export const App = () => {
     markCommandPending,
     clearPendingCommands,
   } = useNetworkRoom();
+  const replayController = useReplayController();
   const matchMenuOpen = appScreen === "setup";
   const isPlayableScreen = appScreen === "localGame" || appScreen === "onlineGame";
-  const isReplaying = replayIndex !== null && replayLog !== null;
-  const replayState = useMemo(
-    () => (isReplaying && replayLog ? replayAtIndex(replayLog, replayIndex ?? replayLog.events.length) : null),
-    [isReplaying, replayIndex, replayLog],
-  );
+  const { log: replayLog, index: replayIndex, isReplaying, state: replayState } = replayController;
   const state = replayState ?? liveState;
-  const visibleEvents = replayLog && replayIndex !== null ? replayLog.events.slice(0, replayIndex) : events;
+  const visibleEvents = isReplaying ? replayController.visibleEvents : events;
   const stateRef = useSyncedRef(liveState);
   const eventsRef = useSyncedRef(events);
   const networkRoomInfoRef = useSyncedRef(networkRoomInfo);
@@ -309,15 +220,13 @@ export const App = () => {
   const humanPlayer = state.players[humanPlayerId];
   const maritimeAction = legal.find((action) => action.type === "MARITIME_TRADE");
   const maritimeTrades = maritimeAction?.type === "MARITIME_TRADE" ? maritimeAction.trades : [];
-  const selectedOfferResources = resources.filter((resource) => tradeOffer[resource] > 0);
-  const selectedRequestResources = resources.filter((resource) => tradeRequest[resource] > 0);
-  const singleOfferResource = selectedOfferResources.length === 1 ? selectedOfferResources[0] : undefined;
-  const previewMaritimeRatio = humanPlayer && singleOfferResource ? maritimeTradeRatio(state, humanPlayerId, singleOfferResource) : 4;
-  const bankOfferResource = singleOfferResource && tradeOffer[singleOfferResource] === previewMaritimeRatio ? singleOfferResource : undefined;
-  const bankRequestResource = selectedRequestResources.length === 1 && tradeRequest[selectedRequestResources[0]!] === 1 ? selectedRequestResources[0] : undefined;
-  const selectedMaritimeTrade = bankOfferResource && bankRequestResource
-    ? maritimeTrades.find((trade) => trade.offered === bankOfferResource && trade.requested === bankRequestResource)
-    : undefined;
+  const { previewMaritimeRatio, bankOfferResource, bankRequestResource, selectedMaritimeTrade } = selectMaritimeTradeDraft(
+    state,
+    humanPlayerId,
+    tradeOffer,
+    tradeRequest,
+    maritimeTrades,
+  );
   const latestRollEvent = [...visibleEvents].reverse().find((event) => event.type === "DICE_ROLLED");
   const latestRollKey = latestRollEvent?.type === "DICE_ROLLED"
     ? `${latestRollEvent.seq}:${latestRollEvent.dice.join("-")}`
@@ -340,22 +249,12 @@ export const App = () => {
   const settlementVerticesAvailable = legal.find((action) => action.type === "BUILD_SETTLEMENT")?.vertices ?? [];
   const cityVerticesAvailable = legal.find((action) => action.type === "UPGRADE_CITY")?.vertices ?? [];
   const yearOfPlentyResources = playYearOfPlentyAction?.type === "PLAY_YEAR_OF_PLENTY" ? playYearOfPlentyAction.resources : [];
-  const yearOfPlentyOptions = (otherPick?: Resource): Resource[] =>
-    yearOfPlentyResources.filter((resource) => (state.resourceBank?.[resource] ?? 0) > (otherPick === resource ? 1 : 0));
-  const yearOfPlentyFirstOptions = yearOfPlentyResources;
-  const selectedYearOfPlentyFirst = yearOfPlentyFirstOptions.includes(yearOfPlentyDraft[0])
-    ? yearOfPlentyDraft[0]
-    : yearOfPlentyFirstOptions[0] ?? yearOfPlentyResources[0] ?? "timber";
-  const yearOfPlentySecondOptions = yearOfPlentyOptions(selectedYearOfPlentyFirst);
-  const selectedYearOfPlentySecond = yearOfPlentySecondOptions.includes(yearOfPlentyDraft[1])
-    ? yearOfPlentyDraft[1]
-    : yearOfPlentySecondOptions[0] ?? yearOfPlentyResources[0] ?? "timber";
-  const selectedYearOfPlentyDraft: [Resource, Resource] = [selectedYearOfPlentyFirst, selectedYearOfPlentySecond];
-  const canTakeYearOfPlenty = yearOfPlentyResources.length > 0 && hasResources(state.resourceBank, {
-    ...emptyResources(),
-    [selectedYearOfPlentyFirst]: (selectedYearOfPlentyFirst === selectedYearOfPlentySecond ? 2 : 1),
-    [selectedYearOfPlentySecond]: selectedYearOfPlentyFirst === selectedYearOfPlentySecond ? 2 : 1,
-  });
+  const {
+    firstOptions: yearOfPlentyFirstOptions,
+    secondOptions: yearOfPlentySecondOptions,
+    selected: selectedYearOfPlentyDraft,
+    canTake: canTakeYearOfPlenty,
+  } = selectYearOfPlentyDraft(state, yearOfPlentyResources, yearOfPlentyDraft);
   const roadBuildingOptions = playRoadBuildingAction?.type === "PLAY_ROAD_BUILDING" ? playRoadBuildingAction.options : [];
   const roadBuildingRequiredCount = playRoadBuildingAction?.type === "PLAY_ROAD_BUILDING" ? playRoadBuildingAction.requiredRoadCount : 0;
   const activeRoadBuildingCardId = specialBoardMode?.type === "roadBuilding"
@@ -382,22 +281,10 @@ export const App = () => {
     && playYearOfPlentyAction.cardIds.includes(specialBoardMode.cardId)
     ? specialBoardMode.cardId
     : undefined;
-  const viewerPlayer = (playerId: PlayerId) => viewer.players.find((player) => player.id === playerId);
   const visiblePlayerResourceCount = (playerId: PlayerId): number =>
-    viewerPlayer(playerId)?.resourceCount ?? resourceCount(state.players[playerId]?.resources ?? emptyResources());
-  const visibleStealTargets = (hexId: HexId): PlayerId[] => {
-    const targets = new Set<PlayerId>();
-    for (const vertexId of state.board.adjacency.hexToVertices[hexId] ?? []) {
-      const owner = state.settlements[vertexId];
-      if (!owner || owner === humanPlayerId || visiblePlayerResourceCount(owner) <= 0) continue;
-      targets.add(owner);
-    }
-    return [...targets].sort((left, right) =>
-      (viewerPlayer(right)?.visibleVictoryPoints ?? state.players[right]?.score ?? 0) - (viewerPlayer(left)?.visibleVictoryPoints ?? state.players[left]?.score ?? 0)
-      || visiblePlayerResourceCount(right) - visiblePlayerResourceCount(left)
-      || state.playerOrder.indexOf(left) - state.playerOrder.indexOf(right),
-    );
-  };
+    selectVisiblePlayerResourceCount(state, viewer, playerId);
+  const visibleStealTargets = (hexId: HexId): PlayerId[] =>
+    selectVisibleStealTargets(state, viewer, humanPlayerId, hexId);
   const legalThiefHexes = new Set([
     ...(moveThiefAction?.type === "MOVE_THIEF" ? moveThiefAction.hexes : []),
     ...(activeKnightCardId && playKnightAction?.type === "PLAY_KNIGHT" ? playKnightAction.hexes : []),
@@ -411,92 +298,19 @@ export const App = () => {
   ]);
   const legalCities = new Set(state.phase.type === "ACTION_PHASE" && buildMode === "city" ? cityVerticesAvailable : []);
   const ownDevelopmentCards = humanPlayer?.developmentCards ?? [];
-  const canSubmitDiscard = discardAction?.type === "DISCARD_RESOURCES"
-    && resourceCount(discardDraft) === discardAction.count
-    && Boolean(humanPlayer && hasResources(humanPlayer.resources, discardDraft));
+  const canSubmitDiscard = canSubmitDiscardDraft(
+    humanPlayer?.resources,
+    discardDraft,
+    discardAction?.type === "DISCARD_RESOURCES" ? discardAction.count : undefined,
+  );
   const hasTradeOverlap = resources.some((resource) => tradeOffer[resource] > 0 && tradeRequest[resource] > 0);
   const canSubmitOfferTrade = canOfferTrade && resourceCount(tradeOffer) > 0 && resourceCount(tradeRequest) > 0 && !hasTradeOverlap && Boolean(humanPlayer && hasResources(humanPlayer.resources, tradeOffer));
   const keyboardShortcutsEnabled = platform() === "desktop";
-  const activeRules = [
-    `Map ${mapPresetLabels[state.config.rules?.mapPreset ?? "standard"]}`,
-    state.config.rules?.diceDoubles ? "Doubles x2" : undefined,
-    state.config.rules?.plight ? `Plight turn ${state.config.rules.plightTurn ?? 20}` : undefined,
-    state.config.rules?.specialCardCostRandomized ? "Random special cost" : undefined,
-  ].filter((rule): rule is string => Boolean(rule));
-  const displayPlayers = useMemo(() => viewer.players.map((player) => {
-    if (player.id === humanPlayerId || state.phase.type === "GAME_OVER") return player;
-    const publicPoints = player.publicVictoryPoints ?? Math.max(0, (player.visibleVictoryPoints ?? player.score) - (player.secretVictoryPoints ?? 0));
-    return {
-      ...player,
-      score: publicPoints,
-      secretVictoryPoints: 0,
-      visibleVictoryPoints: publicPoints,
-      victoryPointBreakdown: {
-        ...player.victoryPointBreakdown,
-        secret: 0,
-        total: publicPoints,
-      },
-    };
-  }), [humanPlayerId, state.phase.type, viewer.players]);
-  const rankedPlayers = useMemo(
-    () => [...displayPlayers].sort((left, right) =>
-      (right.visibleVictoryPoints ?? right.score) - (left.visibleVictoryPoints ?? left.score)
-      || state.playerOrder.indexOf(left.id) - state.playerOrder.indexOf(right.id),
-    ),
-    [displayPlayers, state.playerOrder],
+  const activeRules = activeRuleLabels(state);
+  const displayPlayers = useMemo(
+    () => displayPlayersForViewer(state, viewer, humanPlayerId),
+    [humanPlayerId, state, viewer],
   );
-  const victoryCategoryMaxima = useMemo(() => {
-    const maxima = { settlements: 0, cities: 0, longestRoad: 0, largestArmy: 0, secret: 0, otherPublic: 0 };
-    for (const player of rankedPlayers) {
-      const breakdown = player.victoryPointBreakdown;
-      maxima.settlements = Math.max(maxima.settlements, breakdown?.settlements ?? 0);
-      maxima.cities = Math.max(maxima.cities, breakdown?.cities ?? 0);
-      maxima.longestRoad = Math.max(maxima.longestRoad, breakdown?.longestRoad ?? 0);
-      maxima.largestArmy = Math.max(maxima.largestArmy, breakdown?.largestArmy ?? 0);
-      maxima.secret = Math.max(maxima.secret, breakdown?.secret ?? 0);
-      maxima.otherPublic = Math.max(maxima.otherPublic, breakdown?.otherPublic ?? 0);
-    }
-    return maxima;
-  }, [rankedPlayers]);
-  const diceStats = useMemo(() => {
-    const counts = Object.fromEntries(Array.from({ length: 11 }, (_, index) => [index + 2, 0])) as Record<number, number>;
-    for (const event of visibleEvents) {
-      if (event.type === "DICE_ROLLED") counts[event.sum] = (counts[event.sum] ?? 0) + 1;
-    }
-    return Object.entries(counts).map(([sum, count]) => ({ sum: Number(sum), count }));
-  }, [visibleEvents]);
-  const resourceDrawStats = useMemo(() => {
-    const totals = emptyResources();
-    const add = (bundle?: Partial<ResourceBundle>) => {
-      if (!bundle) return;
-      for (const resource of resources) totals[resource] += bundle[resource] ?? 0;
-    };
-    for (const event of visibleEvents) {
-      if (event.type === "RESOURCES_PRODUCED") Object.values(event.gains).forEach(add);
-      if (event.type === "SETUP_PLACED") add(event.startingResources);
-      if (event.type === "YEAR_OF_PLENTY_PLAYED") {
-        for (const resource of event.resources) totals[resource] += 1;
-      }
-      if (event.type === "MONOPOLY_PLAYED") totals[event.resource] += Object.values(event.collected).reduce((sum, count) => sum + count, 0);
-      if (event.type === "MARITIME_TRADED") totals[event.requested] += 1;
-      if (event.type === "TRADE_ACCEPTED") {
-        add(event.offered);
-        add(event.requested);
-      }
-      if (event.type === "THIEF_MOVED" && event.stolenResource) totals[event.stolenResource] += 1;
-    }
-    return resources.map((resource) => ({ resource, count: totals[resource] }));
-  }, [visibleEvents]);
-  const developmentDrawStats = useMemo(() => {
-    const counts = Object.fromEntries(developmentCardTypes.map((type) => [type, 0])) as Record<DevelopmentCard["type"], number>;
-    for (const event of visibleEvents) {
-      if (event.type === "SPECIAL_CARD_BOUGHT" && event.cardType && event.cardType in counts) counts[event.cardType] += 1;
-    }
-    return developmentCardTypes.map((type) => ({ type, count: counts[type] }));
-  }, [visibleEvents]);
-  const maxDiceCount = Math.max(1, ...diceStats.map((stat) => stat.count));
-  const maxResourceDrawCount = Math.max(1, ...resourceDrawStats.map((stat) => stat.count));
-  const maxDevelopmentDrawCount = Math.max(1, ...developmentDrawStats.map((stat) => stat.count));
   const stagedTrades = Object.values(state.trades)
     .filter((trade) => trade.status === "COLLECTING_RESPONSES")
     .filter((trade) => trade.fromPlayerId === humanPlayerId || trade.recipients === "ANY" || trade.recipients.includes(humanPlayerId));
@@ -521,46 +335,32 @@ export const App = () => {
   const canUpgradeCity = cityVerticesAvailable.length > 0;
   const canBuildSettlement = settlementVerticesAvailable.length > 0;
   const canBuildRoadAction = actionRoadEdges.length > 0;
-  const actionBuildReason = (mode: BuildMode): string | undefined => {
-    if (state.phase.type === "GAME_OVER") return "The game is over.";
-    if (state.phase.type !== "ACTION_PHASE") return "Available during your action phase.";
-    if (!isHumanActive) return `${activeName ?? "Another player"} is taking a turn.`;
-    if (!humanPlayer) return "Player hand is unavailable.";
-    if (mode === "road") {
-      if (!hasResources(humanPlayer.resources, roadCost())) return `Need ${formatCost(roadCost())}.`;
-      return "No legal road edges. Build from your road network.";
-    }
-    if (mode === "settlement") {
-      if (!hasResources(humanPlayer.resources, settlementCost())) return `Need ${formatCost(settlementCost())}.`;
-      return "No legal settlement corners. Keep distance from other houses and connect to your road.";
-    }
-    if (!hasResources(humanPlayer.resources, cityCost())) return `Need ${formatCost(cityCost())}.`;
-    if (!Object.values(state.buildings).some((building) => building.owner === humanPlayerId && building.type === "settlement")) {
-      return "No settlements available to upgrade.";
-    }
-    return "No legal city upgrades are currently available.";
-  };
+  const actionBuildReason = (mode: BuildMode): string => buildUnavailableReason({
+    state,
+    mode,
+    humanPlayerId,
+    isHumanActive,
+    ...(activeName ? { activeName } : {}),
+  });
   const isWaitingForHumanTurn = state.phase.type !== "GAME_OVER" && !isHumanActive;
   const endTurnButtonLabel = isWaitingForHumanTurn ? "Waiting" : "End Turn";
   const setupSettlementActive = state.phase.type === "SETUP_PLACEMENT" && isHumanActive && !pendingSetupVertex;
   const setupRoadActive = state.phase.type === "SETUP_PLACEMENT" && isHumanActive && Boolean(pendingSetupVertex);
-  const actionHint = (() => {
-    if (state.phase.type === "GAME_OVER") return { title: "Game over", detail: `${state.players[state.phase.winnerId]?.name ?? state.phase.winnerId} reached the victory target.` };
-    if (state.phase.type === "DISCARDING") return { title: "Discard", detail: `Choose ${discardAction?.type === "DISCARD_RESOURCES" ? discardAction.count : 0} resources.` };
-    if (state.phase.type === "MOVING_THIEF") return { title: "Move robber", detail: "Choose a destination and steal target if available." };
-    if (!isHumanActive) return { title: "Waiting", detail: `${activeName ?? "Opponent"} is taking a turn.` };
-    if (activeKnightCardId) return { title: "Play Knight", detail: "Choose a robber destination, then choose who to steal from if available." };
-    if (activeRoadBuildingCardId) return { title: "Road Building", detail: `Choose ${roadBuildingRequiredCount - roadBuildingSelectedEdges.length} free road${roadBuildingRequiredCount - roadBuildingSelectedEdges.length === 1 ? "" : "s"} on glowing edges.` };
-    if (activeMonopolyCardId) return { title: "Monopoly", detail: "Choose one resource type to collect from every opponent." };
-    if (activeYearOfPlentyCardId) return { title: "Year of Plenty", detail: "Choose two resources from the bank." };
-    if (activeStagedTrade?.fromPlayerId === humanPlayerId) return { title: "Choose trade partner", detail: "Pick a player who wants to accept, or cancel the offer." };
-    if (activeStagedTrade) return { title: "Answer trade", detail: "Mark whether you want to accept before the offer expires." };
-    if (state.phase.type === "SETUP_PLACEMENT" && pendingSetupVertex) return { title: "Place setup road", detail: "Pick a glowing brown edge attached to the new settlement." };
-    if (state.phase.type === "SETUP_PLACEMENT") return { title: "Place setup settlement", detail: "Pick a glowing corner, then choose its road edge." };
-    if (state.phase.type === "WAITING_FOR_ROLL") return { title: "Roll dice", detail: "Roll for matching numbered tiles." };
-    if (canUpgradeCity || canBuildSettlement || canBuildRoadAction) return { title: "Build or trade", detail: "Choose a build mode, use glowing spots, trade, or end." };
-    return { title: "Trade or end", detail: "Trade if eligible, or end the turn." };
-  })();
+  const actionHint = selectActionHint({
+    state,
+    humanPlayerId,
+    isHumanActive,
+    ...(activeName ? { activeName } : {}),
+    ...(discardAction?.type === "DISCARD_RESOURCES" ? { discardCount: discardAction.count } : {}),
+    activeKnight: Boolean(activeKnightCardId),
+    activeRoadBuilding: Boolean(activeRoadBuildingCardId),
+    roadsRemaining: roadBuildingRequiredCount - roadBuildingSelectedEdges.length,
+    activeMonopoly: Boolean(activeMonopolyCardId),
+    activeYearOfPlenty: Boolean(activeYearOfPlentyCardId),
+    ...(activeStagedTrade ? { stagedTradeRole: activeStagedTrade.fromPlayerId === humanPlayerId ? "offerer" as const : "recipient" as const } : {}),
+    pendingSetup: Boolean(pendingSetupVertex),
+    canBuild: canUpgradeCity || canBuildSettlement || canBuildRoadAction,
+  });
 
   const bankRatiosForState = (targetState: GameState, playerId: PlayerId): Partial<Record<Resource, number>> =>
     Object.fromEntries(resources.map((resource) => [resource, maritimeTradeRatio(targetState, playerId, resource)])) as Partial<Record<Resource, number>>;
@@ -696,7 +496,7 @@ export const App = () => {
       const current = stateRef.current;
       const currentActive = "activePlayerId" in current.phase ? current.phase.activePlayerId : undefined;
       const currentKey = current.phase.type !== "GAME_OVER" && currentActive
-        ? `${current.config.matchId}:${current.turn}:${current.phase.type}:${currentActive}`
+        ? turnDeadlineKey(current, currentActive)
         : null;
       if (currentKey !== key || !currentActive) return;
       if (current.phase.type === "DISCARDING") {
@@ -769,7 +569,7 @@ export const App = () => {
 
   const handleEdge = (edgeId: EdgeId) => {
     setSelectedEdge(edgeId);
-    if (activeRoadBuildingCardId && legalRoads.has(edgeId)) {
+    if (activeRoadBuildingCardId && (legalRoads.has(edgeId) || roadBuildingSelectedEdges.includes(edgeId))) {
       selectRoadBuildingEdge(activeRoadBuildingCardId, edgeId);
     } else if (state.phase.type === "SETUP_PLACEMENT" && pendingSetupVertex && legalRoads.has(edgeId)) {
       playSound("select");
@@ -832,8 +632,7 @@ export const App = () => {
   };
 
   const resetPlayUi = () => {
-    setReplayLog(null);
-    setReplayIndex(null);
+    replayController.exit();
     setServerViewer(null);
     setEvents([]);
     setPendingSetupVertex(null);
@@ -964,24 +763,16 @@ export const App = () => {
       const log = networkRoomId && networkSession
         ? await createNetworkClient().loadReplay(networkRoomInfo?.id ?? networkRoomId, networkSession.token)
         : { config: liveState.config, board: liveState.board, events };
-      setReplayLog(log);
-      setReplayIndex(log.events.length);
+      replayController.start(log);
       setNetworkStatus("Replay");
     } catch (input) {
       setError(networkErrorMessage(input));
     }
   };
 
-  const stepReplay = (delta: number) => {
-    if (!replayLog || replayIndex === null) return;
-    const nextIndex = Math.max(0, Math.min(replayLog.events.length, replayIndex + delta));
-    setReplayIndex(nextIndex);
-  };
-
   const exitReplay = () => {
     if (!replayLog) return;
-    setReplayLog(null);
-    setReplayIndex(null);
+    replayController.exit();
     setNetworkStatus(networkRoomId ? "Online game" : "Bot match");
   };
 
@@ -1040,10 +831,16 @@ export const App = () => {
     setRobberTargetHexId(null);
   };
   const incrementDiscard = (resource: Resource) => {
-    if (!humanPlayer || humanPlayer.resources[resource] <= discardDraft[resource]) return;
-    if (discardAction?.type === "DISCARD_RESOURCES" && resourceCount(discardDraft) >= discardAction.count) return;
-    playSound("select");
-    setDiscardDraft((current) => ({ ...current, [resource]: current[resource] + 1 }));
+    setDiscardDraft((current) => {
+      const next = incrementDiscardDraft(
+        humanPlayer?.resources,
+        current,
+        discardAction?.type === "DISCARD_RESOURCES" ? discardAction.count : undefined,
+        resource,
+      );
+      if (next !== current) playSound("select");
+      return next;
+    });
   };
   const submitDiscard = () => {
     if (!canSubmitDiscard) return;
@@ -1325,7 +1122,7 @@ export const App = () => {
       const log = await createNetworkClient().loadReplay(roomRef, session.token);
       if (!isNetworkGeneration(generation)) return;
       setEvents(log.events);
-      setReplayLog((current) => current ? log : current);
+      replayController.replaceIfActive(log);
     } catch {
       if (hydratedFinishedReplayRef.current === roomRef) hydratedFinishedReplayRef.current = null;
     }
@@ -1464,6 +1261,9 @@ export const App = () => {
       if (!isNetworkGeneration(generation)) return;
       setNetworkStatus("Online unavailable");
       setError(networkErrorMessage(connectError));
+      if (shouldReconnectRef.current) {
+        scheduleReconnect(() => connectOnlineSession(session, roomId, false, generation));
+      }
     });
   };
 
@@ -1565,7 +1365,10 @@ export const App = () => {
     if (!resumable) {
       if (inviteRoomId) {
         void joinOnlineRoom(inviteRoomId);
-        return cleanupOnlineSession;
+        return () => {
+          initialOnlineConnectRef.current = false;
+          cleanupOnlineSession();
+        };
       }
       return undefined;
     }
@@ -1578,7 +1381,10 @@ export const App = () => {
     setNetworkRoomInfo({ id: resumable.roomId, ...(resumable.roomCode ? { code: resumable.roomCode } : {}) });
     setNetworkStatus("Resuming online room...");
     connectOnlineSession({ token: resumable.token, userId: resumable.userId }, resumable.roomCode ?? resumable.roomId, false, generation);
-    return cleanupOnlineSession;
+    return () => {
+      initialOnlineConnectRef.current = false;
+      cleanupOnlineSession();
+    };
   }, []);
 
   useEffect(() => {
@@ -1842,9 +1648,9 @@ export const App = () => {
             ) : null}
             {isReplaying && replayLog ? (
               <div className="replay-controls" aria-label="Replay controls">
-                <button type="button" onClick={() => stepReplay(-1)} disabled={replayIndex === 0}>Prev</button>
+                <button type="button" onClick={() => replayController.step(-1)} disabled={replayIndex === 0}>Prev</button>
                 <span>{replayIndex ?? 0}/{replayLog.events.length}</span>
-                <button type="button" onClick={() => stepReplay(1)} disabled={replayIndex === replayLog.events.length}>Next</button>
+                <button type="button" onClick={() => replayController.step(1)} disabled={replayIndex === replayLog.events.length}>Next</button>
                 <button type="button" onClick={exitReplay}>Live</button>
               </div>
             ) : state.phase.type === "GAME_OVER" ? (
@@ -2048,6 +1854,7 @@ export const App = () => {
                 const roadBuildingPreview = activeRoadBuildingCardId && roadBuildingSelectedEdges.includes(edge.id);
                 const displayedOwner = owner ?? (roadBuildingPreview ? humanPlayerId : undefined);
                 const isLegalRoad = legalRoads.has(edge.id);
+                const isSelectableRoad = isLegalRoad || Boolean(roadBuildingPreview);
                 const dx = b.x - a.x;
                 const dy = b.y - a.y;
                 const edgeLength = Math.hypot(dx, dy);
@@ -2075,7 +1882,7 @@ export const App = () => {
                         <path d={`M${-edgeLength * 0.26} -0.02 H${edgeLength * 0.26}`} />
                       </g>
                     ) : null}
-                    {isLegalRoad && !owner ? (
+                    {isSelectableRoad && !owner ? (
                       <g
                         className="edge-build-control"
                         role="button"
@@ -2248,7 +2055,7 @@ export const App = () => {
             </div>
 
             {discardAction?.type === "DISCARD_RESOURCES" ? (
-              <div className="phase-card discard-board-panel modal-control-card" aria-label="Discard resources">
+              <AccessibleDialog className="phase-card discard-board-panel modal-control-card" label="Discard resources">
                 <div className="panel-title">
                   <strong>Discard</strong>
                   <span>{resourceCount(discardDraft)}/{discardAction.count}{turnDeadline?.mode === "discard" && turnSecondsRemaining !== undefined ? ` · ${formatTimer(turnSecondsRemaining)}` : ""}</span>
@@ -2258,7 +2065,7 @@ export const App = () => {
                   <button type="button" onClick={clearDiscard} disabled={resourceCount(discardDraft) === 0}>Clear</button>
                 </div>
                 <button type="button" className="primary-wide" onClick={submitDiscard} disabled={!canSubmitDiscard}>Discard</button>
-              </div>
+              </AccessibleDialog>
             ) : null}
 
             <HandRack
@@ -2273,7 +2080,7 @@ export const App = () => {
             />
 
             {selectedRobberHex ? (
-              <div className="robber-choice-overlay" aria-label="Choose player to rob">
+              <AccessibleDialog className="robber-choice-overlay" label="Choose player to rob" onClose={() => setRobberTargetHexId(null)}>
                 <div className="robber-choice-heading">
                   <div className="robber-large-symbol" aria-hidden="true">
                     <RobberSymbol />
@@ -2305,322 +2112,62 @@ export const App = () => {
                     );
                   })}
                 </div>
-              </div>
+              </AccessibleDialog>
             ) : null}
 
-            {activeMonopolyCardId ? (
-              <div className="special-card-choice-overlay" aria-label="Monopoly card choice">
-                <div className="special-choice-heading">
-                  <DevelopmentCardIcon type="MONOPOLY" />
-                  <div>
-                    <strong>Monopoly</strong>
-                    <span>Choose one resource to collect</span>
-                  </div>
-                  <button type="button" className="icon-button" onClick={() => setSpecialBoardMode(null)} aria-label="Close Monopoly chooser">x</button>
-                </div>
-                <div className="special-resource-grid">
-                  {resources.map((resource) => (
-                    <ResourceCard
-                      key={resource}
-                      resource={resource}
-                      count={viewer.resourceBank?.[resource] ?? state.resourceBank?.[resource] ?? 0}
-                      onClick={() => playMonopoly(activeMonopolyCardId, resource)}
-                      buttonLabel={`Choose ${resourceLabels[resource]} for Monopoly`}
-                    />
-                  ))}
-                </div>
-              </div>
-            ) : null}
+            <SpecialCardOverlays
+              state={state}
+              viewer={viewer}
+              {...(activeMonopolyCardId ? { monopolyCardId: activeMonopolyCardId } : {})}
+              {...(activeYearOfPlentyCardId ? { yearOfPlentyCardId: activeYearOfPlentyCardId } : {})}
+              yearOfPlentyFirstOptions={yearOfPlentyFirstOptions}
+              yearOfPlentySecondOptions={yearOfPlentySecondOptions}
+              selectedYearOfPlenty={selectedYearOfPlentyDraft}
+              canTakeYearOfPlenty={canTakeYearOfPlenty}
+              onClose={() => setSpecialBoardMode(null)}
+              onPlayMonopoly={playMonopoly}
+              onSetYearOfPlenty={setYearOfPlentyResource}
+              onPlayYearOfPlenty={playYearOfPlenty}
+            />
 
-            {activeYearOfPlentyCardId ? (
-              <div className="special-card-choice-overlay" aria-label="Year of Plenty card choice">
-                <div className="special-choice-heading">
-                  <DevelopmentCardIcon type="YEAR_OF_PLENTY" />
-                  <div>
-                    <strong>Year of Plenty</strong>
-                    <span>Choose two bank resources</span>
-                  </div>
-                  <button type="button" className="icon-button" onClick={() => setSpecialBoardMode(null)} aria-label="Close Year of Plenty chooser">x</button>
-                </div>
-                <div className="year-choice-section">
-                  <strong>First</strong>
-                  <div className="special-resource-grid">
-                    {yearOfPlentyFirstOptions.map((resource) => (
-                      <ResourceCard
-                        key={resource}
-                        resource={resource}
-                        count={state.resourceBank?.[resource] ?? 0}
-                        selected={selectedYearOfPlentyFirst === resource}
-                        onClick={() => setYearOfPlentyResource(0, resource)}
-                        buttonLabel={`Choose ${resourceLabels[resource]} as first Year of Plenty resource`}
-                      />
-                    ))}
-                  </div>
-                </div>
-                <div className="year-choice-section">
-                  <strong>Second</strong>
-                  <div className="special-resource-grid">
-                    {yearOfPlentySecondOptions.map((resource) => (
-                      <ResourceCard
-                        key={resource}
-                        resource={resource}
-                        count={state.resourceBank?.[resource] ?? 0}
-                        selected={selectedYearOfPlentySecond === resource}
-                        onClick={() => setYearOfPlentyResource(1, resource)}
-                        buttonLabel={`Choose ${resourceLabels[resource]} as second Year of Plenty resource`}
-                      />
-                    ))}
-                  </div>
-                </div>
-                <button type="button" className="primary-wide" onClick={() => playYearOfPlenty(activeYearOfPlentyCardId, selectedYearOfPlentyDraft)} disabled={!canTakeYearOfPlenty}>Take resources</button>
-              </div>
-            ) : null}
+            <TradeOverlay
+              visible={showTradePanel}
+              state={state}
+              humanPlayerId={humanPlayerId}
+              online={appScreen === "onlineGame"}
+              {...(activeStagedTrade ? { activeTrade: activeStagedTrade } : {})}
+              recipientIds={stagedRecipientIds}
+              selectedResponder={selectedTradeResponder}
+              selectedResponderCanFinalize={selectedResponderCanFinalize}
+              {...(stagedTradeSeconds !== undefined ? { stagedTradeSeconds } : {})}
+              {...(selectedMaritimeTrade ? { selectedMaritimeTrade } : {})}
+              {...(bankOfferResource ? { bankOfferResource } : {})}
+              previewMaritimeRatio={previewMaritimeRatio}
+              tradeOffer={tradeOffer}
+              tradeRequest={tradeRequest}
+              canSubmitOfferTrade={canSubmitOfferTrade}
+              onClose={() => setTradeOpen(false)}
+              onSelectResponder={setSelectedTradeResponder}
+              onCancel={cancelTrade}
+              onFinalize={finalizeTrade}
+              onRespond={respondToTrade}
+              onIncrement={incrementTradeBundle}
+              onDecrement={decrementTradeBundle}
+              onClear={clearTrade}
+              onBank={bankTrade}
+              onOffer={offerTrade}
+            />
 
-            {showTradePanel ? (
-              <div className="trade-panel trade-overlay" aria-label="Trade interface">
-                <div className="panel-title">
-                  <strong>{activeStagedTrade ? "Trade Responses" : "Trade"}</strong>
-                  <span>
-                    {activeStagedTrade
-                      ? stagedTradeSeconds !== undefined ? `${formatTimer(stagedTradeSeconds)} left` : "waiting"
-                      : selectedMaritimeTrade ? `${selectedMaritimeTrade.ratio}:1 bank ready` : bankOfferResource ? `${previewMaritimeRatio}:1 bank` : "select cards"}
-                  </span>
-                  <button type="button" className="icon-button" onClick={() => setTradeOpen(false)} aria-label="Close trade">x</button>
-                </div>
-                {activeStagedTrade ? (
-                  <div className="staged-trade" role="dialog" aria-modal={activeStagedTrade.fromPlayerId === humanPlayerId} aria-label="Staged trade response overlay">
-                    <div className="incoming-trade-bundles">
-                      <TradeBundle bundle={activeStagedTrade.offered} />
-                      <span>for</span>
-                      <TradeBundle bundle={activeStagedTrade.requested} />
-                    </div>
-                    {activeStagedTrade.fromPlayerId === humanPlayerId ? (
-                      <>
-                        <div className="trade-response-list" aria-live="polite">
-                          {stagedRecipientIds.map((playerId) => {
-                            const response = activeStagedTrade.responses?.[playerId]?.status ?? "PENDING";
-                            const canAfford = appScreen === "onlineGame" || hasResources(state.players[playerId]?.resources ?? emptyResources(), activeStagedTrade.requested);
-                            const canChoose = response === "WANTS_ACCEPT" && canAfford;
-                            return (
-                              <button
-                                key={playerId}
-                                type="button"
-                                className={`trade-response-row ${selectedTradeResponder === playerId ? "selected" : ""}`}
-                                onClick={() => setSelectedTradeResponder(playerId)}
-                                disabled={!canChoose}
-                              >
-                                <span style={{ color: state.players[playerId]?.color }}>{state.players[playerId]?.name ?? playerId}</span>
-                                <strong>{!canAfford ? "Cannot afford" : response === "WANTS_ACCEPT" ? "Wants to accept" : response === "REJECTED" ? "Rejected" : "Pending"}</strong>
-                              </button>
-                            );
-                          })}
-                        </div>
-                        <div className="trade-actions">
-                          <button type="button" onClick={() => cancelTrade(activeStagedTrade.id)}>Cancel</button>
-                          <button
-                            type="button"
-                            onClick={() => selectedTradeResponder && finalizeTrade(activeStagedTrade.id, selectedTradeResponder)}
-                            disabled={!selectedResponderCanFinalize}
-                          >
-                            Trade
-                          </button>
-                        </div>
-                      </>
-                    ) : (
-                      <div className="incoming-trade">
-                        <div>
-                          <strong>{state.players[activeStagedTrade.fromPlayerId]?.name ?? activeStagedTrade.fromPlayerId} offers</strong>
-                          <span>{activeStagedTrade.responses?.[humanPlayerId]?.status === "WANTS_ACCEPT" ? "Waiting for the offerer." : activeStagedTrade.responses?.[humanPlayerId]?.status === "REJECTED" ? "You rejected this offer." : "Choose your response."}</span>
-                        </div>
-                        <div className="incoming-trade-actions">
-                          <button
-                            type="button"
-                            onClick={() => respondToTrade(activeStagedTrade.id, "WANTS_ACCEPT")}
-                            disabled={!humanPlayer || !hasResources(humanPlayer.resources, activeStagedTrade.requested)}
-                          >
-                            Want to accept
-                          </button>
-                          <button type="button" onClick={() => respondToTrade(activeStagedTrade.id, "REJECTED")}>Reject</button>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                ) : (
-                  <>
-                    <div className="trade-picker">
-                      <span>Give</span>
-                      <div className="trade-card-grid">
-                        {resources.map((resource) => (
-                          <TradeResourceButton
-                            key={resource}
-                            resource={resource}
-                            owned={humanPlayer?.resources[resource] ?? 0}
-                            selected={tradeOffer[resource]}
-                            onIncrement={() => incrementTradeBundle("offer", resource)}
-                            onDecrement={() => decrementTradeBundle("offer", resource)}
-                          />
-                        ))}
-                      </div>
-                    </div>
-                    <div className="trade-picker">
-                      <span>Want</span>
-                      <div className="trade-card-grid">
-                        {resources.map((resource) => (
-                          <TradeResourceButton
-                            key={resource}
-                            resource={resource}
-                            owned={0}
-                            selected={tradeRequest[resource]}
-                            request
-                            onIncrement={() => incrementTradeBundle("request", resource)}
-                            onDecrement={() => decrementTradeBundle("request", resource)}
-                          />
-                        ))}
-                      </div>
-                    </div>
-                    <div className="trade-actions">
-                      <button type="button" onClick={clearTrade} disabled={resourceCount(tradeOffer) + resourceCount(tradeRequest) === 0}>Clear</button>
-                      <button type="button" onClick={bankTrade} disabled={!selectedMaritimeTrade}>Bank</button>
-                      <button type="button" onClick={offerTrade} disabled={!canSubmitOfferTrade}>Offer</button>
-                    </div>
-                  </>
-                )}
-              </div>
-            ) : null}
-
-            {state.phase.type === "GAME_OVER" ? (
-              <div className="game-over-overlay" aria-label="Victory analysis">
-                <div className="confetti-layer" aria-hidden="true">
-                  {confettiPieces.map((piece, index) => (
-                    <span
-                      key={index}
-                      style={{
-                        "--confetti-left": piece.left,
-                        "--confetti-delay": piece.delay,
-                        "--confetti-duration": piece.duration,
-                        "--confetti-rotate": piece.rotate,
-                        "--confetti-color": piece.color,
-                      } as CSSProperties}
-                    />
-                  ))}
-                </div>
-                <div className="game-over-title">
-                  <strong>{state.players[state.phase.winnerId]?.name ?? state.phase.winnerId} wins</strong>
-                  <span>Turn {state.turn + 1}</span>
-                </div>
-                <div className="analysis-tabs" role="tablist" aria-label="Game analysis sections">
-                  {gameOverTabs.map((tab) => (
-                    <button
-                      key={tab.id}
-                      type="button"
-                      role="tab"
-                      aria-selected={gameOverTab === tab.id}
-                      className={gameOverTab === tab.id ? "selected" : ""}
-                      onClick={() => setGameOverTab(tab.id)}
-                    >
-                      {tab.label}
-                    </button>
-                  ))}
-                </div>
-                <div className="analysis-panel">
-                  {gameOverTab === "overview" ? (
-                    <div className="victory-breakdown-list">
-                      {rankedPlayers.map((player, index) => {
-                        const breakdown = player.victoryPointBreakdown;
-                        const parts = [
-                          { key: "settlements", label: "Settlements", value: breakdown?.settlements ?? 0, icon: <HouseSymbol /> },
-                          { key: "cities", label: "Cities", value: breakdown?.cities ?? 0, icon: <HouseSymbol city /> },
-                          { key: "longestRoad", label: "Longest Road", value: breakdown?.longestRoad ?? 0, icon: <RoadStatSymbol /> },
-                          { key: "largestArmy", label: "Largest Army", value: breakdown?.largestArmy ?? 0, icon: <KnightStatSymbol /> },
-                          { key: "secret", label: "Secret VP", value: breakdown?.secret ?? 0, icon: <DevelopmentCardIcon type="VICTORY_POINT" /> },
-                          { key: "otherPublic", label: "Other", value: breakdown?.otherPublic ?? 0, icon: <VictoryPointStatSymbol /> },
-                        ].filter((part) => part.value > 0);
-                        return (
-                          <article key={player.id} className="victory-breakdown-row" style={{ borderColor: player.color }}>
-                            <div className="victory-rank">{index + 1}</div>
-                            <div className="victory-player">
-                              <span className="player-kind" style={{ color: player.color }}>{botPlayerIds.has(player.id) ? <BotSymbol /> : <HumanSymbol />}</span>
-                              <strong>{player.name}</strong>
-                              <span className={player.secretVictoryPoints ? "vp-secret" : ""}>{victoryPointText(player)}</span>
-                            </div>
-                            <div className="victory-parts">
-                              {parts.map((part) => {
-                                const best = part.value > 0 && part.value === victoryCategoryMaxima[part.key as keyof typeof victoryCategoryMaxima];
-                                return (
-                                  <span key={part.key} className={`victory-part ${best ? "best" : ""}`} title={part.label}>
-                                    {part.icon}
-                                    <span>{part.value}</span>
-                                  </span>
-                                );
-                              })}
-                            </div>
-                          </article>
-                        );
-                      })}
-                    </div>
-                  ) : null}
-                  {gameOverTab === "dice" ? (
-                    <div className="analysis-chart dice-chart" aria-label="Dice roll counts">
-                      <h2>Dice Rolls</h2>
-                      <div className="chart-bars">
-                        {diceStats.map((stat) => (
-                          <div key={stat.sum} className={`chart-bar-item ${stat.count === maxDiceCount && stat.count > 0 ? "best" : ""}`}>
-                            <span
-                              className="chart-bar"
-                              style={{ "--bar-height": `${Math.max(6, (stat.count / maxDiceCount) * 100)}%` } as CSSProperties}
-                            >
-                              <strong>{stat.count}</strong>
-                            </span>
-                            <small>{stat.sum}</small>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  ) : null}
-                  {gameOverTab === "resources" ? (
-                    <div className="analysis-chart resource-chart" aria-label="Resource cards drawn">
-                      <h2>Resource Cards Drawn</h2>
-                      <div className="chart-bars resource-bars">
-                        {resourceDrawStats.map((stat) => (
-                          <div key={stat.resource} className={`chart-bar-item ${stat.count === maxResourceDrawCount && stat.count > 0 ? "best" : ""}`}>
-                            <span
-                              className="chart-bar"
-                              style={{ "--bar-height": `${Math.max(6, (stat.count / maxResourceDrawCount) * 100)}%` } as CSSProperties}
-                            >
-                              <strong>{stat.count}</strong>
-                            </span>
-                            <ResourceCard resource={stat.resource} count={stat.count} compact />
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  ) : null}
-                  {gameOverTab === "development" ? (
-                    <div className="analysis-chart development-chart" aria-label="Development cards drawn">
-                      <h2>Development Cards Drawn</h2>
-                      <div className="chart-bars development-bars">
-                        {developmentDrawStats.map((stat) => (
-                          <div key={stat.type} className={`chart-bar-item ${stat.count === maxDevelopmentDrawCount && stat.count > 0 ? "best" : ""}`}>
-                            <span
-                              className="chart-bar"
-                              style={{ "--bar-height": `${Math.max(6, (stat.count / maxDevelopmentDrawCount) * 100)}%` } as CSSProperties}
-                            >
-                              <strong>{stat.count}</strong>
-                            </span>
-                            <DevelopmentCardIcon type={stat.type} />
-                            <small>{developmentCardShortLabels[stat.type]}</small>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  ) : null}
-                </div>
-                <div className="game-over-actions">
-                  <button type="button" aria-label="Open replay" onClick={() => void startReplay()}>Replay</button>
-                  <button type="button" onClick={returnToSetup}>New Match</button>
-                </div>
-              </div>
-            ) : null}
+            <MatchAnalysis
+              state={state}
+              players={displayPlayers}
+              events={visibleEvents}
+              botPlayerIds={botPlayerIds}
+              tab={gameOverTab}
+              onTabChange={setGameOverTab}
+              onReplay={() => void startReplay()}
+              onNewMatch={returnToSetup}
+            />
           </div>
 
           <aside className="side-panel" aria-label="Match information and players">

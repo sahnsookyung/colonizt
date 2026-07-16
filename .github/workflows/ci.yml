@@ -7,6 +7,20 @@ on:
       - main
 
 jobs:
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: high
+
   verify:
     runs-on: ubuntu-latest
     services:
@@ -34,14 +48,28 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgres://colonizt:colonizt@127.0.0.1:54329/colonizt
+      COLONIZT_TEST_DATABASE_URL: postgres://colonizt:colonizt@127.0.0.1:54329/colonizt
       REDIS_URL: redis://127.0.0.1:6389
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm audit --audit-level=high
+      - name: Generate production dependency SBOM
+        run: |
+          mkdir -p reports/supply-chain
+          npm sbom --sbom-format=cyclonedx --omit=dev > reports/supply-chain/sbom.cdx.json
+      - name: Upload dependency SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: production-dependency-sbom
+          path: reports/supply-chain/sbom.cdx.json
+          if-no-files-found: error
       - run: npm run scan:branding
       - run: npm run ops:workflows
       - run: npm run docs:diagrams
@@ -57,6 +85,7 @@ jobs:
       - run: npm run replay:fixtures
       - run: npm run build
       - run: npx playwright install --with-deps chromium
+      - run: npm run test:multiplayer
       - run: npm run test:e2e -- --project=chromium
       - run: npm run test:e2e -- --project=mobile
       - run: npm --workspace @colonizt/db run migrate
