@@ -106,6 +106,20 @@ describe("board generation and validation", () => {
     expect(validateBoard(createFixedBoard())).toEqual([]);
   });
 
+  it("rejects invalid boards and empty player orders while applying player fallbacks", () => {
+    const invalidBoard = structuredClone(createFixedBoard());
+    delete invalidBoard.vertices[Object.keys(invalidBoard.vertices)[0] as VertexId];
+    expect(() => createGame(soloConfig("invalid-board"), invalidBoard)).toThrow(/^Invalid board:/);
+    expect(() => createGame({ ...soloConfig("empty-order"), playerOrder: [] }, createFixedBoard())).toThrow("Game requires at least one player");
+
+    const fallbackPlayer = createGame({
+      ...soloConfig("player-fallbacks"),
+      playerNames: {},
+      playerColors: {},
+    }, createFixedBoard()).players.p1;
+    expect(fallbackPlayer).toMatchObject({ name: "p1", color: "#64748b" });
+  });
+
   it("creates seed-reproducible random boards", () => {
     expect(createSeededBoard("same")).toEqual(createSeededBoard("same"));
     expect(createSeededBoard("same")).not.toEqual(createSeededBoard("different"));
@@ -256,6 +270,40 @@ describe("game setup and phases", () => {
 
   it("rejects rolling before setup is done", () => {
     expectReject(createDemoGame(), { type: "ROLL_DICE", playerId: "p1" }, "WRONG_PHASE");
+  });
+
+  it("returns stable errors for unknown entities and exhausted pieces", () => {
+    const setup = createDemoGame("validation-boundaries");
+    const setupVertex = Object.keys(setup.board.vertices)[0] as VertexId;
+    const setupEdge = setup.board.adjacency.vertexToEdges[setupVertex]![0] as EdgeId;
+    expectReject(setup, { type: "PLACE_SETUP", playerId: "missing", vertexId: setupVertex, edgeId: setupEdge }, "UNKNOWN_PLAYER");
+    expectReject(setup, { type: "PLACE_SETUP", playerId: "p1", vertexId: "missing" as VertexId, edgeId: setupEdge }, "UNKNOWN_VERTEX");
+    expectReject(setup, { type: "PLACE_SETUP", playerId: "p1", vertexId: setupVertex, edgeId: "missing" as EdgeId }, "UNKNOWN_EDGE");
+
+    const state = completeSetup(setup).state;
+    state.phase = { type: "ACTION_PHASE", activePlayerId: "p1" };
+    expectReject(state, { type: "BUILD_ROAD", playerId: "p1", edgeId: "missing" as EdgeId }, "UNKNOWN_EDGE");
+    expectReject(state, { type: "BUILD_SETTLEMENT", playerId: "p1", vertexId: "missing" as VertexId }, "UNKNOWN_VERTEX");
+    expectReject(state, { type: "UPGRADE_CITY", playerId: "p1", vertexId: "missing" as VertexId }, "UNKNOWN_VERTEX");
+    expectReject(state, { type: "UPGRADE_CITY", playerId: "p1", vertexId: setupVertex }, "TRADE_NOT_ALLOWED");
+    expectReject(state, { type: "BUY_SPECIAL_CARD", playerId: "p1" }, "INSUFFICIENT_RESOURCES");
+
+    const roadLimited = structuredClone(state);
+    for (const edgeId of Object.keys(roadLimited.board.edges).slice(0, maxRoadsPerPlayer)) roadLimited.roads[edgeId] = "p1";
+    expectReject(roadLimited, { type: "BUILD_ROAD", playerId: "p1", edgeId: Object.keys(roadLimited.board.edges)[maxRoadsPerPlayer] as EdgeId }, "PIECE_LIMIT");
+
+    const settlementLimited = structuredClone(state);
+    for (const vertexId of Object.keys(settlementLimited.board.vertices).slice(0, 5)) {
+      settlementLimited.settlements[vertexId] = "p1";
+      settlementLimited.buildings[vertexId] = { owner: "p1", type: "settlement" };
+    }
+    expectReject(settlementLimited, { type: "BUILD_SETTLEMENT", playerId: "p1", vertexId: Object.keys(settlementLimited.board.vertices)[8] as VertexId }, "PIECE_LIMIT");
+
+    const cityLimited = structuredClone(state);
+    const cityVertices = Object.keys(cityLimited.board.vertices).slice(0, 5) as VertexId[];
+    for (const vertexId of cityVertices.slice(0, 4)) cityLimited.buildings[vertexId] = { owner: "p1", type: "city" };
+    cityLimited.buildings[cityVertices[4]!] = { owner: "p1", type: "settlement" };
+    expectReject(cityLimited, { type: "UPGRADE_CITY", playerId: "p1", vertexId: cityVertices[4]! }, "PIECE_LIMIT");
   });
 
   it("rolls dice into action phase after setup", () => {
@@ -420,9 +468,31 @@ describe("replay validation", () => {
     const log = { config: state.config, board: state.board, events: events.slice(0, 3) };
 
     expect(validateReplayLog(log)).toEqual([]);
+    const invalidStart = validateReplayLog({ ...log, events: [log.events[1]!] });
+    const duplicate = validateReplayLog({ ...log, events: [log.events[0]!, { ...log.events[1]!, seq: 1 }] });
+    const missing = validateReplayLog({ ...log, events: [log.events[0]!, { ...log.events[2]!, seq: 3 }] });
+    expect(invalidStart.map((issue) => issue.code)).toEqual(["INVALID_SEQUENCE_START"]);
+    expect(duplicate.map((issue) => issue.code)).toEqual(["DUPLICATE_SEQUENCE"]);
+    expect(missing.map((issue) => issue.code)).toEqual(["MISSING_SEQUENCE"]);
     expect(() => replay({ ...log, events: [log.events[1]!] })).toThrow(/expected event sequence 1, got 2/i);
     expect(() => replay({ ...log, events: [log.events[0]!, { ...log.events[1]!, seq: 1 }] })).toThrow(/appears more than once/);
     expect(() => replay({ ...log, events: [log.events[0]!, { ...log.events[2]!, seq: 3 }] })).toThrow(/expected event sequence 2, got 3/i);
+
+    expect(() => replay({ ...log, events: [{ ...log.events[1]!, seq: 2 }, { ...log.events[2]!, seq: 2 }] }))
+      .toThrow("Invalid replay log: Replay expected event sequence 1, got 2; Replay event sequence 2 appears more than once");
+
+    const twoGaps = validateReplayLog({ ...log, events: [log.events[0]!, { ...log.events[1]!, seq: 3 }, { ...log.events[2]!, seq: 4 }] });
+    expect(twoGaps.map((issue) => issue.code)).toEqual(["MISSING_SEQUENCE"]);
+  });
+
+  it("rejects unknown and structurally malformed replay events", () => {
+    const state = createDemoGame("invalid-replay-events");
+    const unknown = { schemaVersion: 3, seq: 1, type: "UNKNOWN_EVENT" } as unknown as GameEvent;
+    const malformed = { schemaVersion: 3, seq: 1, type: "TURN_ENDED", playerId: "p1" } as unknown as GameEvent;
+
+    expect(validateReplayLog({ config: state.config, board: state.board, events: [unknown] })).toEqual(expect.arrayContaining([expect.objectContaining({ code: "INVALID_EVENT" })]));
+    expect(() => replay({ config: state.config, board: state.board, events: [malformed] })).toThrow(/unknown type or invalid payload/i);
+    expect(() => applyEvent(state, unknown)).toThrow(/unsupported game event type UNKNOWN_EVENT/i);
   });
 
   it("replays a validated snapshot plus tail to the same state as the full event log", () => {
@@ -433,6 +503,83 @@ describe("replay validation", () => {
 
     expect(validateReplayLog({ config: state.config, board: state.board, snapshot: { seq: snapshotSeq, state: snapshot }, events: tail })).toEqual([]);
     expect(replay({ config: state.config, board: state.board, snapshot: { seq: snapshotSeq, state: snapshot }, events: tail })).toEqual(state);
+    expect(replay({ config: state.config, board: state.board, snapshot: { seq: snapshotSeq, state: snapshot }, events: [...tail].reverse() })).toEqual(state);
+  });
+
+  it("applies imported events by sequence rather than input order", () => {
+    const state = createDemoGame("replay-event-order");
+    const events: GameEvent[] = [
+      { schemaVersion: 3, seq: 2, type: "TURN_ENDED", playerId: "p2", nextPlayerId: "p1" },
+      { schemaVersion: 3, seq: 1, type: "TURN_ENDED", playerId: "p1", nextPlayerId: "p2" },
+    ];
+
+    const replayed = replay({ config: state.config, board: state.board, events });
+
+    expect(replayed.turn).toBe(2);
+    expect(replayed.phase).toEqual({ type: "WAITING_FOR_ROLL", activePlayerId: "p1" });
+  });
+
+  it("reports malformed snapshots and events with precise import diagnostics", () => {
+    const state = createDemoGame("malformed-replay-diagnostics");
+    const badSnapshot = structuredClone(state) as GameState;
+    badSnapshot.schemaVersion = 99;
+    badSnapshot.eventSeq = 4;
+    const events = [
+      null,
+      { schemaVersion: 3, seq: 0, type: "TURN_ENDED", playerId: "p1", nextPlayerId: "p2" },
+      { schemaVersion: 3, seq: 1 },
+      { schemaVersion: 99, seq: 2, type: "TURN_ENDED", playerId: "p1", nextPlayerId: "p2" },
+    ] as unknown as GameEvent[];
+
+    const issues = validateReplayLog({
+      config: state.config,
+      board: state.board,
+      snapshot: { seq: -1, state: badSnapshot },
+      events,
+    });
+
+    expect(issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "INVALID_SNAPSHOT", message: expect.stringContaining("non-negative integer") }),
+      expect.objectContaining({ code: "INVALID_SNAPSHOT", message: expect.stringContaining("does not match") }),
+      expect.objectContaining({ code: "UNSUPPORTED_SCHEMA", message: expect.stringContaining("snapshot schema") }),
+      expect.objectContaining({ code: "INVALID_EVENT", message: "Replay event must be an object" }),
+      expect.objectContaining({ code: "INVALID_EVENT", message: expect.stringContaining("positive integer") }),
+      expect.objectContaining({ code: "INVALID_EVENT", message: expect.stringContaining("missing a type") }),
+      expect.objectContaining({ code: "UNSUPPORTED_SCHEMA", message: expect.stringContaining("event 2 schema") }),
+    ]));
+  });
+});
+
+describe("board validation", () => {
+  it("reports distribution, topology, and playability corruption together", () => {
+    const board = structuredClone(createFixedBoard());
+    const hexes = Object.values(board.hexes);
+    const center = hexes.find((hex) => hex.q === 0 && hex.r === 0)!;
+    const neighbor = hexes.find((hex) => hex.q === 1 && hex.r === 0)!;
+    const distributionHex = hexes.find((hex) => hex.resource === "fiber")!;
+    distributionHex.resource = "ore";
+    center.resource = "timber";
+    center.token = 6;
+    neighbor.resource = "brick";
+    neighbor.token = 8;
+    const desert = hexes.find((hex) => hex.resource === "desert");
+    if (desert) desert.token = 5;
+    board.adjacency.hexToVertices[center.id] = [];
+    const [edgeId, edge] = Object.entries(board.edges)[0]!;
+    edge.vertices[1] = "missing";
+    board.adjacency.edgeToVertices[edgeId] = ["mismatch-a", "mismatch-b"];
+    for (const vertexId of Object.keys(board.vertices).slice(7)) delete board.vertices[vertexId];
+
+    const errors = validateBoard(board);
+    expect(errors).toEqual(expect.arrayContaining([
+      expect.stringMatching(/classic board has .* tiles, expected/),
+      expect.stringMatching(/adjacent red tokens/),
+      expect.stringMatching(/desert cannot have token/),
+      expect.stringMatching(/does not have six vertices/),
+      expect.stringMatching(/invalid endpoints/),
+      expect.stringMatching(/adjacency mismatch/),
+      "board is too small to be playable",
+    ]));
   });
 });
 
@@ -616,6 +763,99 @@ describe("trading", () => {
     expect(expired.trades.ttl2).toMatchObject({ status: "CLOSED", closedReason: "TTL" });
   });
 
+  it("returns stable errors for missing, stale, and unauthorized trade transitions", () => {
+    const state = withResources(tradeReady(), "p2", { ore: 1 });
+    const missingCommands: GameCommand[] = [
+      { type: "CANCEL_TRADE", playerId: "p1", tradeId: "missing" },
+      { type: "RESPOND_TRADE", playerId: "p2", tradeId: "missing", response: "PASS" },
+      { type: "FINALIZE_TRADE", playerId: "p1", tradeId: "missing", toPlayerId: "p2" },
+      { type: "ACCEPT_TRADE", playerId: "p2", tradeId: "missing" },
+      { type: "REJECT_TRADE", playerId: "p2", tradeId: "missing" },
+      { type: "EXPIRE_TRADE", playerId: "p1", tradeId: "missing" },
+    ];
+    for (const command of missingCommands) expectReject(state, command, "UNKNOWN_TRADE");
+
+    const offered = { ...emptyResources(), timber: 1 };
+    const requested = { ...emptyResources(), ore: 1 };
+    const closed = structuredClone(state);
+    closed.trades.closed = {
+      id: "closed", fromPlayerId: "p1", offered, requested, recipients: ["p2"], status: "CLOSED",
+      createdAtSeq: 0, expiresAtSeq: 1, responses: { p2: { playerId: "p2", status: "PENDING" } },
+    };
+    expectReject(closed, { type: "CANCEL_TRADE", playerId: "p1", tradeId: "closed" }, "STALE_TRADE");
+    expectReject(closed, { type: "RESPOND_TRADE", playerId: "p2", tradeId: "closed", response: "PASS" }, "STALE_TRADE");
+    expectReject(closed, { type: "FINALIZE_TRADE", playerId: "p1", tradeId: "closed", toPlayerId: "p2" }, "STALE_TRADE");
+    expectReject(closed, { type: "ACCEPT_TRADE", playerId: "p2", tradeId: "closed" }, "STALE_TRADE");
+    expectReject(closed, { type: "REJECT_TRADE", playerId: "p2", tradeId: "closed" }, "STALE_TRADE");
+    expectReject(closed, { type: "EXPIRE_TRADE", playerId: "p1", tradeId: "closed" }, "STALE_TRADE");
+
+    const collecting = structuredClone(state);
+    collecting.trades.collecting = {
+      id: "collecting", fromPlayerId: "p1", offered, requested, recipients: ["p2"], status: "COLLECTING_RESPONSES",
+      createdAtSeq: collecting.eventSeq, expiresAtSeq: collecting.eventSeq + 10,
+      responses: { p2: { playerId: "p2", status: "PENDING" } },
+    };
+    expectReject(collecting, { type: "RESPOND_TRADE", playerId: "p1", tradeId: "collecting", response: "PASS" }, "TRADE_NOT_ALLOWED");
+    expectReject(collecting, { type: "RESPOND_TRADE", playerId: "p3", tradeId: "collecting", response: "PASS" }, "TRADE_NOT_ALLOWED");
+    expectReject(collecting, { type: "FINALIZE_TRADE", playerId: "p2", tradeId: "collecting", toPlayerId: "p2" }, "TRADE_NOT_ALLOWED");
+    expectReject(collecting, { type: "FINALIZE_TRADE", playerId: "p1", tradeId: "collecting", toPlayerId: "p3" }, "TRADE_NOT_ALLOWED");
+    expectReject(collecting, { type: "FINALIZE_TRADE", playerId: "p1", tradeId: "collecting", toPlayerId: "p2" }, "TRADE_NOT_ALLOWED");
+  });
+
+  it("enforces legacy open-trade balances and recipients before accepting or rejecting", () => {
+    const offered = { ...emptyResources(), timber: 1 };
+    const requested = { ...emptyResources(), ore: 1 };
+    const openTrade = {
+      id: "legacy-open",
+      fromPlayerId: "p1",
+      offered,
+      requested,
+      recipients: ["p2"] as PlayerId[],
+      status: "OPEN" as const,
+      createdAtSeq: 0,
+      expiresAtSeq: 100,
+    };
+    const ready = withResources(withResources(tradeReady(), "p1", { timber: 1 }), "p2", { ore: 1 });
+    ready.trades[openTrade.id] = openTrade;
+
+    const accepted = applyOrThrow(ready, { type: "ACCEPT_TRADE", playerId: "p2", tradeId: openTrade.id });
+    expect(accepted.events[0]).toMatchObject({ type: "TRADE_ACCEPTED", fromPlayerId: "p1", toPlayerId: "p2" });
+
+    const rejectedState = structuredClone(ready);
+    const rejected = applyOrThrow(rejectedState, { type: "REJECT_TRADE", playerId: "p2", tradeId: openTrade.id });
+    expect(rejected.events[0]).toMatchObject({ type: "TRADE_REJECTED", playerId: "p2" });
+
+    expectReject(ready, { type: "ACCEPT_TRADE", playerId: "p1", tradeId: openTrade.id }, "TRADE_NOT_ALLOWED");
+    expectReject(ready, { type: "ACCEPT_TRADE", playerId: "p3", tradeId: openTrade.id }, "TRADE_NOT_ALLOWED");
+    expectReject(ready, { type: "REJECT_TRADE", playerId: "p3", tradeId: openTrade.id }, "TRADE_NOT_ALLOWED");
+
+    const offererShort = structuredClone(ready);
+    offererShort.players.p1!.resources.timber = 0;
+    expectReject(offererShort, { type: "ACCEPT_TRADE", playerId: "p2", tradeId: openTrade.id }, "INSUFFICIENT_RESOURCES");
+
+    const recipientShort = structuredClone(ready);
+    recipientShort.players.p2!.resources.ore = 0;
+    expectReject(recipientShort, { type: "ACCEPT_TRADE", playerId: "p2", tradeId: openTrade.id }, "INSUFFICIENT_RESOURCES");
+  });
+
+  it("expires another player's legacy offer after an unrelated command advances the event sequence", () => {
+    const state = withResources(tradeReady(), "p1", { timber: 4 });
+    state.trades.expiring = {
+      id: "expiring",
+      fromPlayerId: "p2",
+      offered: { ...emptyResources(), ore: 1 },
+      requested: { ...emptyResources(), timber: 1 },
+      recipients: "ANY",
+      status: "OPEN",
+      createdAtSeq: state.eventSeq,
+      expiresAtSeq: state.eventSeq + 1,
+    };
+
+    const result = applyOrThrow(state, { type: "MARITIME_TRADE", playerId: "p1", offered: "timber", requested: "grain" });
+    expect(result.events.map((event) => event.type)).toEqual(["MARITIME_TRADED", "TRADE_CLOSED"]);
+    expect(result.state.trades.expiring).toMatchObject({ status: "CLOSED", closedReason: "TTL" });
+  });
+
   it("locks the offerer until a staged trade is resolved", () => {
     let state = tradeReady();
     state = applyOrThrow(state, { type: "OFFER_TRADE", playerId: "p1", tradeId: "modal", offered: { ...emptyResources(), timber: 1 }, requested: { ...emptyResources(), ore: 1 }, recipients: "ANY", ttlEvents: 20 }).state;
@@ -782,6 +1022,27 @@ describe("serialization and replay", () => {
     });
   });
 
+  it("redacts every private resource-bearing event for uninvolved viewers", () => {
+    const privateEvents = [
+      { schemaVersion: 3, seq: 1, type: "SPECIAL_CARD_BOUGHT", playerId: "p1", cost: emptyResources(), cardIndex: 0, cardId: "card-1", cardType: "KNIGHT" },
+      { schemaVersion: 3, seq: 2, type: "RESOURCES_DISCARDED", playerId: "p1", resources: { ...emptyResources(), ore: 2 } },
+      { schemaVersion: 3, seq: 3, type: "THIEF_MOVED", playerId: "p1", toHexId: "h1", reason: "ROLL_7", stealFromPlayerId: "p2", stolenResource: "grain" },
+      { schemaVersion: 3, seq: 4, type: "RESOURCES_PRODUCED", gains: { p1: { timber: 2 }, p2: { brick: 1 } } },
+      { schemaVersion: 3, seq: 5, type: "TRADE_ACCEPTED", tradeId: "trade-1", fromPlayerId: "p1", toPlayerId: "p2", offered: { ...emptyResources(), timber: 1 }, requested: { ...emptyResources(), ore: 1 } },
+    ] as GameEvent[];
+
+    const redacted = serializeEventsForViewer(privateEvents, "p3", ["p1", "p2", "p3"]);
+    expect(redacted[0]).toMatchObject({ type: "SPECIAL_CARD_BOUGHT" });
+    expect(redacted[0]).not.toHaveProperty("cardId");
+    expect(redacted[0]).not.toHaveProperty("cardType");
+    expect(redacted[1]).toMatchObject({ resources: emptyResources() });
+    expect(redacted[2]).not.toHaveProperty("stolenResource");
+    expect(redacted[3]).toMatchObject({ gains: { p1: {}, p2: {} } });
+    expect(redacted[4]).toMatchObject({ offered: emptyResources(), requested: emptyResources() });
+
+    expect(serializeEventsForViewer([privateEvents[0]!, privateEvents[2]!], "spectator", ["p1", "p2"], true)).toEqual([privateEvents[0], privateEvents[2]]);
+  });
+
   it("normalizes imported v1 open trades as migrated closed trades", () => {
     const state = applyOrThrow(completeSetup(createDemoGame()).state, { type: "ROLL_DICE", playerId: "p1" }).state;
     state.schemaVersion = 1;
@@ -801,6 +1062,14 @@ describe("serialization and replay", () => {
     expect(normalized.schemaVersion).toBe(3);
     expect(normalized.trades.legacy).toMatchObject({ status: "CLOSED", closedReason: "MIGRATED" });
     expect(normalized.trades.legacy?.responses).toBeUndefined();
+  });
+
+  it("restores a missing thief location from the imported board", () => {
+    const legacy = createDemoGame("legacy-missing-thief");
+    delete legacy.thiefHexId;
+
+    const normalized = normalizeImportedState(legacy);
+    expect(normalized.thiefHexId).toBe(Object.values(normalized.board.hexes).find((hex) => hex.resource === "desert")?.id);
   });
 
   it("replays events to the same state", () => {
@@ -967,6 +1236,43 @@ describe("development cards, thief, and adjudication", () => {
     expect(built.events.some((event) => event.type === "ROAD_BUILDING_PLAYED")).toBe(true);
     expect(built.state.roads[first]).toBe("p1");
     expect(built.state.roads[second]).toBe("p1");
+  });
+
+  it("rejects malformed Road Building selections and supports a genuinely single-road network", () => {
+    const state = applyOrThrow(completeSetup(createDemoGame("road-building-boundaries")).state, { type: "ROLL_DICE", playerId: "p1" }).state;
+    state.players.p1!.developmentCards = [{ id: "road-card", type: "ROAD_BUILDING", ownerId: "p1", boughtTurn: state.turn - 1 }];
+    state.players.p1!.specialCards = 1;
+    const plan = getLegalActions(state, "p1").find((candidate) => candidate.type === "PLAY_ROAD_BUILDING");
+    if (plan?.type !== "PLAY_ROAD_BUILDING" || !plan.options[0]?.[0]) throw new Error("Expected Road Building options");
+    const first = plan.options[0][0];
+
+    expectReject(state, { type: "PLAY_ROAD_BUILDING", playerId: "p1", cardId: "road-card", edgeIds: [] }, "CARD_NOT_PLAYABLE");
+    expectReject(state, { type: "PLAY_ROAD_BUILDING", playerId: "p1", cardId: "road-card", edgeIds: [first, first] }, "CARD_NOT_PLAYABLE");
+
+    const constrained = structuredClone(state);
+    const blockedEdges = new Set<EdgeId>([
+      ...plan.options.map((option) => option[0]).filter((edgeId): edgeId is EdgeId => Boolean(edgeId) && edgeId !== first),
+      ...plan.options.filter((option) => option[0] === first && option[1]).map((option) => option[1]!),
+    ]);
+    for (const edgeId of blockedEdges) constrained.roads[edgeId] = "p2";
+    const constrainedPlan = getLegalActions(constrained, "p1").find((candidate) => candidate.type === "PLAY_ROAD_BUILDING");
+    expect(constrainedPlan).toMatchObject({ type: "PLAY_ROAD_BUILDING", requiredRoadCount: 1, options: [[first]] });
+    const built = applyOrThrow(constrained, { type: "PLAY_ROAD_BUILDING", playerId: "p1", cardId: "road-card", edgeIds: [first] });
+    expect(built.state.roads[first]).toBe("p1");
+  });
+
+  it("rejects invalid and unaffordable maritime trade pairs", () => {
+    const state = applyOrThrow(completeSetup(createDemoGame("maritime-boundaries")).state, { type: "ROLL_DICE", playerId: "p1" }).state;
+    expectReject(state, { type: "MARITIME_TRADE", playerId: "p1", offered: "timber", requested: "timber" }, "TRADE_NOT_ALLOWED");
+    expectReject(state, { type: "MARITIME_TRADE", playerId: "p1", offered: "timber", requested: "grain" }, "INSUFFICIENT_RESOURCES");
+
+    const solo = setupSoloAtVertex(
+      Object.keys(createFixedBoard().vertices)[0] as VertexId,
+      createFixedBoard().adjacency.vertexToEdges[Object.keys(createFixedBoard().vertices)[0] as VertexId]![0] as EdgeId,
+    );
+    const offer = { ...emptyResources(), timber: 1 };
+    const request = { ...emptyResources(), ore: 1 };
+    expectReject(solo, { type: "OFFER_TRADE", playerId: "p1", tradeId: "no-recipient", offered: offer, requested: request, recipients: "ANY" }, "TRADE_NOT_ALLOWED");
   });
 
   it("serializes public config without exposing seed but includes deck remaining", () => {

@@ -8,7 +8,6 @@ import {
   emptyResources,
   eligibleStealTargets,
   getLegalActions,
-  hasResources,
   randomizedDiscard,
   replay,
   resourceCount,
@@ -24,14 +23,32 @@ import {
   type HexId,
   type ViewerState,
 } from "@colonizt/game-core";
-import { createBotTradeId, createBotView, evaluateTrade, greedyBot, hasEquivalentBotTradeOffer, plannerBot, randomLegalBot, resolveBotOfferCommand, tradeFullyAnswered, tradeShapeKey, type BotController } from "@colonizt/bots";
+import { tradeShapeKey } from "@colonizt/bots";
+import {
+  botSeatIds,
+  botTradeResponseCommand,
+  chooseBotTurnCommand,
+  dueTradeResponseCommand,
+  readyBotOfferResolutionCommand,
+} from "./bot-automation.js";
+import {
+  acceptedStoredCommandResult,
+  commandIdempotencyKey,
+  commandPayloadHash,
+  rejectedStoredCommandResult,
+  replayStoredCommandResult,
+  type CommandResult,
+} from "./command-idempotency.js";
 import { DueWorkIndex } from "./due-work.js";
 import { MemoryEventStore, type EventStore, type StoredCommandResult, type StoredMatchSummary, type StoredRoomRecord } from "./event-store.js";
 import { applyLobbySettings, canStartLobby, publicSeatsForRoom, startableSeatsForRoom, type LobbySettingsUpdate } from "./lobby.js";
 import type { RoomOwnershipStore } from "./ownership.js";
-import { hydrateGameFromStoredMatch } from "./replay-hydration.js";
+import { hydrateGameFromStoredMatchWithOutcome } from "./replay-hydration.js";
+import { persistAcceptedEvents } from "./command-commit.js";
+import { createAnalyticsRecord, createChatMessage, createModerationReport } from "./room-content.js";
+import { noOpRoomDiagnostics, type RoomDiagnostics } from "./room-diagnostics.js";
+import { applyRoomCleanupPolicy, cleanupDueAt, resumeRoomIfNeeded } from "./room-lifecycle.js";
 import { connectedSeatedHumanCount, connectedUserCount, isActiveRoom, livenessStateForRoom, roomTimerKey } from "./room-runtime.js";
-import { hashCommandPayload } from "./security.js";
 
 const tradeResponseWindowMs = 15_000;
 const roomCodeAlphabet = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
@@ -167,25 +184,23 @@ export interface RoomHealthEntry {
 
 type AutomationProgress = { key: string; repeats: number; seenAt: number };
 
+const replaceRoomState = (target: Room, source: Room): void => {
+  const mutableTarget = target as unknown as Record<PropertyKey, unknown>;
+  for (const key of Reflect.ownKeys(target)) {
+    if (!Reflect.has(source, key)) delete mutableTarget[key];
+  }
+  Object.assign(target, source);
+};
+
 type RoomManagerOptions = Partial<RoomCleanupPolicy> & {
   sessionTtlMs?: number;
   ownerId?: string;
   ownershipStore?: RoomOwnershipStore;
   ownershipLeaseTtlMs?: number;
+  diagnostics?: RoomDiagnostics;
 };
 
-export type CommandResult = {
-  ok: true;
-  events: GameEvent[];
-  state: GameState;
-  replayed?: boolean;
-  seqStart?: number;
-  seqEnd?: number;
-} | {
-  ok: false;
-  code: string;
-  message: string;
-};
+export type { CommandResult } from "./command-idempotency.js";
 
 export class RoomManager {
   readonly sessions = new Map<string, Session>();
@@ -196,19 +211,22 @@ export class RoomManager {
   private readonly ownerId: string;
   private readonly ownershipStore: RoomOwnershipStore | undefined;
   private readonly ownershipLeaseTtlMs: number;
+  private readonly diagnostics: RoomDiagnostics;
   private readonly automationDueWork = new DueWorkIndex();
   private readonly cleanupDueWork = new DueWorkIndex();
   private readonly automationProgress = new Map<string, AutomationProgress>();
   private readonly automationCommandTimes = new Map<string, number[]>();
   private readonly botTradeCooldowns = new Map<string, number>();
+  private pendingRoomCreations = 0;
 
   constructor(private readonly eventStore: EventStore = new MemoryEventStore(), options: RoomManagerOptions = {}) {
-    const { sessionTtlMs, ownerId, ownershipStore, ownershipLeaseTtlMs, ...cleanupPolicy } = options;
+    const { sessionTtlMs, ownerId, ownershipStore, ownershipLeaseTtlMs, diagnostics, ...cleanupPolicy } = options;
     this.cleanupPolicy = { ...defaultRoomCleanupPolicy, ...cleanupPolicy };
     this.sessionTtlMs = sessionTtlMs ?? defaultSessionTtlMs;
     this.ownerId = ownerId ?? "local";
     this.ownershipStore = ownershipStore;
     this.ownershipLeaseTtlMs = ownershipLeaseTtlMs ?? 30_000;
+    this.diagnostics = diagnostics ?? noOpRoomDiagnostics;
   }
 
   async createSession(displayName: string): Promise<Session> {
@@ -219,8 +237,8 @@ export class RoomManager {
       displayName,
       ...(this.sessionTtlMs > 0 ? { expiresAt: new Date(Date.now() + this.sessionTtlMs).toISOString() } : {}),
     };
-    this.sessions.set(session.token, session);
     await this.eventStore.persistSession(session);
+    this.sessions.set(session.token, session);
     return session;
   }
 
@@ -257,42 +275,49 @@ export class RoomManager {
 
   async createRoom(host: Session, settings: RoomSettings): Promise<Room> {
     await this.cleanupRooms();
-    if (this.activeRoomCount() >= this.cleanupPolicy.maxActiveRooms) {
+    if (this.activeRoomCount() + this.pendingRoomCreations >= this.cleanupPolicy.maxActiveRooms) {
       throw new RoomCapacityError();
     }
-    const createdAt = new Date().toISOString();
-    const seatCount = this.seatCountForSettings(settings);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      const room: Room = {
-        id: `room_${nanoid(8)}`,
-        code: await this.createUniqueRoomCode(),
-        hostUserId: host.userId,
-        status: "LOBBY",
-        settings,
-        seats: Array.from({ length: seatCount }, (_, seatIndex) => ({ seatIndex, ready: false, connected: false })),
-        spectators: new Set(),
-        createdAt,
-        lastActivityAt: createdAt,
-        events: [],
-        chat: [],
-        reports: [],
-        processedClientCommands: new Map(),
-        tradeResponseDeadlines: new Map(),
-      };
-      room.seats[0] = { seatIndex: 0, userId: host.userId, displayName: host.displayName, ready: false, connected: false };
-      this.rooms.set(room.id, room);
-      try {
-        await this.eventStore.persistRoom(room);
-        await this.claimRoom(room);
-        this.updateRoomDueWork(room);
-        return room;
-      } catch (error) {
-        this.rooms.delete(room.id);
-        if (this.isRoomCodeCollision(error) && attempt < 4) continue;
-        throw error;
+    this.pendingRoomCreations += 1;
+    try {
+      const createdAt = new Date().toISOString();
+      const seatCount = this.seatCountForSettings(settings);
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const room: Room = {
+          id: `room_${nanoid(8)}`,
+          code: await this.createUniqueRoomCode(),
+          hostUserId: host.userId,
+          status: "LOBBY",
+          settings,
+          seats: Array.from({ length: seatCount }, (_, seatIndex) => ({ seatIndex, ready: false, connected: false })),
+          spectators: new Set(),
+          createdAt,
+          lastActivityAt: createdAt,
+          events: [],
+          chat: [],
+          reports: [],
+          processedClientCommands: new Map(),
+          tradeResponseDeadlines: new Map(),
+        };
+        room.seats[0] = { seatIndex: 0, userId: host.userId, displayName: host.displayName, ready: false, connected: false };
+        try {
+          await this.eventStore.persistRoom(room);
+          if (!await this.claimRoom(room)) {
+            throw new Error(`Could not acquire ownership for newly created room ${room.id}`);
+          }
+          this.rooms.set(room.id, room);
+          this.updateRoomDueWork(room);
+          return room;
+        } catch (error) {
+          this.rooms.delete(room.id);
+          if (this.isRoomCodeCollision(error) && attempt < 4) continue;
+          throw error;
+        }
       }
+      throw new Error("Could not allocate a unique room code");
+    } finally {
+      this.pendingRoomCreations -= 1;
     }
-    throw new Error("Could not allocate a unique room code");
   }
 
   async createAllBotRoomForTest(settings: RoomSettings, botIds: readonly PlayerId[] = ["bot_1", "bot_2", "bot_3", "bot_4"]): Promise<Room> {
@@ -300,17 +325,18 @@ export class RoomManager {
     const host = await this.createSession("All Bot Test Host");
     const allBotSettings = { ...settings, botFill: true, maxPlayers: botIds.length };
     const room = await this.createRoom(host, allBotSettings);
-    room.hostUserId = botIds[0]!;
-    room.seats = room.seats.map((seat, index) => ({
+    const candidate = structuredClone(room) as Room;
+    candidate.hostUserId = botIds[0]!;
+    candidate.seats = candidate.seats.map((seat, index) => ({
       seatIndex: seat.seatIndex,
       botId: botIds[index]!,
       ready: true,
       connected: true,
     }));
-    room.settings = allBotSettings;
-    this.touchRoom(room);
-    await this.eventStore.persistRoom(room);
-    await this.startRoom(room);
+    candidate.settings = allBotSettings;
+    this.touchRoom(candidate);
+    await this.startRoom(candidate);
+    replaceRoomState(room, candidate);
     this.updateRoomDueWork(room);
     return room;
   }
@@ -350,17 +376,32 @@ export class RoomManager {
     return Object.keys(deadlines).length > 0 ? { ...snapshot, tradeResponseDeadlines: deadlines } : snapshot;
   }
 
-  async hydrateFromStore(limit = 50): Promise<number> {
-    const [sessions, records] = await Promise.all([
-      this.eventStore.loadSessions(limit * 4),
-      this.eventStore.loadRooms(limit),
-    ]);
+  async hydrateFromStore(limit = this.cleanupPolicy.maxActiveRooms): Promise<number> {
+    let sessions: Session[];
+    let records: StoredRoomRecord[];
+    try {
+      [sessions, records] = await Promise.all([
+        this.eventStore.loadSessions(limit * 4),
+        this.eventStore.loadRooms(limit),
+      ]);
+    } catch (error) {
+      this.diagnostics.recordStoreValidationFailure("room");
+      this.diagnostics.recordHydration("failure");
+      throw error;
+    }
     for (const session of sessions) {
       if (this.sessionIsActive(session)) this.sessions.set(session.token, session);
     }
     let hydrated = 0;
     for (const record of records) {
-      const room = this.roomFromStoredRecord(record);
+      let room: Room;
+      try {
+        room = this.roomFromStoredRecord(record);
+      } catch (error) {
+        this.diagnostics.recordStoreValidationFailure("room");
+        this.diagnostics.recordHydration("failure");
+        throw error;
+      }
       if (await this.claimRoom(room)) {
         this.rooms.set(room.id, room);
         this.updateRoomDueWork(room);
@@ -375,7 +416,14 @@ export class RoomManager {
     if (existing) return existing;
     const stored = await this.eventStore.loadRoomByRef?.(roomRef);
     if (!stored) return undefined;
-    const room = this.roomFromStoredRecord(stored);
+    let room: Room;
+    try {
+      room = this.roomFromStoredRecord(stored);
+    } catch (error) {
+      this.diagnostics.recordStoreValidationFailure("room");
+      this.diagnostics.recordHydration("failure");
+      throw error;
+    }
     if (room.archivedAt || room.status === "EXPIRED" || room.status === "ABANDONED") return room;
     if (!await this.claimRoom(room)) return room;
     this.rooms.set(room.id, room);
@@ -439,56 +487,78 @@ export class RoomManager {
     return publicSeatsForRoom(room, (userId) => this.displayNameForUser(userId));
   }
 
+  private repairLobbyHost(room: Room): void {
+    if (room.status !== "LOBBY" || room.seats.some((seat) => seat.userId === room.hostUserId)) return;
+    const nextHost = room.seats.find((seat) => seat.userId)?.userId;
+    if (nextHost) room.hostUserId = nextHost;
+  }
+
   async updateDisplayName(session: Session, displayName: string, roomRef?: string): Promise<Session> {
     const nextName = displayName.trim().slice(0, 40);
     if (!nextName) return session;
-    session.displayName = nextName;
+    const candidateSession = { ...session, displayName: nextName };
+    await this.eventStore.persistSession(candidateSession);
+    Object.assign(session, candidateSession);
     this.sessions.set(session.token, session);
-    await this.eventStore.persistSession(session);
     const candidateRooms = roomRef ? [await this.ensureRoomLoadedByRef(roomRef)] : [...this.rooms.values()];
-    await Promise.all(candidateRooms.filter((room): room is Room => Boolean(room)).map(async (room) => {
+    await Promise.all(candidateRooms.filter((room): room is Room => Boolean(room)).map(async (targetRoom) => {
+      const room = this.roomForRef(targetRoom.id) ?? targetRoom;
       if (!await this.claimRoom(room)) return;
-      const seat = room.seats.find((candidate) => candidate.userId === session.userId);
+      const candidate = structuredClone(room) as Room;
+      const seat = candidate.seats.find((candidateSeat) => candidateSeat.userId === session.userId);
       if (!seat || seat.displayName === nextName) return;
       seat.displayName = nextName;
-      this.touchRoom(room);
-      await this.eventStore.persistRoom(room);
+      this.touchRoom(candidate);
+      await this.eventStore.persistRoom(candidate);
+      replaceRoomState(room, candidate);
       this.updateRoomDueWork(room);
     }));
     return session;
   }
 
   async joinRoom(roomId: string, session: Session, asSpectator = false): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
-    const room = await this.ensureRoomLoadedByRef(roomId);
-    if (!room) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
+    const targetRoom = await this.ensureRoomLoadedByRef(roomId);
+    if (!targetRoom) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
+    return this.enqueueRoom(targetRoom.id, () => this.joinRoomNow(targetRoom, session, asSpectator));
+  }
+
+  private async joinRoomNow(targetRoom: Room, session: Session, asSpectator: boolean): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
+    const room = this.roomForRef(targetRoom.id) ?? targetRoom;
     if (room.status === "EXPIRED") return { ok: false, code: "ROOM_EXPIRED", message: "Room expired because everyone left the lobby" };
     if (room.status === "ABANDONED") return { ok: false, code: "ROOM_ABANDONED", message: "Room was abandoned because all seated players disconnected" };
     if (room.archivedAt) return { ok: false, code: "ROOM_CLOSED", message: "Room is closed" };
     if (!await this.claimRoom(room)) return { ok: false, code: "ROOM_NOT_OWNED", message: "Room is owned by another server" };
-    const existing = room.seats.find((seat) => seat.userId === session.userId);
+
+    const candidate = structuredClone(room) as Room;
+    const existing = candidate.seats.find((seat) => seat.userId === session.userId);
     if (existing) {
       existing.connected = true;
       existing.displayName = session.displayName;
-      this.touchRoom(room);
-      this.resumeRoomIfNeeded(room);
-      await this.eventStore.persistRoom(room);
+      this.repairLobbyHost(candidate);
+      this.touchRoom(candidate);
+      resumeRoomIfNeeded(candidate);
+      await this.eventStore.persistRoom(candidate);
+      replaceRoomState(room, candidate);
       this.updateRoomDueWork(room);
       return { ok: true, room };
     }
-    if (asSpectator || room.status !== "LOBBY") {
-      room.spectators.add(session.userId);
-      this.touchRoom(room);
-      await this.eventStore.persistRoom(room);
+    if (asSpectator || candidate.status !== "LOBBY") {
+      candidate.spectators.add(session.userId);
+      this.touchRoom(candidate);
+      await this.eventStore.persistRoom(candidate);
+      replaceRoomState(room, candidate);
       this.updateRoomDueWork(room);
       return { ok: true, room };
     }
-    const seat = room.seats.find((candidate) => !candidate.userId && !candidate.botId);
+    const seat = candidate.seats.find((candidateSeat) => !candidateSeat.userId && !candidateSeat.botId);
     if (!seat) return { ok: false, code: "ROOM_FULL", message: "Room is full" };
     seat.userId = session.userId;
     seat.displayName = session.displayName;
     seat.connected = true;
-    this.touchRoom(room);
-    await this.eventStore.persistRoom(room);
+    this.repairLobbyHost(candidate);
+    this.touchRoom(candidate);
+    await this.eventStore.persistRoom(candidate);
+    replaceRoomState(room, candidate);
     this.updateRoomDueWork(room);
     return { ok: true, room };
   }
@@ -499,23 +569,24 @@ export class RoomManager {
     if (targetRoom.status === "EXPIRED") return { ok: false, code: "ROOM_EXPIRED", message: "Room expired because everyone left the lobby" };
     if (targetRoom.status === "ABANDONED") return { ok: false, code: "ROOM_ABANDONED", message: "Room was abandoned because all seated players disconnected" };
     if (targetRoom.archivedAt) return { ok: false, code: "ROOM_CLOSED", message: "Room is closed" };
-    return this.enqueueRoom(targetRoom.id, () => this.setReadyNow(targetRoom.id, session, ready));
+    return this.enqueueRoom(targetRoom.id, () => this.setReadyNow(targetRoom, session, ready));
   }
 
-  private async setReadyNow(roomId: string, session: Session, ready: boolean): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
-    const room = this.roomForRef(roomId);
-    if (!room) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
+  private async setReadyNow(targetRoom: Room, session: Session, ready: boolean): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
+    const room = this.roomForRef(targetRoom.id) ?? targetRoom;
     if (!await this.claimRoom(room)) return { ok: false, code: "ROOM_NOT_OWNED", message: "Room is owned by another server" };
     if (room.status === "EXPIRED" || room.status === "ABANDONED") return { ok: false, code: "ROOM_CLOSED", message: "Room is closed" };
     if (room.status !== "LOBBY") return { ok: false, code: "ROOM_ALREADY_STARTED", message: "Room has already started" };
-    const seat = room.seats.find((candidate) => candidate.userId === session.userId);
+    const candidate = structuredClone(room) as Room;
+    const seat = candidate.seats.find((candidateSeat) => candidateSeat.userId === session.userId);
     if (!seat) return { ok: false, code: "NOT_IN_ROOM", message: "You are not seated in this room" };
     seat.ready = ready;
     seat.connected = true;
-    this.touchRoom(room);
-    if (room.settings.botFill) this.fillBots(room);
-    if (room.settings.botFill && this.canStart(room)) await this.startRoom(room);
-    else await this.eventStore.persistRoom(room);
+    this.touchRoom(candidate);
+    if (candidate.settings.botFill) this.fillBots(candidate);
+    if (candidate.settings.botFill && this.canStart(candidate)) await this.startRoom(candidate);
+    else await this.eventStore.persistRoom(candidate);
+    replaceRoomState(room, candidate);
     this.updateRoomDueWork(room);
     return { ok: true, room };
   }
@@ -523,21 +594,22 @@ export class RoomManager {
   async updateRoomSettings(roomId: string, session: Session, settings: LobbySettingsUpdate): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
     const targetRoom = await this.ensureRoomLoadedByRef(roomId);
     if (!targetRoom) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
-    return this.enqueueRoom(targetRoom.id, () => this.updateRoomSettingsNow(targetRoom.id, session, settings));
+    return this.enqueueRoom(targetRoom.id, () => this.updateRoomSettingsNow(targetRoom, session, settings));
   }
 
-  private async updateRoomSettingsNow(roomId: string, session: Session, settings: LobbySettingsUpdate): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
-    const room = this.roomForRef(roomId);
-    if (!room) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
+  private async updateRoomSettingsNow(targetRoom: Room, session: Session, settings: LobbySettingsUpdate): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
+    const room = this.roomForRef(targetRoom.id) ?? targetRoom;
     if (!await this.claimRoom(room)) return { ok: false, code: "ROOM_NOT_OWNED", message: "Room is owned by another server" };
     if (room.status !== "LOBBY") return { ok: false, code: "ROOM_ALREADY_STARTED", message: "Room has already started" };
     if (room.hostUserId !== session.userId) return { ok: false, code: "NOT_ROOM_HOST", message: "Only the host can change room settings" };
     const next = applyLobbySettings(room, settings);
     if (!next.ok) return next;
-    room.seats = next.seats;
-    room.settings = next.settings;
-    this.touchRoom(room);
-    await this.eventStore.persistRoom(room);
+    const candidate = structuredClone(room) as Room;
+    candidate.seats = next.seats;
+    candidate.settings = next.settings;
+    this.touchRoom(candidate);
+    await this.eventStore.persistRoom(candidate);
+    replaceRoomState(room, candidate);
     this.updateRoomDueWork(room);
     return { ok: true, room };
   }
@@ -545,24 +617,25 @@ export class RoomManager {
   async addLobbyBot(roomId: string, session: Session): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
     const targetRoom = await this.ensureRoomLoadedByRef(roomId);
     if (!targetRoom) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
-    return this.enqueueRoom(targetRoom.id, () => this.addLobbyBotNow(targetRoom.id, session));
+    return this.enqueueRoom(targetRoom.id, () => this.addLobbyBotNow(targetRoom, session));
   }
 
-  private async addLobbyBotNow(roomId: string, session: Session): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
-    const room = this.roomForRef(roomId);
-    if (!room) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
+  private async addLobbyBotNow(targetRoom: Room, session: Session): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
+    const room = this.roomForRef(targetRoom.id) ?? targetRoom;
     if (!await this.claimRoom(room)) return { ok: false, code: "ROOM_NOT_OWNED", message: "Room is owned by another server" };
     if (room.status !== "LOBBY") return { ok: false, code: "ROOM_ALREADY_STARTED", message: "Room has already started" };
     if (room.hostUserId !== session.userId) return { ok: false, code: "NOT_ROOM_HOST", message: "Only the host can add bots" };
-    const seat = room.seats.find((candidate) => !candidate.userId && !candidate.botId);
+    const candidate = structuredClone(room) as Room;
+    const seat = candidate.seats.find((candidateSeat) => !candidateSeat.userId && !candidateSeat.botId);
     if (!seat) return { ok: false, code: "ROOM_FULL", message: "No open seats for a bot" };
     seat.botId = this.botIdForSeat(seat.seatIndex);
     seat.ready = true;
     seat.connected = true;
     delete seat.displayName;
-    room.settings.botFill = false;
-    this.touchRoom(room);
-    await this.eventStore.persistRoom(room);
+    candidate.settings.botFill = false;
+    this.touchRoom(candidate);
+    await this.eventStore.persistRoom(candidate);
+    replaceRoomState(room, candidate);
     this.updateRoomDueWork(room);
     return { ok: true, room };
   }
@@ -570,24 +643,25 @@ export class RoomManager {
   async removeLobbyBot(roomId: string, session: Session, seatIndex: number): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
     const targetRoom = await this.ensureRoomLoadedByRef(roomId);
     if (!targetRoom) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
-    return this.enqueueRoom(targetRoom.id, () => this.removeLobbyBotNow(targetRoom.id, session, seatIndex));
+    return this.enqueueRoom(targetRoom.id, () => this.removeLobbyBotNow(targetRoom, session, seatIndex));
   }
 
-  private async removeLobbyBotNow(roomId: string, session: Session, seatIndex: number): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
-    const room = this.roomForRef(roomId);
-    if (!room) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
+  private async removeLobbyBotNow(targetRoom: Room, session: Session, seatIndex: number): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
+    const room = this.roomForRef(targetRoom.id) ?? targetRoom;
     if (!await this.claimRoom(room)) return { ok: false, code: "ROOM_NOT_OWNED", message: "Room is owned by another server" };
     if (room.status !== "LOBBY") return { ok: false, code: "ROOM_ALREADY_STARTED", message: "Room has already started" };
     if (room.hostUserId !== session.userId) return { ok: false, code: "NOT_ROOM_HOST", message: "Only the host can remove bots" };
-    const seat = room.seats[seatIndex];
+    const candidate = structuredClone(room) as Room;
+    const seat = candidate.seats[seatIndex];
     if (!seat?.botId) return { ok: false, code: "BOT_NOT_FOUND", message: "No bot is seated there" };
     delete seat.botId;
     delete seat.displayName;
     seat.ready = false;
     seat.connected = false;
-    room.settings.botFill = false;
-    this.touchRoom(room);
-    await this.eventStore.persistRoom(room);
+    candidate.settings.botFill = false;
+    this.touchRoom(candidate);
+    await this.eventStore.persistRoom(candidate);
+    replaceRoomState(room, candidate);
     this.updateRoomDueWork(room);
     return { ok: true, room };
   }
@@ -595,19 +669,20 @@ export class RoomManager {
   async startRoomByHost(roomId: string, session: Session): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
     const targetRoom = await this.ensureRoomLoadedByRef(roomId);
     if (!targetRoom) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
-    return this.enqueueRoom(targetRoom.id, () => this.startRoomByHostNow(targetRoom.id, session));
+    return this.enqueueRoom(targetRoom.id, () => this.startRoomByHostNow(targetRoom, session));
   }
 
-  private async startRoomByHostNow(roomId: string, session: Session): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
-    const room = this.roomForRef(roomId);
-    if (!room) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
+  private async startRoomByHostNow(targetRoom: Room, session: Session): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
+    const room = this.roomForRef(targetRoom.id) ?? targetRoom;
     if (!await this.claimRoom(room)) return { ok: false, code: "ROOM_NOT_OWNED", message: "Room is owned by another server" };
     if (room.status !== "LOBBY") return { ok: false, code: "ROOM_ALREADY_STARTED", message: "Room has already started" };
     if (room.hostUserId !== session.userId) return { ok: false, code: "NOT_ROOM_HOST", message: "Only the host can start the room" };
-    if (room.settings.botFill) this.fillBots(room);
-    if (!this.canStart(room)) return { ok: false, code: "ROOM_NOT_READY", message: "At least two connected ready players are required" };
-    this.touchRoom(room);
-    await this.startRoom(room);
+    const candidate = structuredClone(room) as Room;
+    if (candidate.settings.botFill) this.fillBots(candidate);
+    if (!this.canStart(candidate)) return { ok: false, code: "ROOM_NOT_READY", message: "At least two connected ready players are required" };
+    this.touchRoom(candidate);
+    await this.startRoom(candidate);
+    replaceRoomState(room, candidate);
     this.updateRoomDueWork(room);
     return { ok: true, room };
   }
@@ -618,19 +693,19 @@ export class RoomManager {
     if (targetRoom.archivedAt || targetRoom.status === "EXPIRED" || targetRoom.status === "ABANDONED") {
       return { ok: false, code: "ROOM_CLOSED", message: "Room is closed" };
     }
-    return this.enqueueRoom(targetRoom.id, () => this.leaveRoomNow(targetRoom.id, session, now));
+    return this.enqueueRoom(targetRoom.id, () => this.leaveRoomNow(targetRoom, session, now));
   }
 
-  private async leaveRoomNow(roomId: string, session: Session, now: number): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
-    const room = this.roomForRef(roomId);
-    if (!room) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
+  private async leaveRoomNow(targetRoom: Room, session: Session, now: number): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
+    const room = this.roomForRef(targetRoom.id) ?? targetRoom;
     if (!await this.claimRoom(room)) return { ok: false, code: "ROOM_NOT_OWNED", message: "Room is owned by another server" };
 
+    const candidate = structuredClone(room) as Room;
     let changed = false;
-    if (room.spectators.delete(session.userId)) changed = true;
-    const seat = room.seats.find((candidate) => candidate.userId === session.userId);
+    if (candidate.spectators.delete(session.userId)) changed = true;
+    const seat = candidate.seats.find((candidateSeat) => candidateSeat.userId === session.userId);
     if (seat) {
-      if (room.status === "LOBBY") {
+      if (candidate.status === "LOBBY") {
         delete seat.userId;
         delete seat.botId;
         delete seat.displayName;
@@ -644,32 +719,33 @@ export class RoomManager {
       }
     }
 
-    if (room.status === "LOBBY" && room.hostUserId === session.userId) {
-      const nextHost = room.seats.find((candidate) => candidate.userId)?.userId;
-      if (nextHost) room.hostUserId = nextHost;
+    if (candidate.status === "LOBBY" && candidate.hostUserId === session.userId) {
+      const nextHost = candidate.seats.find((candidateSeat) => candidateSeat.userId)?.userId;
+      if (nextHost) candidate.hostUserId = nextHost;
     }
 
-    if (connectedSeatedHumanCount(room) === 0) {
+    if (connectedSeatedHumanCount(candidate) === 0) {
       const nowIso = new Date(now).toISOString();
-      if (room.status === "IN_GAME" && !room.pausedAt) {
-        room.pausedAt = nowIso;
-        room.pauseReason = "EMPTY_ROOM";
-        room.emptySince ??= nowIso;
+      if (candidate.status === "IN_GAME" && !candidate.pausedAt) {
+        candidate.pausedAt = nowIso;
+        candidate.pauseReason = "EMPTY_ROOM";
+        candidate.emptySince ??= nowIso;
         changed = true;
-      } else if ((room.status === "LOBBY" || room.status === "FINISHED") && !room.emptySince) {
-        room.emptySince = nowIso;
+      } else if ((candidate.status === "LOBBY" || candidate.status === "FINISHED") && !candidate.emptySince) {
+        candidate.emptySince = nowIso;
         changed = true;
       }
-    } else if (this.resumeRoomIfNeeded(room, now)) {
+    } else if (resumeRoomIfNeeded(candidate, now)) {
       changed = true;
-    } else if (room.emptySince && room.status !== "IN_GAME") {
-      delete room.emptySince;
+    } else if (candidate.emptySince && candidate.status !== "IN_GAME") {
+      delete candidate.emptySince;
       changed = true;
     }
 
     if (changed) {
-      this.touchRoom(room, now);
-      await this.eventStore.persistRoom(room);
+      this.touchRoom(candidate, now);
+      await this.eventStore.persistRoom(candidate);
+      replaceRoomState(room, candidate);
       this.updateRoomDueWork(room, now);
     }
     return { ok: true, room };
@@ -679,44 +755,46 @@ export class RoomManager {
     const room = this.roomForRef(roomId);
     if (!room) return undefined;
     if (!await this.claimRoom(room)) return undefined;
+    const candidate = structuredClone(room) as Room;
     let changed = false;
-    for (const seat of room.seats) {
+    for (const seat of candidate.seats) {
       if (!seat.userId) continue;
       const connected = connectedUserIds.has(seat.userId);
       if (seat.connected !== connected) {
         seat.connected = connected;
         changed = true;
       }
-      if (room.status === "LOBBY" && !connected && seat.ready) {
+      if (candidate.status === "LOBBY" && !connected && seat.ready) {
         seat.ready = false;
         changed = true;
       }
     }
-    for (const spectatorId of [...room.spectators]) {
+    for (const spectatorId of [...candidate.spectators]) {
       if (!connectedUserIds.has(spectatorId)) {
-        room.spectators.delete(spectatorId);
+        candidate.spectators.delete(spectatorId);
         changed = true;
       }
     }
-    if (connectedSeatedHumanCount(room) === 0) {
-      if (room.status === "IN_GAME" && !room.pausedAt) {
-        room.pausedAt = new Date(now).toISOString();
-        room.pauseReason = "EMPTY_ROOM";
-        room.emptySince ??= room.pausedAt;
+    if (connectedSeatedHumanCount(candidate) === 0) {
+      if (candidate.status === "IN_GAME" && !candidate.pausedAt) {
+        candidate.pausedAt = new Date(now).toISOString();
+        candidate.pauseReason = "EMPTY_ROOM";
+        candidate.emptySince ??= candidate.pausedAt;
         changed = true;
-      } else if ((room.status === "LOBBY" || room.status === "FINISHED") && !room.emptySince) {
-        room.emptySince = new Date(now).toISOString();
+      } else if ((candidate.status === "LOBBY" || candidate.status === "FINISHED") && !candidate.emptySince) {
+        candidate.emptySince = new Date(now).toISOString();
         changed = true;
       }
-    } else if (this.resumeRoomIfNeeded(room, now)) {
+    } else if (resumeRoomIfNeeded(candidate, now)) {
       changed = true;
-    } else if (room.emptySince && room.status !== "IN_GAME") {
-      delete room.emptySince;
+    } else if (candidate.emptySince && candidate.status !== "IN_GAME") {
+      delete candidate.emptySince;
       changed = true;
     }
     if (changed) {
-      this.touchRoom(room, now);
-      await this.eventStore.persistRoom(room);
+      this.touchRoom(candidate, now);
+      await this.eventStore.persistRoom(candidate);
+      replaceRoomState(room, candidate);
       this.updateRoomDueWork(room, now);
     }
     return room;
@@ -730,78 +808,26 @@ export class RoomManager {
     for (const room of candidates) {
       if (room.archivedAt) continue;
       if (!await this.claimRoom(room)) continue;
-      const nowIso = new Date(now).toISOString();
-      const connectedSeatedHumans = connectedSeatedHumanCount(room);
-      const connectedUsers = connectedUserCount(room);
-      let changed = false;
-
-      if (room.status === "LOBBY") {
-        if (connectedSeatedHumans === 0) {
-          if (!room.emptySince) {
-            room.emptySince = nowIso;
-            changed = true;
-          }
-          if (now - Date.parse(room.emptySince) >= this.cleanupPolicy.emptyLobbyTtlMs) {
-            room.status = "EXPIRED";
-            room.cleanupReason = "EMPTY_LOBBY_TTL";
-            room.archivedAt = nowIso;
-            changed = true;
-          }
-        } else if (room.emptySince) {
-          delete room.emptySince;
-          changed = true;
-        }
-      } else if (room.status === "IN_GAME") {
-        if (connectedSeatedHumans === 0) {
-          if (!room.emptySince) {
-            room.emptySince = nowIso;
-            changed = true;
-          }
-          if (!room.pausedAt) {
-            room.pausedAt = nowIso;
-            room.pauseReason = "EMPTY_ROOM";
-            changed = true;
-          }
-          if (now - Date.parse(room.emptySince) >= this.cleanupPolicy.emptyGameTtlMs) {
-            room.status = "ABANDONED";
-            room.cleanupReason = "EMPTY_GAME_TTL";
-            room.archivedAt = nowIso;
-            changed = true;
-          }
-        } else if (this.resumeRoomIfNeeded(room, now)) {
-          changed = true;
-        }
-      } else if (room.status === "FINISHED") {
-        if (connectedUsers === 0) {
-          if (!room.emptySince) {
-            room.emptySince = nowIso;
-            changed = true;
-          }
-          if (now - Date.parse(room.emptySince) >= this.cleanupPolicy.finishedRoomUnloadMs) {
-            room.cleanupReason = "FINISHED_UNLOADED";
-            room.archivedAt = nowIso;
-            changed = true;
-          }
-        } else if (room.emptySince) {
-          delete room.emptySince;
-          changed = true;
-        }
-      }
+      const candidate = structuredClone(room) as Room;
+      const changed = applyRoomCleanupPolicy(candidate, this.cleanupPolicy, now);
 
       if (!changed) continue;
-      this.touchRoom(room, now);
-      await this.eventStore.persistRoom(room);
-      if (room.archivedAt || room.status === "EXPIRED" || room.status === "ABANDONED") {
+      this.touchRoom(candidate, now);
+      await this.eventStore.persistRoom(candidate);
+      if (candidate.archivedAt || candidate.status === "EXPIRED" || candidate.status === "ABANDONED") {
         this.rooms.delete(room.id);
         this.removeRoomRuntimeState(room.id);
         await this.releaseRoom(room.id);
         cleaned.push({
-          roomId: room.id,
-          code: room.code,
-          status: room.status,
-          ...(room.cleanupReason ? { cleanupReason: room.cleanupReason } : {}),
+          roomId: candidate.id,
+          code: candidate.code,
+          status: candidate.status,
+          ...(candidate.cleanupReason ? { cleanupReason: candidate.cleanupReason } : {}),
         });
-      } else this.updateRoomDueWork(room, now);
+      } else {
+        replaceRoomState(room, candidate);
+        this.updateRoomDueWork(room, now);
+      }
     }
     return cleaned;
   }
@@ -839,7 +865,7 @@ export class RoomManager {
     return [...this.rooms.values()]
       .filter((room) => isActiveRoom(room))
       .map((room) => {
-        const cleanupDueAt = this.cleanupDueAt(room, now);
+        const roomCleanupDueAt = cleanupDueAt(room, this.cleanupPolicy, now);
         const entry: RoomHealthEntry = {
           roomId: room.id,
           code: room.code,
@@ -858,7 +884,7 @@ export class RoomManager {
         if (room.pauseReason) entry.pauseReason = room.pauseReason;
         if (room.cleanupReason) entry.cleanupReason = room.cleanupReason;
         if (room.timer) entry.timer = room.timer;
-        if (Number.isFinite(cleanupDueAt)) entry.cleanupDueAt = new Date(cleanupDueAt).toISOString();
+        if (Number.isFinite(roomCleanupDueAt)) entry.cleanupDueAt = new Date(roomCleanupDueAt).toISOString();
         if (room.game) {
           entry.eventSeq = room.game.eventSeq;
           entry.turn = room.game.turn;
@@ -956,7 +982,9 @@ export class RoomManager {
   }
 
   async submitCommand(roomId: string, session: Session, clientSeq: number, command: GameCommand): Promise<CommandResult> {
-    return this.enqueueRoom(roomId, () => this.submitCommandNow(roomId, session, clientSeq, command));
+    const targetRoom = await this.ensureRoomLoadedByRef(roomId);
+    const canonicalRoomId = targetRoom?.id ?? roomId;
+    return this.enqueueRoom(canonicalRoomId, () => this.submitCommandNow(targetRoom, canonicalRoomId, session, clientSeq, command));
   }
 
   async expireTurn(roomId: string, now = Date.now()): Promise<CommandResult | undefined> {
@@ -987,20 +1015,14 @@ export class RoomManager {
     };
     this.refreshTimer(committedRoom, previousState, now);
     try {
-      if (this.eventStore.commitEvents) {
-        await this.eventStore.commitEvents(committedRoom, events, commandResult);
-      } else {
-        await this.eventStore.appendEvents(committedRoom, events);
-        if (commandResult) await this.eventStore.persistCommandResult?.(commandResult);
-        if (nextState.phase.type === "GAME_OVER") await this.eventStore.markFinished(committedRoom, nextState.phase.winnerId);
-        else await this.eventStore.persistRoom(committedRoom);
-      }
+      await persistAcceptedEvents(this.eventStore, committedRoom, nextState, events, commandResult);
     } catch (error) {
       if ((error as { code?: unknown }).code === "COMMAND_RESULT_CONFLICT" && commandResult) {
+        this.diagnostics.recordCommandConflict("accepted");
         const persisted = await this.eventStore.loadCommandResult?.(room.id, commandResult.userId, commandResult.clientSeq);
         if (persisted) {
-          room.processedClientCommands.set(`${room.id}:${commandResult.userId}:${commandResult.clientSeq}`, persisted);
-          return this.commandResultReplay(room, persisted, commandResult.commandHash);
+          room.processedClientCommands.set(commandIdempotencyKey(room.id, commandResult.userId, commandResult.clientSeq), persisted);
+          return replayStoredCommandResult(room.game, persisted, commandResult.commandHash);
         }
         return { ok: false, code: "CLIENT_SEQ_CONFLICT", message: "Client sequence was already used for a different command" };
       }
@@ -1011,52 +1033,52 @@ export class RoomManager {
     room.game = nextState;
     room.status = nextStatus;
     this.touchRoom(room, now);
-    if (commandResult) room.processedClientCommands.set(`${room.id}:${commandResult.userId}:${commandResult.clientSeq}`, commandResult);
+    if (commandResult) room.processedClientCommands.set(commandIdempotencyKey(room.id, commandResult.userId, commandResult.clientSeq), commandResult);
     if (committedRoom.timer) room.timer = committedRoom.timer;
     else delete room.timer;
     this.updateRoomDueWork(room, now);
     return { ok: true, events, state: room.game };
   }
 
-  private async submitCommandNow(roomId: string, session: Session, clientSeq: number, command: GameCommand): Promise<CommandResult> {
-    const room = this.roomForRef(roomId);
+  private async submitCommandNow(targetRoom: Room | undefined, roomId: string, session: Session, clientSeq: number, command: GameCommand): Promise<CommandResult> {
+    const room = this.roomForRef(roomId) ?? targetRoom;
     if (!room?.game) return { ok: false, code: "ROOM_NOT_IN_GAME", message: "Room is not in game" };
     if (!await this.claimRoom(room)) return { ok: false, code: "ROOM_NOT_OWNED", message: "Room is owned by another server" };
     if (room.pausedAt) return { ok: false, code: "ROOM_PAUSED", message: "Room is paused until a seated player reconnects" };
     if (!this.isMember(room, session.userId)) return { ok: false, code: "NOT_IN_ROOM", message: "You are not in this room" };
     if (command.playerId !== session.userId) return { ok: false, code: "COMMAND_PLAYER_MISMATCH", message: "Command player does not match session" };
 
-    const commandHash = hashCommandPayload(command);
-    const idempotencyKey = `${room.id}:${session.userId}:${clientSeq}`;
+    const commandHash = commandPayloadHash(command);
+    const idempotencyKey = commandIdempotencyKey(room.id, session.userId, clientSeq);
     const duplicate = room.processedClientCommands.get(idempotencyKey)
       ?? await this.eventStore.loadCommandResult?.(room.id, session.userId, clientSeq);
     if (duplicate) {
       room.processedClientCommands.set(idempotencyKey, duplicate);
-      return this.commandResultReplay(room, duplicate, commandHash);
+      return replayStoredCommandResult(room.game, duplicate, commandHash);
     }
 
     const previousState = room.game;
     const result = applyCommand(previousState, command);
     if (!result.ok) {
-      const rejected: StoredCommandResult = {
+      const rejected = rejectedStoredCommandResult({
         roomId: room.id,
         matchId: room.game.config.matchId,
         userId: session.userId,
         clientSeq,
         commandHash,
-        ok: false,
-        rejectionCode: result.error.code,
-        rejectionMessage: result.error.message,
-      };
+        code: result.error.code,
+        message: result.error.message,
+      });
       room.processedClientCommands.set(idempotencyKey, rejected);
       try {
         await this.eventStore.persistCommandResult?.(rejected);
       } catch (error) {
         if ((error as { code?: unknown }).code === "COMMAND_RESULT_CONFLICT") {
+          this.diagnostics.recordCommandConflict("rejected");
           const persisted = await this.eventStore.loadCommandResult?.(room.id, session.userId, clientSeq);
           if (persisted) {
             room.processedClientCommands.set(idempotencyKey, persisted);
-            return this.commandResultReplay(room, persisted, commandHash);
+            return replayStoredCommandResult(room.game, persisted, commandHash);
           }
           room.processedClientCommands.delete(idempotencyKey);
           return { ok: false, code: "CLIENT_SEQ_CONFLICT", message: "Client sequence was already used for a different command" };
@@ -1068,37 +1090,15 @@ export class RoomManager {
     }
 
     const allEvents = result.value.events;
-    const storedResult: StoredCommandResult = {
+    const storedResult = acceptedStoredCommandResult({
       roomId: room.id,
       matchId: previousState.config.matchId,
       userId: session.userId,
       clientSeq,
       commandHash,
-      ok: true,
       events: allEvents,
-    };
-    if (allEvents[0]) storedResult.seqStart = allEvents[0].seq;
-    if (allEvents.at(-1)) storedResult.seqEnd = allEvents.at(-1)!.seq;
+    });
     return this.commitAcceptedEvents(room, previousState, result.value.nextState, allEvents, storedResult);
-  }
-
-  private commandResultReplay(room: Room, result: StoredCommandResult, commandHash: string): CommandResult {
-    if (result.commandHash !== commandHash) {
-      return { ok: false, code: "CLIENT_SEQ_CONFLICT", message: "Client sequence was already used for a different command" };
-    }
-    if (!result.ok) {
-      return { ok: false, code: result.rejectionCode ?? "COMMAND_REJECTED", message: result.rejectionMessage ?? "Command was rejected" };
-    }
-    if (!room.game) return { ok: false, code: "ROOM_NOT_IN_GAME", message: "Room is not in game" };
-    const replayed: CommandResult = {
-      ok: true,
-      events: result.events ?? [],
-      state: room.game,
-      replayed: true,
-    };
-    if (result.seqStart !== undefined) replayed.seqStart = result.seqStart;
-    if (result.seqEnd !== undefined) replayed.seqEnd = result.seqEnd;
-    return replayed;
   }
 
   appendEvents(room: Room, events: GameEvent[], now = Date.now()): void {
@@ -1187,10 +1187,12 @@ export class RoomManager {
     const room = this.roomForRef(roomId);
     if (!room || !this.isMember(room, session.userId)) return undefined;
     if (!await this.claimRoom(room)) return undefined;
-    const chat: ChatMessage = { id: `chat_${nanoid(8)}`, userId: session.userId, message, createdAt: new Date().toISOString() };
-    room.chat.push(chat);
-    this.touchRoom(room);
-    await this.eventStore.persistChat(room, chat);
+    const chat = createChatMessage(session, message);
+    const candidate = structuredClone(room) as Room;
+    candidate.chat.push(chat);
+    this.touchRoom(candidate);
+    await this.eventStore.persistChat(candidate, chat);
+    replaceRoomState(room, candidate);
     return chat;
   }
 
@@ -1198,15 +1200,17 @@ export class RoomManager {
     const room = this.roomForRef(roomId);
     if (!room || !this.isMember(room, reporter.userId)) return undefined;
     if (!await this.claimRoom(room)) return undefined;
-    const report: Report = { id: `report_${nanoid(8)}`, reporterUserId: reporter.userId, reportedUserId, roomId: room.id, reason, status: "OPEN" };
-    room.reports.push(report);
-    this.touchRoom(room);
-    await this.eventStore.persistReport(room, report);
+    const report = createModerationReport(room, reporter, reportedUserId, reason);
+    const candidate = structuredClone(room) as Room;
+    candidate.reports.push(report);
+    this.touchRoom(candidate);
+    await this.eventStore.persistReport(candidate, report);
+    replaceRoomState(room, candidate);
     return report;
   }
 
   async recordAnalytics(event: { userId?: string; matchId?: string; eventName: string; payload: unknown }): Promise<void> {
-    await this.eventStore.persistAnalytics({ id: `analytics_${nanoid(10)}`, ...event });
+    await this.eventStore.persistAnalytics(createAnalyticsRecord(event));
   }
 
   getReplay(roomId: string): { config: GameConfig; board: GameState["board"]; events: GameEvent[] } | undefined {
@@ -1328,7 +1332,7 @@ export class RoomManager {
       return;
     }
     this.automationDueWork.set(room.id, this.automationDueAt(room, now));
-    this.cleanupDueWork.set(room.id, this.cleanupDueAt(room, now));
+    this.cleanupDueWork.set(room.id, cleanupDueAt(room, this.cleanupPolicy, now));
   }
 
   private removeRoomDueWork(roomId: string): void {
@@ -1350,64 +1354,14 @@ export class RoomManager {
     if (!room.game || room.status !== "IN_GAME" || room.game.phase.type === "GAME_OVER" || room.pausedAt) return Number.POSITIVE_INFINITY;
     const tradeDue = Math.min(Number.POSITIVE_INFINITY, ...room.tradeResponseDeadlines.values());
     if (tradeDue <= now) return tradeDue;
-    if (this.botTradeResponseCommand(room)) return now;
-    if (this.readyBotOfferResolutionCommand(room)) return now;
+    if (botTradeResponseCommand(room)) return now;
+    if (readyBotOfferResolutionCommand(room)) return now;
     if (room.timer?.expiresAt && room.timer.expiresAt <= now) return room.timer.expiresAt;
-    if ("activePlayerId" in room.game.phase && this.botSeatIds(room).includes(room.game.phase.activePlayerId)) {
+    if ("activePlayerId" in room.game.phase && botSeatIds(room).includes(room.game.phase.activePlayerId)) {
       const lastAutomation = this.automationCommandTimes.get(room.id)?.at(-1);
       return lastAutomation ? lastAutomation + 450 : now;
     }
     return room.timer?.expiresAt ?? Number.POSITIVE_INFINITY;
-  }
-
-  private cleanupDueAt(room: Room, now = Date.now()): number {
-    if (!isActiveRoom(room)) return Number.POSITIVE_INFINITY;
-    const connectedSeatedHumans = connectedSeatedHumanCount(room);
-    if (room.status === "LOBBY" && connectedSeatedHumans === 0) {
-      return room.emptySince ? Date.parse(room.emptySince) + this.cleanupPolicy.emptyLobbyTtlMs : now;
-    }
-    if (room.status === "IN_GAME" && connectedSeatedHumans === 0) {
-      return room.emptySince ? Date.parse(room.emptySince) + this.cleanupPolicy.emptyGameTtlMs : now;
-    }
-    if (room.status === "FINISHED" && connectedUserCount(room) === 0) {
-      return room.emptySince ? Date.parse(room.emptySince) + this.cleanupPolicy.finishedRoomUnloadMs : now;
-    }
-    return Number.POSITIVE_INFINITY;
-  }
-
-  private resumeRoomIfNeeded(room: Room, now = Date.now()): boolean {
-    if (room.pauseReason === "STALLED_AUTOMATION") return false;
-    if (!room.pausedAt) {
-      if (room.emptySince && connectedSeatedHumanCount(room) > 0) {
-        delete room.emptySince;
-        return true;
-      }
-      return false;
-    }
-    if (connectedSeatedHumanCount(room) === 0) return false;
-    const pausedDuration = Math.max(0, now - Date.parse(room.pausedAt));
-    if (room.timer) room.timer.expiresAt += pausedDuration;
-    for (const [tradeId, deadline] of room.tradeResponseDeadlines.entries()) {
-      room.tradeResponseDeadlines.set(tradeId, deadline + pausedDuration);
-    }
-    delete room.pausedAt;
-    delete room.pauseReason;
-    delete room.emptySince;
-    return true;
-  }
-
-  private botFor(botId: PlayerId): BotController {
-    let seatNumber = 0;
-    let placeValue = 1;
-    for (let index = botId.length - 1; index >= 0; index -= 1) {
-      const digit = botId.charCodeAt(index) - 48;
-      if (digit < 0 || digit > 9) break;
-      seatNumber += digit * placeValue;
-      placeValue *= 10;
-    }
-    if (seatNumber % 3 === 0) return plannerBot;
-    if (seatNumber % 2 === 0) return greedyBot;
-    return randomLegalBot;
   }
 
   private async applyInternalCommand(room: Room, command: GameCommand): Promise<CommandResult> {
@@ -1473,7 +1427,9 @@ export class RoomManager {
   }
 
   private roomFromStoredRecord(record: StoredRoomRecord): Room {
-    const game = record.match ? hydrateGameFromStoredMatch(record.match) : undefined;
+    const hydration = record.match ? hydrateGameFromStoredMatchWithOutcome(record.match) : undefined;
+    const game = hydration?.state;
+    this.diagnostics.recordHydration(hydration?.outcome ?? "room_only");
     const status = game?.phase.type === "GAME_OVER" ? "FINISHED" : record.status;
     const room: Room = {
       id: record.id,
@@ -1513,65 +1469,6 @@ export class RoomManager {
     return room;
   }
 
-  private botSeatIds(room: Room): PlayerId[] {
-    return room.seats.map((seat) => seat.botId).filter((botId): botId is PlayerId => Boolean(botId));
-  }
-
-  private botTradeResponseCommand(room: Room): GameCommand | undefined {
-    if (!room.game) return undefined;
-    const botIds = new Set(this.botSeatIds(room));
-    for (const trade of Object.values(room.game.trades)) {
-      if (trade.status !== "COLLECTING_RESPONSES") continue;
-      if (!hasResources(room.game.players[trade.fromPlayerId]?.resources ?? emptyResources(), trade.offered)) continue;
-      const candidates = trade.recipients === "ANY"
-        ? [...botIds].filter((botId) => botId !== trade.fromPlayerId)
-        : trade.recipients.filter((recipient) => botIds.has(recipient));
-      for (const botId of candidates) {
-        if (trade.responses?.[botId]?.status !== "PENDING") continue;
-        const bot = this.botFor(botId);
-        const view = createBotView(room.game, botId, bot.profile, room.game.config.botDifficulty ?? "medium");
-        if (evaluateTrade(view, trade, bot.profile, room.game.config.botDifficulty ?? "medium") === "ACCEPT") {
-          return { type: "RESPOND_TRADE", playerId: botId, tradeId: trade.id, response: "WANTS_ACCEPT" };
-        }
-        return { type: "RESPOND_TRADE", playerId: botId, tradeId: trade.id, response: "REJECTED" };
-      }
-    }
-    return undefined;
-  }
-
-  private botOfferResolutionCommand(room: Room, tradeId: string): GameCommand | undefined {
-    if (!room.game) return undefined;
-    const resolution = resolveBotOfferCommand({
-      state: room.game,
-      tradeId,
-      botIds: this.botSeatIds(room),
-      profileForPlayer: (playerId) => this.botFor(playerId).profile,
-      difficulty: room.game.config.botDifficulty ?? "medium",
-    });
-    return resolution?.command;
-  }
-
-  private readyBotOfferResolutionCommand(room: Room): GameCommand | undefined {
-    if (!room.game) return undefined;
-    const botIds = new Set(this.botSeatIds(room));
-    const trade = Object.values(room.game.trades)
-      .filter((candidate) => candidate.status === "COLLECTING_RESPONSES")
-      .filter((candidate) => botIds.has(candidate.fromPlayerId))
-      .filter((candidate) => tradeFullyAnswered(room.game!, candidate))
-      .sort((left, right) => left.createdAtSeq - right.createdAtSeq || left.id.localeCompare(right.id))[0];
-    return trade ? this.botOfferResolutionCommand(room, trade.id) : undefined;
-  }
-
-  private dueTradeResponseCommand(room: Room, now: number): GameCommand | undefined {
-    for (const [tradeId, deadline] of [...room.tradeResponseDeadlines.entries()].sort((left, right) => left[1] - right[1] || left[0].localeCompare(right[0]))) {
-      if (deadline > now) continue;
-      const command = this.botOfferResolutionCommand(room, tradeId);
-      if (command) return command;
-      room.tradeResponseDeadlines.delete(tradeId);
-    }
-    return undefined;
-  }
-
   private automationProgressKey(room: Room): string {
     const state = room.game;
     const active = state && "activePlayerId" in state.phase ? state.phase.activePlayerId : "none";
@@ -1597,10 +1494,13 @@ export class RoomManager {
       : { key, repeats: 1, seenAt: now };
     this.automationProgress.set(room.id, next);
     if (next.repeats <= this.cleanupPolicy.automationStallTickLimit) return true;
-    room.pausedAt = new Date(now).toISOString();
-    room.pauseReason = "STALLED_AUTOMATION";
-    this.touchRoom(room, now);
-    await this.eventStore.persistRoom(room);
+    const candidate = structuredClone(room) as Room;
+    candidate.pausedAt = new Date(now).toISOString();
+    candidate.pauseReason = "STALLED_AUTOMATION";
+    this.touchRoom(candidate, now);
+    await this.eventStore.persistRoom(candidate);
+    replaceRoomState(room, candidate);
+    this.diagnostics.recordAutomationPause("stalled");
     this.updateRoomDueWork(room, now);
     return false;
   }
@@ -1621,25 +1521,19 @@ export class RoomManager {
     if (room.pausedAt) return undefined;
     if (!await this.guardAutomationProgress(room, now)) return undefined;
 
-    const dueTrade = this.dueTradeResponseCommand(room, now);
+    const dueTrade = dueTradeResponseCommand(room, now);
     if (dueTrade) return this.automationCommandAllowed(room, now) ? this.applyInternalCommand(room, dueTrade) : this.pauseForAutomationBudget(room, now);
 
-    const tradeResponse = this.botTradeResponseCommand(room);
+    const tradeResponse = botTradeResponseCommand(room);
     if (tradeResponse) return this.automationCommandAllowed(room, now) ? this.applyInternalCommand(room, tradeResponse) : this.pauseForAutomationBudget(room, now);
 
-    const readyBotOffer = this.readyBotOfferResolutionCommand(room);
+    const readyBotOffer = readyBotOfferResolutionCommand(room);
     if (readyBotOffer) return this.automationCommandAllowed(room, now) ? this.applyInternalCommand(room, readyBotOffer) : this.pauseForAutomationBudget(room, now);
 
-    if (!("activePlayerId" in room.game.phase) || !this.botSeatIds(room).includes(room.game.phase.activePlayerId)) return undefined;
+    if (!("activePlayerId" in room.game.phase) || !botSeatIds(room).includes(room.game.phase.activePlayerId)) return undefined;
     const active = room.game.phase.activePlayerId;
-    if (activeCollectingTradeForPlayer(room.game, active)) return undefined;
-    const bot = this.botFor(active);
-    const view = createBotView(room.game, active, bot.profile, room.game.config.botDifficulty ?? "medium");
-    let command = bot.chooseCommand(view, (prefix: string) => createBotTradeId(room.game!, active, bot.profile) || prefix);
+    let command = chooseBotTurnCommand(room, active);
     if (!command) return undefined;
-    if (command.type === "OFFER_TRADE" && hasEquivalentBotTradeOffer(view, command)) {
-      command = { type: "END_TURN", playerId: active };
-    }
     if (command.type === "OFFER_TRADE") {
       const cooldownKey = `${room.id}:${active}:${tradeShapeKey(command)}`;
       const cooldownUntil = this.botTradeCooldowns.get(cooldownKey) ?? -1;
@@ -1649,19 +1543,17 @@ export class RoomManager {
         this.botTradeCooldowns.set(cooldownKey, room.game.turn + this.cleanupPolicy.botTradeCooldownTurns);
       }
     }
-    if (command.type === "PLACE_SETUP") {
-      const setupCommand = command;
-      const edgeId = room.game.board.adjacency.vertexToEdges[setupCommand.vertexId]?.find((candidate) => canBuildRoad(room.game!, setupCommand.playerId, candidate, setupCommand.vertexId));
-      if (edgeId) command = { ...setupCommand, edgeId };
-    }
     return this.automationCommandAllowed(room, now) ? this.applyInternalCommand(room, command) : this.pauseForAutomationBudget(room, now);
   }
 
   private async pauseForAutomationBudget(room: Room, now: number): Promise<CommandResult | undefined> {
-    room.pausedAt = new Date(now).toISOString();
-    room.pauseReason = "STALLED_AUTOMATION";
-    this.touchRoom(room, now);
-    await this.eventStore.persistRoom(room);
+    const candidate = structuredClone(room) as Room;
+    candidate.pausedAt = new Date(now).toISOString();
+    candidate.pauseReason = "STALLED_AUTOMATION";
+    this.touchRoom(candidate, now);
+    await this.eventStore.persistRoom(candidate);
+    replaceRoomState(room, candidate);
+    this.diagnostics.recordAutomationPause("budget");
     this.updateRoomDueWork(room, now);
     return undefined;
   }

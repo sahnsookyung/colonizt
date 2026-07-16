@@ -38,7 +38,10 @@ assertContains(deployWorkflowPath, deployWorkflow, "SonarCloud=sonarcloud.yml");
 assertContains(deployWorkflowPath, deployWorkflow, "CD image build=cd.yml");
 assertContains(deployWorkflowPath, deployWorkflow, "COLONIZT_PRODUCTION_HOST");
 assertContains(deployWorkflowPath, deployWorkflow, "COLONIZT_DEPLOY_KEY");
+assertContains(deployWorkflowPath, deployWorkflow, "COLONIZT_PRODUCTION_KNOWN_HOSTS");
 assertContains(deployWorkflowPath, deployWorkflow, "COLONIZT_PRODUCTION_ENV_B64");
+assertContains(deployWorkflowPath, deployWorkflow, "StrictHostKeyChecking yes");
+assertContains(deployWorkflowPath, deployWorkflow, "UserKnownHostsFile");
 assertContains(deployWorkflowPath, deployWorkflow, "docker manifest inspect \"ghcr.io/sahnsookyung/colonizt-server:${IMAGE_TAG}\"");
 assertContains(deployWorkflowPath, deployWorkflow, "docker manifest inspect \"ghcr.io/sahnsookyung/colonizt-web:${IMAGE_TAG}\"");
 assertContains(deployWorkflowPath, deployWorkflow, "./ops/scripts/deploy-oci.sh \"$COLONIZT_PRODUCTION_HOST\" \"$IMAGE_TAG\"");
@@ -52,7 +55,13 @@ assertContains(cdWorkflowPath, cdWorkflow, "platforms: linux/arm64");
 
 assertContains(deployScriptPath, deployScript, "Refusing to deploy mutable latest");
 assertContains(deployScriptPath, deployScript, "Verifying origin endpoints");
+assertContains(deployScriptPath, deployScript, "StrictHostKeyChecking=yes");
+assertContains(deployScriptPath, deployScript, "restore_application_stack");
+assertContains(deployScriptPath, deployScript, "trap on_exit EXIT");
 assertMatches(deployScriptPath, deployScript, /\[\[ ! "\$IMAGE_TAG" =~ \^\[0-9a-fA-F\]\{40\}\$ \]\]/, "a full 40-character image tag guard");
+if (deployWorkflow.includes("accept-new") || deployScript.includes("accept-new")) {
+  throw new Error("Production SSH must use a pinned known_hosts entry, never accept-new.");
+}
 assertContains(awaitGatesPath, awaitGates, 'const ghExecutable = "/usr/bin/gh";');
 if (awaitGates.includes('spawnSync("gh"')) {
   throw new Error(`${awaitGatesPath} must use a fixed gh executable path.`);

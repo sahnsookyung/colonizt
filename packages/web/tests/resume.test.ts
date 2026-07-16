@@ -31,6 +31,10 @@ describe("network resume storage", () => {
     const storage = new MemoryStorage();
     storage.setItem(resumeStorageKey, "{bad");
     expect(readResumeState(storage)).toBeNull();
+    storage.setItem(resumeStorageKey, "{}");
+    expect(readResumeState(storage)).toBeNull();
+    storage.setItem(resumeStorageKey, JSON.stringify({ token: "s_1", userId: "u_1", roomId: "room_1", clientSeq: -1, lastSeq: 2 }));
+    expect(readResumeState(storage)).toBeNull();
   });
 
   it("ignores storage write failures", () => {

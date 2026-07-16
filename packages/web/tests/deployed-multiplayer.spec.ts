@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 test.describe("deployed multiplayer smoke", () => {
-  test.skip(!process.env.PUBLIC_WEB_URL, "PUBLIC_WEB_URL is required for deployed browser smoke");
+  test.skip(!process.env.PUBLIC_WEB_URL && !process.env.LOCAL_MULTIPLAYER, "PUBLIC_WEB_URL is required for deployed browser smoke");
 
   test("two browser clients join, ready, go, act, and reconnect through the public app", async ({ browser }) => {
     const contexts = await Promise.all(Array.from({ length: 2 }, () => browser.newContext()));

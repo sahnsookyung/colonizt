@@ -84,6 +84,13 @@ export class RedisPresenceStore implements PresenceStore {
   }
 
   async joinRoom(session: Session, socketId: string, roomId: string): Promise<void> {
+    const previousRoomId = await this.client.hGet(this.socketKey(socketId), "roomId");
+    if (previousRoomId && previousRoomId !== roomId) {
+      await this.client.sRem(this.roomKey(previousRoomId), socketId);
+      if ((await this.client.sCard(this.roomKey(previousRoomId))) === 0) {
+        await this.client.sRem(this.roomsKey(), previousRoomId);
+      }
+    }
     await this.client.hSet(this.socketKey(socketId), { roomId });
     await this.refresh(session, socketId, roomId);
     await this.client.sAdd(this.roomKey(roomId), socketId);
@@ -163,9 +170,24 @@ export class RedisPresenceStore implements PresenceStore {
   }
 }
 
-export const createPresenceStore = async (redisUrl?: string): Promise<PresenceStore> => {
+interface PresenceStoreFactoryOptions {
+  createRedisClient?: (url: string) => RedisClient;
+  onFallback?(error: unknown): void;
+}
+
+export const createPresenceStore = async (redisUrl?: string, options: PresenceStoreFactoryOptions = {}): Promise<PresenceStore> => {
   if (!redisUrl) return new MemoryPresenceStore();
-  const client = createClient({ url: redisUrl });
-  await client.connect();
-  return new RedisPresenceStore(client);
+  const client = options.createRedisClient?.(redisUrl) ?? createClient({ url: redisUrl });
+  try {
+    await client.connect();
+    return new RedisPresenceStore(client);
+  } catch (error) {
+    try {
+      client.destroy();
+    } catch {
+      // The client may already be closed after a failed connect.
+    }
+    options.onFallback?.(error);
+    return new MemoryPresenceStore();
+  }
 };

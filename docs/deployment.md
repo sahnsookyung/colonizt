@@ -13,9 +13,11 @@ This starts PostgreSQL, the Fastify server on `http://127.0.0.1:8787`, and the s
 - `DATABASE_URL`: PostgreSQL connection string for migrations, rooms, matches, and replay event logs.
 - `REDIS_URL`: optional; when omitted the single-node server uses in-memory presence. Redis must never be treated as match truth.
 - `INSTANCE_MODE`: must be `single`; the current server enforces one authoritative `RoomManager` per active room.
+- `COLONIZT_ADMIN_URL=http://127.0.0.1:8787 ADMIN_TOKEN=... npm run ops:diagnose` prints a hand-safe incident bundle combining room liveness with hydration, validation, command-conflict, automation-pause, and database-failure metrics.
 - `NODE_ID`: optional identifier included in health, config, logs, and metrics.
 - `SERVER_HOST`: bind host, usually `0.0.0.0` in containers.
 - `SERVER_PORT`: server port, default `8787`.
+- `TRUSTED_PROXY_HOPS`: number of reverse-proxy hops Fastify may trust when resolving client IPs, default `0`. The OCI Caddy deployment uses exactly `1`; do not enable it for a directly exposed server.
 - `WEB_ORIGIN`: allowed browser origin for CORS.
 - `ADMIN_TOKEN`: optional bearer or `x-admin-token` secret required for `/metrics` and `/leaderboard` when set.
 - `VITE_API_BASE_URL`: optional legacy web build-time API fallback for local or custom builds. Leave unset for portable production images; browsers should discover the public API through `GET /config`.
@@ -62,6 +64,7 @@ Configure these GitHub environment secrets on `production`:
 | `COLONIZT_PRODUCTION_HOST` | OCI host or IP passed to `ops/scripts/deploy-oci.sh`. |
 | `COLONIZT_PRODUCTION_USER` | SSH user, usually `opc`. |
 | `COLONIZT_DEPLOY_KEY` | Private SSH key with access to the OCI host. |
+| `COLONIZT_PRODUCTION_KNOWN_HOSTS` | Pinned OpenSSH `known_hosts` line for the production host. Verify this fingerprint through the OCI console or another trusted channel before saving it. |
 | `COLONIZT_PRODUCTION_ENV_B64` | Base64-encoded production `.env` uploaded to the host for Docker Compose. |
 | `COLONIZT_GHCR_SECRET` | Optional GHCR token for the runner and remote Docker host to pull private images. |
 | `COLONIZT_GHCR_USER` | Optional GHCR username; defaults to `sahnsookyung`. |
@@ -84,6 +87,14 @@ snippets there. Colonizt only writes `/srv/jobscout-cloud/ops/caddy/sites/coloni
 it does not rewrite the JobScout site block or Caddy certificate data. Deploy the
 JobScout shared-sites Caddy mount before running the Colonizt deploy script on a
 fresh host.
+
+The deploy script requires the production host key to already exist in
+`~/.ssh/known_hosts` (or in `COLONIZT_SSH_KNOWN_HOSTS_FILE`) and fails closed on
+a mismatch. It snapshots the previous Colonizt Compose environment and compose
+file before promotion. Any later pull, migration, startup, Caddy, or origin-smoke
+failure restores those files and restarts the prior image set; Caddy is restored
+independently. Database migrations must remain backward compatible because a
+container rollback does not reverse an applied schema migration.
 
 ```bash
 ./ops/scripts/deploy-oci.sh <jobscout-oci-ip> <full-40-character-git-sha-image-tag>

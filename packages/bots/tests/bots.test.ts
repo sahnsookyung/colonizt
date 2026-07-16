@@ -229,6 +229,67 @@ describe("bot policies", () => {
     })?.command).toEqual(resolution?.command);
   });
 
+  it("resolves every staged-offer failure mode without issuing an illegal trade command", () => {
+    let state = completeSetup(createDemoGame("bot-trade-failure-modes", { botDifficulty: "hard" })).state;
+    state = { ...state, phase: { type: "ACTION_PHASE", activePlayerId: "p1" } };
+    state = withResources(state, "p1", { timber: 1 });
+    state = withResources(state, "p2", { ore: 1 });
+    const offered = applyCommand(state, {
+      type: "OFFER_TRADE",
+      playerId: "p1",
+      tradeId: "failure-modes",
+      offered: { ...emptyResources(), timber: 1 },
+      requested: { ...emptyResources(), ore: 1 },
+      recipients: ["p2"],
+    });
+    expect(offered.ok).toBe(true);
+    if (!offered.ok) throw new Error("Expected staged trade");
+    state = offered.value.nextState;
+
+    expect(resolveBotOfferCommand({ state, tradeId: "missing", botIds: ["p1"] })).toBeUndefined();
+    expect(resolveBotOfferCommand({ state, tradeId: "failure-modes", botIds: ["p2"], expireNonBotOfferer: false })).toBeUndefined();
+    expect(resolveBotOfferCommand({ state, tradeId: "failure-modes", botIds: ["p2"] })).toMatchObject({
+      command: { type: "EXPIRE_TRADE", reason: "RESPONSE_TIMEOUT" },
+      trace: { reason: "EXPIRE_NON_BOT_OFFERER" },
+    });
+    expect(resolveBotOfferCommand({ state, tradeId: "failure-modes", botIds: ["p1"] })).toMatchObject({
+      command: { type: "CANCEL_TRADE" },
+      trace: { reason: "CANCEL_NO_ACCEPTORS" },
+    });
+
+    const unfunded = structuredClone(state);
+    unfunded.players.p1!.resources.timber = 0;
+    expect(resolveBotOfferCommand({ state: unfunded, tradeId: "failure-modes", botIds: ["p1"] })).toMatchObject({
+      command: { type: "CANCEL_TRADE" },
+      trace: { reason: "OFFERER_NOT_FUNDED" },
+    });
+
+    const closed = structuredClone(state);
+    closed.trades["failure-modes"]!.status = "CLOSED";
+    expect(resolveBotOfferCommand({ state: closed, tradeId: "failure-modes", botIds: ["p1"] })).toBeUndefined();
+  });
+
+  it("ignores trades that are closed, self-authored, untargeted, or unaffordable", () => {
+    let state = completeSetup(createDemoGame("ignored-bot-trades", { botDifficulty: "hard" })).state;
+    state = { ...state, phase: { type: "ACTION_PHASE", activePlayerId: "p1" } };
+    state = withResources(state, "p1", { timber: 1 });
+    const trade = {
+      id: "ignored",
+      fromPlayerId: "p1" as PlayerId,
+      offered: { ...emptyResources(), timber: 1 },
+      requested: { ...emptyResources(), ore: 1 },
+      recipients: ["p2"] as PlayerId[],
+      status: "COLLECTING_RESPONSES" as const,
+      createdAtSeq: 0,
+      expiresAtSeq: 10,
+    };
+    const p2 = createBotView(state, "p2", greedyBot.profile, "hard");
+    expect(evaluateTrade(p2, { ...trade, status: "CLOSED" }, greedyBot.profile, "hard")).toBe("IGNORE");
+    expect(evaluateTrade(createBotView(state, "p1", greedyBot.profile, "hard"), trade, greedyBot.profile, "hard")).toBe("IGNORE");
+    expect(evaluateTrade(createBotView(state, "p3", greedyBot.profile, "hard"), trade, greedyBot.profile, "hard")).toBe("IGNORE");
+    expect(evaluateTrade(p2, trade, greedyBot.profile, "hard")).toBe("IGNORE");
+  });
+
   it("only chooses commands accepted by the engine preview path", () => {
     for (let index = 0; index < 40; index += 1) {
       let state = completeSetup(createDemoGame(`legal-preview-${index}`, { botDifficulty: "medium" })).state;
@@ -314,6 +375,23 @@ describe("bot policies", () => {
     expect(view.state.resourceBank.ore).toBe(0);
     const candidates = scoreBotCandidates(view, greedyBot.profile, () => "bank-authority-trade");
     expect(candidates.some((candidate) => candidate.command.type === "MARITIME_TRADE" && candidate.command.requested === "ore")).toBe(false);
+  });
+
+  it("only generates Year of Plenty choices the bank can fulfill", () => {
+    let state = completeSetup(createDemoGame("bot-year-of-plenty-bank", { botDifficulty: "hard" })).state;
+    state = { ...state, phase: { type: "ACTION_PHASE", activePlayerId: "p1" } };
+    for (const player of Object.values(state.players)) player.resources = emptyResources();
+    state.players.p2!.resources = { timber: 19, brick: 19, grain: 17, fiber: 19, ore: 19 };
+    state.players.p1!.developmentCards = [{ id: "plenty-card", type: "YEAR_OF_PLENTY", ownerId: "p1", boughtTurn: state.turn - 1 }];
+    state.players.p1!.specialCards = 1;
+    state.resourceBank = { ...emptyResources(), grain: 2 };
+
+    const candidates = scoreBotCandidates(createBotView(state, "p1", greedyBot.profile, "hard"), greedyBot.profile, () => "plenty-trade")
+      .filter((candidate) => candidate.command.type === "PLAY_YEAR_OF_PLENTY");
+
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]?.command).toMatchObject({ type: "PLAY_YEAR_OF_PLENTY", resources: ["grain", "grain"] });
+    expect(candidates[0] && applyCommand(state, candidates[0].command).ok).toBe(true);
   });
 
   it("chooses legal modal commands for discard and thief phases", () => {

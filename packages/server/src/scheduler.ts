@@ -35,7 +35,10 @@ export class RoomAutomationScheduler {
   private scheduleAutomation(delayMs: number): void {
     if (!this.running) return;
     this.automationTimer = setTimeout(() => {
-      void this.tickAutomation().catch((error) => this.recordFailure("automation", error));
+      void this.tickAutomation().catch((error) => {
+        this.recordFailure("automation", error);
+        this.scheduleAutomation(this.options.automationIntervalMs ?? 1000);
+      });
     }, delayMs);
     this.automationTimer.unref?.();
   }
@@ -43,7 +46,10 @@ export class RoomAutomationScheduler {
   private scheduleCleanup(delayMs: number): void {
     if (!this.running) return;
     this.cleanupTimer = setTimeout(() => {
-      void this.tickCleanup().catch((error) => this.recordFailure("cleanup", error));
+      void this.tickCleanup().catch((error) => {
+        this.recordFailure("cleanup", error);
+        this.scheduleCleanup(this.options.cleanupIntervalMs ?? 30_000);
+      });
     }, delayMs);
     this.cleanupTimer.unref?.();
   }
@@ -85,6 +91,8 @@ export class RoomAutomationScheduler {
         if (this.options.manager.rooms.get(roomId)?.pauseReason === "STALLED_AUTOMATION") {
           this.options.metrics.recordScheduler("stalled_automation");
         }
+      } catch (error) {
+        this.recordFailure("automation_room", error);
       } finally {
         this.options.manager.refreshRoomDueWork(roomId, Date.now());
       }
@@ -98,13 +106,20 @@ export class RoomAutomationScheduler {
     this.options.metrics.recordScheduler("cleanup_tick");
     const now = Date.now();
     const dueRoomIds = this.options.manager.dueCleanupRoomIds(now);
-    const closedRooms = await this.options.manager.cleanupRooms(now, dueRoomIds);
-    for (const closed of closedRooms) {
-      this.options.metrics.recordRoomCleanup(closed.status, closed.cleanupReason ?? "none");
-      this.options.logger.info("room.cleaned", closed);
-      this.options.onRoomClosed(closed);
+    for (const roomId of dueRoomIds) {
+      try {
+        const closedRooms = await this.options.manager.cleanupRooms(now, [roomId]);
+        for (const closed of closedRooms) {
+          this.options.metrics.recordRoomCleanup(closed.status, closed.cleanupReason ?? "none");
+          this.options.logger.info("room.cleaned", closed);
+          this.options.onRoomClosed(closed);
+        }
+      } catch (error) {
+        this.recordFailure("cleanup_room", error);
+      } finally {
+        this.options.manager.refreshRoomDueWork(roomId, Date.now());
+      }
     }
-    for (const roomId of dueRoomIds) this.options.manager.refreshRoomDueWork(roomId, Date.now());
     const nextDue = this.options.manager.nextCleanupDueAt(Date.now());
     const fallback = this.options.cleanupIntervalMs ?? 30_000;
     this.scheduleCleanup(nextDue ? Math.max(0, Math.min(nextDue - Date.now(), fallback)) : fallback);

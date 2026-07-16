@@ -5,7 +5,7 @@ export default [
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
-    ignores: ["**/dist/**", "node_modules/**", "coverage/**", "playwright-report/**", "test-results/**"],
+    ignores: ["**/dist/**", "node_modules/**", "coverage/**", "playwright-report/**", "test-results/**", ".stryker-tmp/**", "reports/**"],
   },
   {
     files: ["**/*.{ts,tsx}"],

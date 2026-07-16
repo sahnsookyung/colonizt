@@ -128,7 +128,7 @@ flowchart TB
   demo --> bots
 ```
 
-The web package owns screen state, local bot games, online lobby/gameplay, trade and special-card overlays, mobile HUD layout, post-game replay viewing, sounds, and analytics. It uses `protocol` for wire contracts and `game-core` for deterministic local projections; online rooms still treat the server as authoritative. `viewer-projection.ts` is the only client boundary that converts a viewer-safe online payload into game-shaped UI state, so redacted opponent cards stay redacted even when incremental events arrive.
+The web package owns screen state, local bot games, online lobby/gameplay, trade and special-card overlays, mobile HUD layout, post-game replay viewing, sounds, and analytics. `game-view-model.ts`, `game-guidance.ts`, `discard-policy.ts`, and `useReplayController.ts` keep render selection and interaction policy outside the main controller; accessible dialogs own focus entry, Escape dismissal, and focus restoration. The client uses `protocol` for wire contracts and `game-core` for deterministic local projections; online rooms still treat the server as authoritative. `viewer-projection.ts` is the only client boundary that converts a viewer-safe online payload into game-shaped UI state, so redacted opponent cards stay redacted even when incremental events arrive.
 
 ## Server Runtime Detail
 
@@ -144,9 +144,11 @@ flowchart TB
     manager["RoomManager"]
     lobby["lobby helpers"]
     runtime["room-runtime helpers"]
+    lifecycle["room lifecycle policy"]
+    idempotency["command idempotency"]
+    botAutomation["bot automation policy"]
     scheduler["Scheduler"]
     due["DueWorkIndex"]
-    security["idempotency"]
   end
 
   subgraph domainServer["domain"]
@@ -175,7 +177,9 @@ flowchart TB
 
   manager --> lobby
   manager --> runtime
-  manager --> security
+  manager --> lifecycle
+  manager --> idempotency
+  manager --> botAutomation
   manager --> core
   manager --> bots
   manager --> events
@@ -190,7 +194,9 @@ flowchart TB
   presence -. optional .-> redis
 ```
 
-`RoomManager` owns online room authority: seats, host actions, spectators, chat, reports, accepted commands, timers, persistence, and viewer-safe broadcasts. Shared room lifecycle/counting/timer derivation lives in `room-runtime.ts` so scheduler, metrics, and admin room-health reports use the same semantics. `RoomAutomationScheduler` drives due bot actions, trade deadlines, turn expiry, and cleanup callbacks without scanning every room blindly.
+`RoomManager` remains the online authority and persistence boundary for seats, host actions, spectators, chat, reports, accepted commands, timers, and viewer-safe broadcasts. Pure policy is split into focused modules: `command-idempotency.ts` owns stored-command replay semantics, `command-commit.ts` owns atomic persistence selection, `room-content.ts` creates chat/report/analytics records, `room-lifecycle.ts` owns pause/resume/cleanup transitions, `bot-automation.ts` owns bot command selection, and `room-runtime.ts` owns shared liveness/counting/timer derivation. Server composition delegates HTTP registration, runtime parsing, rate limits, ticket storage, socket indexing, transport dispatch, and process shutdown to dedicated adapters. `RoomAutomationScheduler` drives due bot actions, trade deadlines, turn expiry, and cleanup callbacks without scanning every room blindly.
+
+The supported runtime has one authoritative server process. [ADR 0001](adr/0001-room-authority-and-horizontal-routing.md) defines the routing, fencing, fanout, failover, and proof required before enabling multiple room-authority processes; ownership leases and optional Redis presence alone do not make the process-local socket registry horizontally safe.
 
 ## Package Dependencies
 

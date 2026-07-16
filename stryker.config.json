@@ -1,0 +1,27 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "testRunner": "vitest",
+  "mutate": [
+    "packages/game-core/src/invariants.ts",
+    "packages/game-core/src/replay.ts:226-258",
+    "packages/server/src/command-idempotency.ts:69-84",
+    "packages/server/src/room-lifecycle.ts:19-38"
+  ],
+  "vitest": {
+    "configFile": "vitest.mutation.config.ts",
+    "related": true
+  },
+  "reporters": ["clear-text", "progress", "json"],
+  "jsonReporter": {
+    "fileName": "reports/mutation/mutation.json"
+  },
+  "thresholds": {
+    "high": 97,
+    "low": 95,
+    "break": 95
+  },
+  "concurrency": 2,
+  "timeoutMS": 15000,
+  "timeoutFactor": 1.5,
+  "disableTypeChecks": "packages/**/*.{ts,tsx}"
+}

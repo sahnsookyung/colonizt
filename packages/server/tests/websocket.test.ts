@@ -1,7 +1,9 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 import { emptyResources, getLegalActions, type GameEvent, type TradeOffer, type ViewerState } from "@colonizt/game-core";
 import { buildServer } from "../src/index.js";
+import { createStructuredLogger, MetricsRegistry, type StructuredLogRecord } from "../src/observability.js";
+import { MemoryPresenceStore } from "../src/presence.js";
 import { RoomManager } from "../src/room-manager.js";
 import type { AddressInfo } from "node:net";
 
@@ -68,13 +70,35 @@ const waitForClose = (socket: WebSocket): Promise<{ code: number; reason: string
     socket.once("close", (code, reason) => resolve({ code, reason: reason.toString() }));
   });
 
-const waitUntil = async (predicate: () => boolean, timeoutMs = 500): Promise<void> => {
+const waitUntil = async (predicate: () => boolean | Promise<boolean>, timeoutMs = 500): Promise<void> => {
   const startedAt = Date.now();
-  while (!predicate()) {
+  while (!await predicate()) {
     if (Date.now() - startedAt > timeoutMs) throw new Error("Timed out waiting for condition");
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 };
+
+class DelayedJoinPresenceStore extends MemoryPresenceStore {
+  activeJoins = 0;
+  completedJoins = 0;
+  maxConcurrentJoins = 0;
+
+  constructor(private readonly delayMs = 40) {
+    super();
+  }
+
+  override async joinRoom(...args: Parameters<MemoryPresenceStore["joinRoom"]>): Promise<void> {
+    this.activeJoins += 1;
+    this.maxConcurrentJoins = Math.max(this.maxConcurrentJoins, this.activeJoins);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+      await super.joinRoom(...args);
+      this.completedJoins += 1;
+    } finally {
+      this.activeJoins -= 1;
+    }
+  }
+}
 
 const wsBase = (app: { server: { address(): string | AddressInfo | null } }): string => {
   const address = app.server.address();
@@ -110,6 +134,127 @@ const openSocket = async (
 };
 
 describe("WebSocket gateway", () => {
+  it("enforces the per-socket command burst budget before invoking room logic", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Burst Host");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
+    const submit = vi.spyOn(manager, "submitCommand").mockResolvedValue({ ok: false, code: "ROOM_PAUSED", message: "paused" });
+    const app = await buildServer({ manager });
+    servers.push({ close: () => app.close() });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const socket = await openSocket(app, host.token);
+    const rateLimited = waitForMessageWhere<{ type: "COMMAND_REJECTED"; code: string; clientSeq: number }>(
+      socket,
+      "COMMAND_REJECTED",
+      (message) => message.code === "RATE_LIMITED",
+    );
+
+    for (let clientSeq = 1; clientSeq <= 31; clientSeq += 1) {
+      socket.send(JSON.stringify({
+        type: "COMMAND",
+        roomId: room.id,
+        clientSeq,
+        command: { type: "ROLL_DICE", playerId: host.userId },
+      }));
+    }
+
+    await expect(rateLimited).resolves.toMatchObject({ code: "RATE_LIMITED", clientSeq: 31 });
+    expect(submit).toHaveBeenCalledTimes(30);
+  });
+
+  it("translates asynchronous manager failures into stable gateway errors and rejects unsafe frames", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Failure Host");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
+    const app = await buildServer({ manager });
+    servers.push({ close: () => app.close() });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const socket = await openSocket(app, host.token);
+
+    const expectError = async (message: unknown, code: string) => {
+      const received = waitForMessageWhere<{ type: "ERROR" | "COMMAND_REJECTED"; code: string }>(socket, code === "COMMAND_FAILED" ? "COMMAND_REJECTED" : "ERROR", (candidate) => candidate.code === code);
+      socket.send(JSON.stringify(message));
+      await expect(received).resolves.toMatchObject({ code });
+    };
+
+    vi.spyOn(manager, "joinRoom").mockRejectedValueOnce(new Error("join persistence failed"));
+    await expectError({ type: "JOIN_ROOM", roomId: room.id }, "JOIN_FAILED");
+
+    vi.spyOn(manager, "leaveRoom").mockRejectedValueOnce(new Error("leave persistence failed"));
+    await expectError({ type: "LEAVE_ROOM", roomId: room.id }, "LEAVE_FAILED");
+
+    vi.spyOn(manager, "setReady").mockRejectedValueOnce(new Error("ready persistence failed"));
+    await expectError({ type: "READY", roomId: room.id, ready: true }, "READY_FAILED");
+
+    vi.spyOn(manager, "startRoomByHost").mockRejectedValueOnce(new Error("start persistence failed"));
+    await expectError({ type: "START_ROOM", roomId: room.id }, "START_FAILED");
+
+    vi.spyOn(manager, "addLobbyBot").mockRejectedValueOnce(new Error("bot add failed"));
+    await expectError({ type: "ADD_BOT", roomId: room.id }, "ADD_BOT_FAILED");
+
+    vi.spyOn(manager, "removeLobbyBot").mockRejectedValueOnce(new Error("bot remove failed"));
+    await expectError({ type: "REMOVE_BOT", roomId: room.id, seatIndex: 1 }, "REMOVE_BOT_FAILED");
+
+    vi.spyOn(manager, "updateRoomSettings").mockRejectedValueOnce(new Error("settings persistence failed"));
+    await expectError({ type: "UPDATE_ROOM_SETTINGS", roomId: room.id, settings: { maxPlayers: 2, botDifficulty: "hard", rules: { diceDoubles: true } } }, "SETTINGS_FAILED");
+
+    vi.spyOn(manager, "updateDisplayName").mockRejectedValueOnce(new Error("name persistence failed"));
+    await expectError({ type: "UPDATE_DISPLAY_NAME", displayName: "Renamed" }, "NAME_FAILED");
+
+    vi.spyOn(manager, "submitCommand").mockRejectedValueOnce(new Error("event commit failed"));
+    await expectError({ type: "COMMAND", roomId: room.id, clientSeq: 1, command: { type: "ROLL_DICE", playerId: host.userId } }, "COMMAND_FAILED");
+
+    vi.spyOn(manager, "addChat").mockRejectedValueOnce(new Error("chat persistence failed"));
+    await expectError({ type: "CHAT", roomId: room.id, message: "hello" }, "CHAT_FAILED");
+
+    vi.spyOn(manager, "resync").mockRejectedValueOnce(new Error("replay persistence failed"));
+    await expectError({ type: "RESYNC", roomId: room.id, lastSeq: 0 }, "RESYNC_FAILED");
+
+    await expectError({ type: "UNKNOWN_MESSAGE" }, "BAD_MESSAGE");
+
+    const closed = waitForClose(socket);
+    socket.send("x".repeat(32_001));
+    await expect(closed).resolves.toMatchObject({ code: 1009 });
+  });
+
+  it("preserves domain rejection codes across every mutating gateway command", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Rejected Host");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
+    const app = await buildServer({ manager });
+    servers.push({ close: () => app.close() });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const socket = await openSocket(app, host.token);
+
+    const expectError = async (message: unknown, code: string, type = "ERROR") => {
+      const received = waitForMessageWhere<{ type: string; code: string }>(socket, type, (candidate) => candidate.code === code);
+      socket.send(JSON.stringify(message));
+      await expect(received).resolves.toMatchObject({ type, code });
+    };
+    const rejected = (code: string) => ({ ok: false as const, code, message: `${code} rejected` });
+
+    vi.spyOn(manager, "joinRoom").mockResolvedValueOnce(rejected("ROOM_FULL"));
+    await expectError({ type: "JOIN_ROOM", roomId: room.id }, "ROOM_FULL");
+    vi.spyOn(manager, "leaveRoom").mockResolvedValueOnce(rejected("ROOM_CLOSED"));
+    await expectError({ type: "LEAVE_ROOM", roomId: room.id }, "ROOM_CLOSED");
+    vi.spyOn(manager, "setReady").mockResolvedValueOnce(rejected("NOT_IN_ROOM"));
+    await expectError({ type: "READY", roomId: room.id, ready: true }, "NOT_IN_ROOM");
+    vi.spyOn(manager, "startRoomByHost").mockResolvedValueOnce(rejected("NOT_ROOM_HOST"));
+    await expectError({ type: "START_ROOM", roomId: room.id }, "NOT_ROOM_HOST");
+    vi.spyOn(manager, "addLobbyBot").mockResolvedValueOnce(rejected("ROOM_FULL"));
+    await expectError({ type: "ADD_BOT", roomId: room.id }, "ROOM_FULL");
+    vi.spyOn(manager, "removeLobbyBot").mockResolvedValueOnce(rejected("BOT_NOT_FOUND"));
+    await expectError({ type: "REMOVE_BOT", roomId: room.id, seatIndex: 1 }, "BOT_NOT_FOUND");
+    vi.spyOn(manager, "updateRoomSettings").mockResolvedValueOnce(rejected("INVALID_ROOM_SETTINGS"));
+    await expectError({ type: "UPDATE_ROOM_SETTINGS", roomId: room.id, settings: { maxPlayers: 2 } }, "INVALID_ROOM_SETTINGS");
+    vi.spyOn(manager, "submitCommand").mockResolvedValueOnce(rejected("ROOM_PAUSED"));
+    await expectError({ type: "COMMAND", roomId: room.id, clientSeq: 2, command: { type: "ROLL_DICE", playerId: host.userId } }, "ROOM_PAUSED", "COMMAND_REJECTED");
+    vi.spyOn(manager, "addChat").mockResolvedValueOnce(undefined);
+    await expectError({ type: "CHAT", roomId: room.id, message: "rejected" }, "CHAT_REJECTED");
+    vi.spyOn(manager, "resync").mockResolvedValueOnce(undefined);
+    await expectError({ type: "RESYNC", roomId: room.id, lastSeq: 0 }, "RESYNC_FAILED");
+  });
+
   it("redacts trade history and snapshots in implicit spectator room state", async () => {
     const manager = new RoomManager();
     const host = await manager.createSession("Host");
@@ -216,6 +361,97 @@ describe("WebSocket gateway", () => {
     const message = await events;
     expect(message.roomId).toBe(room.id);
     expect(message.events[0]).toMatchObject({ type: "SETUP_PLACED" });
+  });
+
+  it("removes a socket's presence from its previous room when switching rooms", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Host");
+    const firstRoom = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
+    const secondRoom = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
+    const app = await buildServer({ manager });
+    servers.push({ close: () => app.close() });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const socket = await openSocket(app, host.token);
+
+    socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: firstRoom.code }));
+    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string } }>(socket, "ROOM_STATE", (message) => message.room.id === firstRoom.id);
+    socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: secondRoom.code }));
+    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string } }>(socket, "ROOM_STATE", (message) => message.room.id === secondRoom.id);
+    await waitUntil(() => firstRoom.seats.find((seat) => seat.userId === host.userId)?.connected === false);
+
+    expect(firstRoom.seats.find((seat) => seat.userId === host.userId)).toMatchObject({ connected: false });
+    expect(secondRoom.seats.find((seat) => seat.userId === host.userId)).toMatchObject({ connected: true });
+  });
+
+  it("serializes delayed presence updates while switching rooms", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Serialized Host");
+    const firstRoom = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
+    const secondRoom = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
+    const presence = new DelayedJoinPresenceStore();
+    const app = await buildServer({ manager, presenceStore: presence });
+    servers.push({ close: () => app.close() });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const socket = await openSocket(app, host.token);
+
+    socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: firstRoom.code }));
+    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string } }>(socket, "ROOM_STATE", (message) => message.room.id === firstRoom.id);
+    socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: secondRoom.code }));
+    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string } }>(socket, "ROOM_STATE", (message) => message.room.id === secondRoom.id);
+    await waitUntil(() => presence.completedJoins === 2, 1_000);
+
+    expect(presence.maxConcurrentJoins).toBe(1);
+    expect(await presence.roomUserIds(firstRoom.id)).not.toContain(host.userId);
+    expect(await presence.roomUserIds(secondRoom.id)).toContain(host.userId);
+  });
+
+  it("preserves wire order when a command follows a delayed room join", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Ordering Host");
+    const guest = await manager.createSession("Ordering Guest");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
+    const joinRoom = manager.joinRoom.bind(manager);
+    vi.spyOn(manager, "joinRoom").mockImplementationOnce(async (...args) => {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      return joinRoom(...args);
+    });
+    const app = await buildServer({ manager });
+    servers.push({ close: () => app.close() });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const socket = await openSocket(app, guest.token);
+    const readyState = waitForMessageWhere<{
+      type: "ROOM_STATE";
+      room: { seats: Array<{ userId?: string; ready: boolean }> };
+    }>(socket, "ROOM_STATE", (message) => message.room.seats.some((seat) => seat.userId === guest.userId && seat.ready));
+
+    socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.code }));
+    socket.send(JSON.stringify({ type: "READY", roomId: room.code, ready: true }));
+
+    const update = await readyState;
+    expect(update.room.seats).toContainEqual(expect.objectContaining({ userId: guest.userId, ready: true }));
+  });
+
+  it("finishes a delayed join before close cleanup so presence cannot be recreated", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Closing Host");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
+    const presence = new DelayedJoinPresenceStore();
+    const app = await buildServer({ manager, presenceStore: presence });
+    servers.push({ close: () => app.close() });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const socket = await openSocket(app, host.token);
+
+    socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.code }));
+    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string } }>(socket, "ROOM_STATE", (message) => message.room.id === room.id);
+    const closed = waitForClose(socket);
+    socket.close();
+    await closed;
+    await waitUntil(() => presence.completedJoins === 1, 1_000);
+    await waitUntil(async () => !(await presence.roomUserIds(room.id)).has(host.userId), 1_000);
+    await waitUntil(() => room.seats.find((seat) => seat.userId === host.userId)?.connected === false, 1_000);
+
+    expect(await presence.roomUserIds(room.id)).not.toContain(host.userId);
+    expect(room.seats.find((seat) => seat.userId === host.userId)).toMatchObject({ connected: false });
   });
 
   it("resyncs lobby rooms by short code without surfacing RESYNC_FAILED", async () => {
@@ -668,6 +904,129 @@ describe("WebSocket gateway", () => {
     expect(room.pauseReason).toBe("EMPTY_ROOM");
   });
 
+  it("uses local socket authority to synchronize disconnects when presence storage fails", async () => {
+    const manager = new RoomManager(undefined, { emptyGameTtlMs: 60_000 });
+    const host = await manager.createSession("Host");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: true, ranked: false });
+    const ready = await manager.setReady(room.id, host, true);
+    if (!ready.ok) throw new Error("Failed to start room");
+    const presence = new MemoryPresenceStore();
+    vi.spyOn(presence, "disconnect").mockRejectedValue(new Error("redis unavailable"));
+    const metrics = new MetricsRegistry("presence-test", "single");
+    const logs: StructuredLogRecord[] = [];
+    const logger = createStructuredLogger("presence-test", "single", (record) => logs.push(record));
+    const app = await buildServer({ manager, presenceStore: presence, metrics, logger });
+    servers.push({ close: () => app.close() });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+
+    const socket = await openSocket(app, host.token);
+    socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.id }));
+    await waitForMessage(socket, "ROOM_STATE");
+    socket.close();
+    await waitForClose(socket);
+
+    await waitUntil(() => room.seats.find((seat) => seat.userId === host.userId)?.connected === false);
+    expect(room.seats.find((seat) => seat.userId === host.userId)).toMatchObject({ connected: false });
+    expect(logs).toContainEqual(expect.objectContaining({
+      event: "presence.disconnect_failed",
+      roomId: room.id,
+      message: "redis unavailable",
+    }));
+    expect(metrics.render(manager, 0, presence.kind)).toContain('operation="presence_disconnect"');
+  });
+
+  it("keeps accepted sockets usable while surfacing initial presence connection failures", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Host");
+    const presence = new MemoryPresenceStore();
+    vi.spyOn(presence, "connect").mockRejectedValue(new Error("redis connect failed"));
+    const metrics = new MetricsRegistry("presence-connect-test", "single");
+    const logs: StructuredLogRecord[] = [];
+    const logger = createStructuredLogger("presence-connect-test", "single", (record) => logs.push(record));
+    const app = await buildServer({ manager, presenceStore: presence, metrics, logger });
+    servers.push({ close: () => app.close() });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+
+    const socket = await openSocket(app, host.token);
+    socket.send(JSON.stringify({ type: "PING", nonce: "still-usable" }));
+
+    await expect(waitForMessage(socket, "PONG")).resolves.toMatchObject({ nonce: "still-usable" });
+    await waitUntil(() => logs.some((record) => record.event === "presence.connect_failed"));
+    expect(logs).toContainEqual(expect.objectContaining({ event: "presence.connect_failed", message: "redis connect failed" }));
+    expect(metrics.render(manager, 1, presence.kind)).toContain('operation="presence_connect"');
+  });
+
+  it("falls back to local room users when presence membership lookup fails on close", async () => {
+    const manager = new RoomManager(undefined, { emptyGameTtlMs: 60_000 });
+    const host = await manager.createSession("Host");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: true, ranked: false });
+    const ready = await manager.setReady(room.id, host, true);
+    if (!ready.ok) throw new Error("Failed to start room");
+    const presence = new MemoryPresenceStore();
+    const metrics = new MetricsRegistry("presence-users-test", "single");
+    const logs: StructuredLogRecord[] = [];
+    const logger = createStructuredLogger("presence-users-test", "single", (record) => logs.push(record));
+    const app = await buildServer({ manager, presenceStore: presence, metrics, logger });
+    servers.push({ close: () => app.close() });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+
+    const socket = await openSocket(app, host.token);
+    socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.id }));
+    await waitForMessage(socket, "ROOM_STATE");
+    await waitUntil(async () => (await presence.roomUserIds(room.id)).has(host.userId));
+    vi.spyOn(presence, "roomUserIds").mockRejectedValue(new Error("redis membership failed"));
+    socket.close();
+    await waitForClose(socket);
+
+    await waitUntil(() => room.seats.find((seat) => seat.userId === host.userId)?.connected === false);
+    expect(logs).toContainEqual(expect.objectContaining({ event: "presence.room_users_failed", message: "redis membership failed" }));
+    expect(metrics.render(manager, 0, presence.kind)).toContain('operation="presence_room_users"');
+  });
+
+  it("reports stale-presence sweep failures without stopping the server", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Host");
+    const presence = new MemoryPresenceStore();
+    vi.spyOn(presence, "sweepStale").mockRejectedValue(new Error("redis sweep failed"));
+    const metrics = new MetricsRegistry("presence-sweep-test", "single");
+    const logs: StructuredLogRecord[] = [];
+    const logger = createStructuredLogger("presence-sweep-test", "single", (record) => logs.push(record));
+    const app = await buildServer({ manager, presenceStore: presence, metrics, logger, presenceSweepIntervalMs: 5 });
+    servers.push({ close: () => app.close() });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+
+    await waitUntil(() => logs.some((record) => record.event === "presence.sweep_failed"));
+    const health = await app.inject({ method: "GET", url: "/health" });
+    expect(health.statusCode).toBe(200);
+    expect(logs).toContainEqual(expect.objectContaining({ event: "presence.sweep_failed", message: "redis sweep failed" }));
+    expect(metrics.render(manager, 0, presence.kind)).toContain('operation="presence_sweep"');
+    expect(await manager.resolveSession(host.token)).toEqual(host);
+  });
+
+  it("reports durable connection-sync failures after a socket closes", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Host");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false });
+    const metrics = new MetricsRegistry("connection-sync-test", "single");
+    const logs: StructuredLogRecord[] = [];
+    const logger = createStructuredLogger("connection-sync-test", "single", (record) => logs.push(record));
+    const app = await buildServer({ manager, metrics, logger });
+    servers.push({ close: () => app.close() });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+
+    const socket = await openSocket(app, host.token);
+    socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.id }));
+    await waitForMessage(socket, "ROOM_STATE");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    vi.spyOn(manager, "syncConnections").mockRejectedValue(new Error("room persistence failed"));
+    socket.close();
+    await waitForClose(socket);
+
+    await waitUntil(() => logs.some((record) => record.event === "presence.connection_sync_failed"));
+    expect(logs).toContainEqual(expect.objectContaining({ event: "presence.connection_sync_failed", message: "room persistence failed" }));
+    expect(metrics.render(manager, 0, "memory")).toContain('operation="connection_sync"');
+  });
+
   it("resyncs missed broadcasts after reconnect with a fresh ticket", async () => {
     const manager = new RoomManager();
     const host = await manager.createSession("Host");
@@ -699,5 +1058,18 @@ describe("WebSocket gateway", () => {
     const resync = await waitForMessage<{ type: "RESYNC"; events: GameEvent[]; snapshot: { eventSeq: number } }>(reconnected, "RESYNC");
     expect(resync.events.map((event) => event.seq)).toEqual([1]);
     expect(resync.snapshot.eventSeq).toBe(1);
+  });
+
+  it("closes active WebSockets while draining server resources", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Shutdown Host");
+    const app = await buildServer({ manager });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const socket = await openSocket(app, host.token);
+    const closed = waitForClose(socket);
+
+    await app.close();
+
+    await expect(closed).resolves.toMatchObject({ code: 1005 });
   });
 });

@@ -2,15 +2,22 @@ import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
 import Fastify, { type FastifyInstance } from "fastify";
 import { nanoid } from "nanoid";
-import { schemaVersion, serializeEventsForViewer, serializeForViewer, type GameCommand } from "@colonizt/game-core";
-import { analyticsEventSchema, createRoomSchema, defaultWebSocketTicketTtlMs, protocolVersion, websocketAuthMode, wsClientMessageSchema } from "@colonizt/protocol";
+import { serializeEventsForViewer, serializeForViewer } from "@colonizt/game-core";
+import { defaultWebSocketTicketTtlMs } from "@colonizt/protocol";
 import { createPool, runMigrations } from "@colonizt/db";
 import { PostgresEventStore } from "./event-store.js";
 import { createStructuredLogger, MetricsRegistry, resolveInstanceMode, type StructuredLogger } from "./observability.js";
 import { MemoryRoomOwnershipStore, PostgresRoomOwnershipStore, type RoomOwnershipStore } from "./ownership.js";
 import { createPresenceStore, type PresenceStore } from "./presence.js";
-import { defaultRoomCleanupPolicy, RoomCapacityError, RoomManager, type Room, type RoomCleanupPolicy, type RoomSettings, type Session } from "./room-manager.js";
+import { defaultRoomCleanupPolicy, RoomManager, type Room, type RoomCleanupPolicy, type Session } from "./room-manager.js";
 import { RoomAutomationScheduler } from "./scheduler.js";
+import { handleWebSocketMessage, type SocketClient } from "./websocket-transport.js";
+import { RateLimitBuckets } from "./rate-limits.js";
+import { SocketRegistry } from "./socket-registry.js";
+import { WebSocketTicketStore } from "./websocket-tickets.js";
+import { configuredSecret, externalBaseUrl, isDatabaseError, nonNegativeInt, positiveInt } from "./server-runtime.js";
+import { registerHttpRoutes } from "./http-routes.js";
+import { installGracefulShutdown } from "./process-lifecycle.js";
 
 export { RoomManager, defaultRoomCleanupPolicy } from "./room-manager.js";
 export { MemoryEventStore, PostgresEventStore } from "./event-store.js";
@@ -34,60 +41,20 @@ export interface BuildServerOptions {
   sessionTtlMs?: number;
   roomOwnershipStore?: RoomOwnershipStore;
   roomOwnershipLeaseTtlMs?: number;
+  presenceStore?: PresenceStore;
   adminToken?: string | null;
   logger?: StructuredLogger;
   metrics?: MetricsRegistry;
   nodeId?: string;
   instanceMode?: "single";
   allowTestRules?: boolean;
+  trustedProxyHops?: number;
+  rateLimits?: Partial<{
+    sessionsPerMinutePerIp: number;
+    wsTicketsPerMinutePerIp: number;
+    roomCreationsPerMinutePerIp: number;
+  }>;
 }
-
-type SocketClient = { socket: WebSocketLike; session: Session; roomId?: string; asSpectator?: boolean };
-type WsTicket = { token: string; sessionToken: string; expiresAt: number; consumed: boolean };
-
-interface WebSocketLike {
-  send(data: string): void;
-  close(code?: number, reason?: string): void;
-  on(event: "message" | "close", listener: (...args: any[]) => void): void;
-}
-
-const tokenFromHeader = (authorization: unknown, xSessionToken: unknown): string | undefined => {
-  if (typeof xSessionToken === "string") return xSessionToken;
-  if (typeof authorization === "string" && authorization.startsWith("Bearer ")) return authorization.slice("Bearer ".length);
-  return undefined;
-};
-
-const configuredSecret = (value: string | null | undefined): string | undefined => {
-  const trimmed = value?.trim();
-  return trimmed ? trimmed : undefined;
-};
-
-const requireSession = async (manager: RoomManager, request: { headers: Record<string, unknown> }): Promise<Session> => {
-  const token = tokenFromHeader(request.headers.authorization, request.headers["x-session-token"]);
-  const session = await manager.resolveSession(token);
-  if (!session) {
-    throw Object.assign(new Error("Unauthorized"), { statusCode: 401 });
-  }
-  return session;
-};
-
-const positiveInt = (value: string | undefined, fallback: number): number => {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-};
-
-const withoutUndefined = <T extends Record<string, unknown>>(input: T): Partial<T> =>
-  Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined)) as Partial<T>;
-
-const sqlStatePattern = /^[0-9A-Z]{5}$/u;
-
-const isDatabaseError = (error: unknown): boolean => {
-  if (!error || typeof error !== "object") return false;
-  const candidate = error as { code?: unknown; routine?: unknown; severity?: unknown };
-  return typeof candidate.code === "string"
-    && sqlStatePattern.test(candidate.code)
-    && (typeof candidate.routine === "string" || typeof candidate.severity === "string");
-};
 
 export const buildServer = async (options: BuildServerOptions = {}): Promise<FastifyInstance> => {
   const instanceMode = options.instanceMode ?? resolveInstanceMode();
@@ -108,6 +75,11 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
   const sessionTtlMs = options.sessionTtlMs ?? positiveInt(process.env.SESSION_TTL_MS, 30 * 24 * 60 * 60 * 1000);
   const adminToken = configuredSecret(options.adminToken === undefined ? process.env.ADMIN_TOKEN : options.adminToken);
   const allowTestRules = options.allowTestRules ?? process.env.ALLOW_TEST_RULES === "true";
+  const rateLimits = {
+    sessionsPerMinutePerIp: options.rateLimits?.sessionsPerMinutePerIp ?? 20,
+    wsTicketsPerMinutePerIp: options.rateLimits?.wsTicketsPerMinutePerIp ?? 120,
+    roomCreationsPerMinutePerIp: options.rateLimits?.roomCreationsPerMinutePerIp ?? 30,
+  };
   let manager = options.manager;
   let ownershipStore = options.roomOwnershipStore;
   let pool: ReturnType<typeof createPool> | undefined;
@@ -118,6 +90,12 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     } catch (error) {
       metrics.recordDbFailure("migrations");
       logger.error("db.migrations_failed", { message: error instanceof Error ? error.message : String(error) });
+      try {
+        await pool.end();
+      } catch (closeError) {
+        metrics.recordDbFailure("pool_close");
+        logger.error("db.pool_close_failed", { message: closeError instanceof Error ? closeError.message : String(closeError) });
+      }
       throw error;
     }
     ownershipStore ??= new PostgresRoomOwnershipStore(pool);
@@ -126,6 +104,7 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
       sessionTtlMs,
       ownerId: nodeId,
       ownershipStore,
+      diagnostics: metrics,
       ...(options.roomOwnershipLeaseTtlMs !== undefined ? { ownershipLeaseTtlMs: options.roomOwnershipLeaseTtlMs } : {}),
     });
     await manager.hydrateFromStore();
@@ -136,81 +115,30 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     sessionTtlMs,
     ownerId: nodeId,
     ownershipStore,
+    diagnostics: metrics,
     ...(options.roomOwnershipLeaseTtlMs !== undefined ? { ownershipLeaseTtlMs: options.roomOwnershipLeaseTtlMs } : {}),
   });
-  const presence: PresenceStore = await createPresenceStore(process.env.REDIS_URL);
+  const presence: PresenceStore = options.presenceStore ?? await createPresenceStore(process.env.REDIS_URL, {
+    onFallback: (error) => {
+      metrics.recordDbFailure("presence_connect");
+      logger.warn("presence.redis_unavailable", { message: error instanceof Error ? error.message : String(error), fallback: "memory" });
+    },
+  });
   const defaultAllowedOrigins = process.env.WEB_ORIGIN
     ? [process.env.WEB_ORIGIN]
     : ["http://127.0.0.1:5173", "http://localhost:5173"];
   const allowedOrigins = options.allowedOrigins ?? defaultAllowedOrigins;
   const allowLegacySessionToken = options.allowLegacySessionToken ?? false;
   const wsTicketTtlMs = options.wsTicketTtlMs ?? defaultWebSocketTicketTtlMs;
-  const app = Fastify({ logger: false, bodyLimit: 32_000 });
-  const clients = new Set<SocketClient>();
-  const clientsByRoom = new Map<string, Set<SocketClient>>();
-  const clientsBySocket = new Map<string, SocketClient>();
-  const wsTickets = new Map<string, WsTicket>();
+  const trustedProxyHops = options.trustedProxyHops ?? nonNegativeInt(process.env.TRUSTED_PROXY_HOPS, 0);
+  const app = Fastify({ logger: false, bodyLimit: 32_000, ...(trustedProxyHops > 0 ? { trustProxy: trustedProxyHops } : {}) });
+  const socketRegistry = new SocketRegistry();
+  const wsTickets = new WebSocketTicketStore(wsTicketTtlMs);
   const requestStartedAt = new WeakMap<object, number>();
-  const rateLimitBuckets = new Map<string, number[]>();
+  const rateLimitBuckets = new RateLimitBuckets();
 
-  const externalBaseUrl = (request: { headers: Record<string, unknown>; protocol?: string; hostname?: string }, configured?: string): string => {
-    if (configured) return configured.replace(/\/$/, "");
-    const protoHeader = request.headers["x-forwarded-proto"];
-    const hostHeader = request.headers["x-forwarded-host"] ?? request.headers.host;
-    const proto = typeof protoHeader === "string" ? protoHeader.split(",")[0]!.trim() : request.protocol ?? "http";
-    const host = typeof hostHeader === "string" ? hostHeader.split(",")[0]!.trim() : request.hostname ?? "127.0.0.1";
-    return `${proto}://${host}`.replace(/\/$/, "");
-  };
-
-  const issueWsTicket = (session: Session): WsTicket => {
-    const ticket: WsTicket = {
-      token: `wst_${nanoid(24)}`,
-      sessionToken: session.token,
-      expiresAt: Date.now() + wsTicketTtlMs,
-      consumed: false,
-    };
-    wsTickets.set(ticket.token, ticket);
-    return ticket;
-  };
-
-  const consumeWsTicket = async (ticketToken: string | null): Promise<Session | undefined> => {
-    if (!ticketToken) return undefined;
-    const ticket = wsTickets.get(ticketToken);
-    if (!ticket || ticket.consumed || ticket.expiresAt < Date.now()) {
-      if (ticket) wsTickets.delete(ticketToken);
-      return undefined;
-    }
-    ticket.consumed = true;
-    wsTickets.delete(ticketToken);
-    return manager.resolveSession(ticket.sessionToken);
-  };
-
-  const withinLimit = (timestamps: number[], limit: number, windowMs: number): boolean => {
-    const now = Date.now();
-    while (timestamps[0] && timestamps[0] < now - windowMs) timestamps.shift();
-    if (timestamps.length >= limit) return false;
-    timestamps.push(now);
-    return true;
-  };
-
-  const clientIp = (request: { ip?: string; headers: Record<string, unknown> }): string => {
-    const forwarded = request.headers["x-forwarded-for"];
-    return typeof forwarded === "string" ? forwarded.split(",")[0]!.trim() : request.ip ?? "unknown";
-  };
-
-  const withinNamedLimit = (key: string, limit: number, windowMs: number): boolean => {
-    const timestamps = rateLimitBuckets.get(key) ?? [];
-    const ok = withinLimit(timestamps, limit, windowMs);
-    rateLimitBuckets.set(key, timestamps);
-    return ok;
-  };
-
-  const requireAdminToken = (request: { headers: Record<string, unknown> }, reply: { status(code: number): { send(payload: unknown): unknown } }): boolean => {
-    if (!adminToken) return true;
-    const token = tokenFromHeader(request.headers.authorization, request.headers["x-admin-token"]);
-    if (token === adminToken) return true;
-    reply.status(403).send({ code: "FORBIDDEN", message: "Admin token required" });
-    return false;
+  const withinNamedLimit = (key: string, limit: number, windowMs: number, now?: number): boolean => {
+    return rateLimitBuckets.allow(key, limit, windowMs, now);
   };
 
   const send = (client: SocketClient, payload: unknown): void => {
@@ -226,25 +154,23 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
   };
 
   const broadcastRoom = (roomId: string, payloadFor: (client: SocketClient) => unknown): void => {
-    for (const client of clientsByRoom.get(roomId) ?? []) send(client, payloadFor(client));
+    const failures = socketRegistry.broadcast(roomId, payloadFor);
+    for (const failure of failures) {
+      metrics.recordWebSocket("rejected", "broadcast_failed");
+      logger.warn("websocket.broadcast_failed", {
+        roomId,
+        userId: failure.client.session.userId,
+        message: failure.error instanceof Error ? failure.error.message : String(failure.error),
+      });
+    }
   };
 
   const detachClientFromRoom = (client: SocketClient, roomId = client.roomId): void => {
-    if (!roomId) return;
-    const roomClients = clientsByRoom.get(roomId);
-    if (roomClients) {
-      roomClients.delete(client);
-      if (roomClients.size === 0) clientsByRoom.delete(roomId);
-    }
-    if (client.roomId === roomId) delete client.roomId;
+    socketRegistry.detach(client, roomId);
   };
 
   const attachClientToRoom = (client: SocketClient, roomId: string): void => {
-    if (client.roomId && client.roomId !== roomId) detachClientFromRoom(client, client.roomId);
-    client.roomId = roomId;
-    const roomClients = clientsByRoom.get(roomId) ?? new Set<SocketClient>();
-    roomClients.add(client);
-    clientsByRoom.set(roomId, roomClients);
+    socketRegistry.attach(client, roomId);
   };
 
   const roomInviteUrl = (request: { headers: Record<string, unknown>; protocol?: string; hostname?: string } | undefined, room: Room): string => {
@@ -266,11 +192,11 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
   };
 
   const closeRoomClients = (roomId: string, code: string, message: string): void => {
-    for (const client of [...(clientsByRoom.get(roomId) ?? [])]) {
+    for (const client of socketRegistry.roomClients(roomId)) {
       send(client, { type: "ERROR", code, message });
+      socketRegistry.detach(client, roomId);
       client.socket.close(1000, message);
     }
-    clientsByRoom.delete(roomId);
   };
 
   const cleanupIntervalMs = options.roomCleanupIntervalMs ?? positiveInt(process.env.ROOM_CLEANUP_INTERVAL_MS, 30_000);
@@ -306,11 +232,9 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     const affectedRoomIds = new Set<string>();
     for (const stale of staleSockets) {
       if (stale.roomId) affectedRoomIds.add(stale.roomId);
-      const client = clientsBySocket.get(stale.socketId);
+      const client = socketRegistry.find(stale.socketId);
       if (!client) continue;
-      clients.delete(client);
-      clientsBySocket.delete(stale.socketId);
-      detachClientFromRoom(client);
+      socketRegistry.untrack(stale.socketId, client);
       metrics.recordWebSocket("closed", "presence_stale");
       client.socket.close(4000, "Presence stale");
     }
@@ -329,17 +253,9 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
   presenceSweepTimer.unref?.();
 
   const sweepTransientState = (): void => {
-    const now = Date.now();
-    for (const [token, ticket] of wsTickets) {
-      if (ticket.expiresAt <= now || ticket.consumed) wsTickets.delete(token);
-    }
-    for (const [key, timestamps] of rateLimitBuckets) {
-      while (timestamps[0] && timestamps[0] < now - 60_000) timestamps.shift();
-      if (timestamps.length === 0) rateLimitBuckets.delete(key);
-    }
-    for (const [roomId, roomClients] of clientsByRoom) {
-      if (roomClients.size === 0) clientsByRoom.delete(roomId);
-    }
+    wsTickets.sweep();
+    rateLimitBuckets.sweep();
+    socketRegistry.sweepEmptyRooms();
   };
 
   const transientSweepTimer = setInterval(sweepTransientState, Math.max(30_000, Math.min(wsTicketTtlMs, 60_000)));
@@ -368,8 +284,13 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     clearInterval(presenceSweepTimer);
     clearInterval(transientSweepTimer);
     scheduler.stop();
-    await presence.close();
-    await pool?.end();
+    const closeResults = await Promise.allSettled([presence.close(), pool?.end()]);
+    const closeFailures = closeResults
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => result.reason);
+    if (closeFailures.length > 0) {
+      throw new AggregateError(closeFailures, `Server cleanup failed: ${closeFailures.map(String).join("; ")}`);
+    }
   });
 
   await app.register(cors, {
@@ -381,173 +302,32 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
   });
   await app.register(websocket, { options: { maxPayload: 32_000 } });
 
-  app.get("/health", async () => ({ ok: true, service: "colonizt-server", presence: presence.kind, nodeId, instanceMode }));
-
-  app.get("/metrics", async (request, reply) => {
-    if (!requireAdminToken(request, reply)) return;
-    return reply.header("content-type", "text/plain; version=0.0.4; charset=utf-8").send(metrics.render(manager, clients.size, presence.kind));
+  const publicApiBaseUrl = options.publicApiBaseUrl ?? process.env.PUBLIC_API_URL;
+  const publicWsBaseUrl = options.publicWsBaseUrl ?? process.env.PUBLIC_WS_URL;
+  const publicWebUrl = options.publicWebUrl ?? process.env.PUBLIC_WEB_URL;
+  const webOrigin = process.env.WEB_ORIGIN;
+  registerHttpRoutes(app, {
+    manager,
+    metrics,
+    logger,
+    wsTickets,
+    wsTicketTtlMs,
+    allowedOrigins,
+    nodeId,
+    instanceMode,
+    presenceKind: presence.kind,
+    socketCount: () => socketRegistry.size(),
+    allowTestRules,
+    adminToken,
+    rateLimits,
+    withinNamedLimit,
+    publicRoomWithInvite,
+    ...(publicApiBaseUrl ? { publicApiBaseUrl } : {}),
+    ...(publicWsBaseUrl ? { publicWsBaseUrl } : {}),
+    ...(publicWebUrl ? { publicWebUrl } : {}),
+    ...(webOrigin ? { webOrigin } : {}),
   });
 
-  app.get("/admin/rooms/health", async (request, reply) => {
-    if (!requireAdminToken(request, reply)) return;
-    return {
-      nodeId,
-      instanceMode,
-      generatedAt: new Date().toISOString(),
-      rooms: manager.roomHealthReport(),
-    };
-  });
-
-  app.get("/config", async (request) => {
-    const apiBaseUrl = externalBaseUrl(request, options.publicApiBaseUrl ?? process.env.PUBLIC_API_URL);
-    const wsBaseUrl = (options.publicWsBaseUrl ?? process.env.PUBLIC_WS_URL ?? apiBaseUrl.replace(/^http/i, "ws")).replace(/\/$/, "");
-    return {
-      schemaVersion,
-      protocolVersion,
-      apiBaseUrl,
-      wsBaseUrl,
-      webOrigin: options.publicWebUrl ?? process.env.PUBLIC_WEB_URL ?? process.env.WEB_ORIGIN ?? allowedOrigins[0],
-      auth: { webSocket: websocketAuthMode, ticketTtlMs: wsTicketTtlMs },
-      nodeId,
-      instanceMode,
-    };
-  });
-
-  app.post<{ Body: { displayName?: string } }>("/sessions", async (request, reply) => {
-    if (!withinNamedLimit(`ip:${clientIp(request)}:sessions`, 20, 60_000)) {
-      return reply.status(429).send({ code: "RATE_LIMITED", message: "Too many sessions" });
-    }
-    const displayName = typeof request.body.displayName === "string" ? request.body.displayName.trim().slice(0, 40) : "";
-    return manager.createSession(displayName || "Guest");
-  });
-
-  app.post("/ws-tickets", async (request, reply) => {
-    const session = await requireSession(manager, request);
-    if (!withinNamedLimit(`session:${session.userId}:ws-tickets`, 60, 60_000) || !withinNamedLimit(`ip:${clientIp(request)}:ws-tickets`, 120, 60_000)) {
-      return reply.status(429).send({ code: "RATE_LIMITED", message: "Too many WebSocket tickets" });
-    }
-    const ticket = issueWsTicket(session);
-    return reply.status(201).send({ ticket: ticket.token, expiresAt: new Date(ticket.expiresAt).toISOString(), ttlMs: wsTicketTtlMs });
-  });
-
-  app.post("/analytics", async (request, reply) => {
-    if (!withinNamedLimit(`ip:${clientIp(request)}:analytics`, 120, 60_000)) return reply.status(429).send({ code: "RATE_LIMITED" });
-    const parsed = analyticsEventSchema.safeParse(request.body ?? {});
-    if (!parsed.success) return reply.status(400).send({ code: "BAD_REQUEST", issues: parsed.error.issues });
-    const token = tokenFromHeader(request.headers.authorization, request.headers["x-session-token"]);
-    const session = token ? await manager.resolveSession(token) : undefined;
-    const event = {
-      eventName: parsed.data.eventName,
-      payload: parsed.data.payload,
-      ...(session ? { userId: session.userId } : {}),
-      ...(parsed.data.matchId ? { matchId: parsed.data.matchId } : {}),
-    };
-    await manager.recordAnalytics(event);
-    return reply.status(202).send({ ok: true });
-  });
-
-  app.get("/rooms", async (request, reply) => {
-    if (!withinNamedLimit(`ip:${clientIp(request)}:room-list`, 120, 60_000)) return reply.status(429).send({ code: "RATE_LIMITED" });
-    return manager.listRooms();
-  });
-
-  app.get<{ Params: { roomRef: string } }>("/rooms/:roomRef", async (request, reply) => {
-    if (!withinNamedLimit(`ip:${clientIp(request)}:room-lookup`, 90, 60_000)) return reply.status(429).send({ code: "RATE_LIMITED" });
-    const room = await manager.ensureRoomLoadedByRef(request.params.roomRef);
-    if (room && !room.archivedAt && room.status !== "EXPIRED" && room.status !== "ABANDONED") return publicRoomWithInvite(request, room);
-    const stored = await manager.loadRoomStatusByRef(request.params.roomRef);
-    if (!stored) return reply.status(404).send({ code: "ROOM_NOT_FOUND" });
-    const code = stored.status === "EXPIRED" ? "ROOM_EXPIRED" : stored.status === "ABANDONED" ? "ROOM_ABANDONED" : "ROOM_CLOSED";
-    return reply.status(410).send({ code, status: stored.status, cleanupReason: stored.cleanupReason });
-  });
-
-  app.get<{ Querystring: { limit?: string } }>("/matches", async (request) => {
-    const limit = Number(request.query.limit ?? 20);
-    return manager.listMatchHistory(Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 100) : 20);
-  });
-
-  app.get<{ Params: { matchId: string } }>("/matches/:matchId", async (request, reply) => {
-    const matches = await manager.listMatchHistory(100);
-    const match = matches.find((candidate) => candidate.id === request.params.matchId || candidate.roomId === request.params.matchId);
-    return match ?? reply.status(404).send({ code: "MATCH_NOT_FOUND" });
-  });
-
-  app.post("/rooms", async (request, reply) => {
-    const session = await requireSession(manager, request);
-    if (!withinNamedLimit(`session:${session.userId}:room-create`, 12, 60_000) || !withinNamedLimit(`ip:${clientIp(request)}:room-create`, 30, 60_000)) {
-      return reply.status(429).send({ code: "RATE_LIMITED", message: "Too many room creation attempts" });
-    }
-    const parsed = createRoomSchema.safeParse(request.body ?? {});
-    if (!parsed.success) return reply.status(400).send({ code: "BAD_REQUEST", issues: parsed.error.issues });
-    const { minPlayers, maxPlayers, ...baseSettings } = parsed.data;
-    const parsedSettings = {
-      ...baseSettings,
-      ...(minPlayers === undefined ? {} : { minPlayers }),
-      ...(maxPlayers === undefined ? {} : { maxPlayers }),
-    };
-    const settings = parsedSettings.rules?.mapPreset
-      ? { ...parsedSettings, rules: { ...parsedSettings.rules, mapRandomized: true } }
-      : parsedSettings;
-    if (!allowTestRules && (settings.rules?.maxTurns !== undefined || settings.rules?.maxTurnAdjudication !== undefined)) {
-      return reply.status(400).send({ code: "TEST_RULES_DISABLED", message: "Turn-limit adjudication is available only for test and smoke rooms" });
-    }
-    try {
-      return publicRoomWithInvite(request, await manager.createRoom(session, settings), session.userId);
-    } catch (error) {
-      if (error instanceof RoomCapacityError) return reply.status(503).send({ code: error.code, message: error.message });
-      throw error;
-    }
-  });
-
-  app.get<{ Params: { replayId: string } }>("/matches/:replayId/replay", async (request, reply) => {
-    const session = await requireSession(manager, request);
-    const replayResult = await manager.getFinishedReplayById(request.params.replayId);
-    if (replayResult.status === "missing") {
-      metrics.recordReplay("not_found");
-      return reply.status(404).send({ code: "REPLAY_NOT_FOUND" });
-    }
-    if (replayResult.status === "not_finished") {
-      metrics.recordReplay("not_ready");
-      return reply.status(409).send({ code: "REPLAY_NOT_READY", message: "Replay is available after the game is finished" });
-    }
-    if (replayResult.status !== "finished") {
-      metrics.recordReplay("not_found");
-      return reply.status(404).send({ code: "REPLAY_NOT_FOUND" });
-    }
-    const storedReplay = replayResult.replay;
-    if (!storedReplay.config.playerOrder.includes(session.userId)) {
-      metrics.recordReplay("forbidden");
-      return reply.status(403).send({ code: "REPLAY_FORBIDDEN" });
-    }
-    metrics.recordReplay("loaded");
-    logger.info("replay.loaded", { replayId: request.params.replayId, userId: session.userId, eventCount: storedReplay.events.length });
-    return storedReplay;
-  });
-
-  app.get("/leaderboard", async (request, reply) => {
-    if (!requireAdminToken(request, reply)) return;
-    return {
-      mode: "CLASSIC",
-      seasonId: "local-admin",
-      rankedPublicQueue: "deferred",
-      rows: [...manager.rooms.values()].flatMap((room) =>
-        Object.values(room.game?.players ?? {}).map((player) => ({ userId: player.id, score: player.score, rating: 1000 + player.score * 25 })),
-      ),
-    };
-  });
-
-  app.post<{ Params: { roomId: string }; Body: { reportedUserId?: string; reason?: string } }>("/rooms/:roomId/reports", async (request, reply) => {
-    const session = await requireSession(manager, request);
-    if (!withinNamedLimit(`session:${session.userId}:reports`, 10, 60_000) || !withinNamedLimit(`ip:${clientIp(request)}:reports`, 30, 60_000)) {
-      return reply.status(429).send({ code: "RATE_LIMITED" });
-    }
-    const reportedUserId = typeof request.body.reportedUserId === "string" ? request.body.reportedUserId.trim() : "";
-    const reason = typeof request.body.reason === "string" ? request.body.reason.trim() : "";
-    if (!reportedUserId || reportedUserId.length > 120 || !reason || reason.length > 500) return reply.status(400).send({ code: "BAD_REQUEST" });
-    const report = await manager.createReport(request.params.roomId, session, reportedUserId, reason);
-    if (!report) return reply.status(404).send({ code: "REPORT_REJECTED" });
-    return report;
-  });
 
   app.get("/ws", { websocket: true }, async (socket, request) => {
     const url = new URL(request.url, "http://localhost");
@@ -558,7 +338,7 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
       socket.close(1008, "Origin not allowed");
       return;
     }
-    const session = await consumeWsTicket(url.searchParams.get("ticket"))
+    const session = await wsTickets.consume(url.searchParams.get("ticket"), (token) => manager.resolveSession(token))
       ?? (allowLegacySessionToken ? await manager.resolveSession(url.searchParams.get("sessionToken") ?? undefined) : undefined);
     if (!session) {
       metrics.recordWebSocket("rejected", "unauthorized");
@@ -570,214 +350,108 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     const socketId = `sock_${nanoid(10)}`;
     const commandTimes: number[] = [];
     const chatTimes: number[] = [];
-    clients.add(client);
-    clientsBySocket.set(socketId, client);
+    let transitionTail = Promise.resolve();
+    const enqueueConnectionTransition = (operation: () => void | Promise<void>): void => {
+      transitionTail = transitionTail.then(operation).catch((error) => {
+        metrics.recordWebSocket("rejected", "transition_failed");
+        logger.error("websocket.transition_failed", {
+          socketId,
+          userId: session.userId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
+    };
+    socketRegistry.track(socketId, client);
     metrics.recordWebSocket("connected");
     logger.info("websocket.connected", { socketId, userId: session.userId });
-    void presence.connect(session, socketId).catch(() => undefined);
+    enqueueConnectionTransition(async () => {
+      try {
+        await presence.connect(session, socketId);
+      } catch (error) {
+        metrics.recordDbFailure("presence_connect");
+        logger.warn("presence.connect_failed", {
+          socketId,
+          userId: session.userId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
     socket.on("close", () => {
-      const wasTracked = clients.delete(client);
-      clientsBySocket.delete(socketId);
-      const roomId = client.roomId;
-      detachClientFromRoom(client, roomId);
-      if (wasTracked) metrics.recordWebSocket("closed");
-      logger.info("websocket.closed", { socketId, userId: session.userId, roomId });
-      void (async () => {
-        await presence.disconnect(session, socketId, roomId);
+      enqueueConnectionTransition(async () => {
+        const { tracked, roomId } = socketRegistry.untrack(socketId, client);
+        if (tracked) metrics.recordWebSocket("closed");
+        logger.info("websocket.closed", { socketId, userId: session.userId, roomId });
         if (!roomId) return;
-        const room = await manager.syncConnections(roomId, await presence.roomUserIds(roomId));
-        if (room) broadcastRoomState(room);
-      })().catch(() => undefined);
+        let useLocalPresence = false;
+        try {
+          await presence.disconnect(session, socketId, roomId);
+        } catch (error) {
+          useLocalPresence = true;
+          metrics.recordDbFailure("presence_disconnect");
+          logger.warn("presence.disconnect_failed", {
+            socketId,
+            userId: session.userId,
+            roomId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+        let connectedUserIds: Set<string>;
+        if (useLocalPresence) {
+          connectedUserIds = socketRegistry.roomUserIds(roomId);
+        } else {
+          try {
+            connectedUserIds = await presence.roomUserIds(roomId);
+          } catch (error) {
+            metrics.recordDbFailure("presence_room_users");
+            logger.warn("presence.room_users_failed", {
+              socketId,
+              userId: session.userId,
+              roomId,
+              message: error instanceof Error ? error.message : String(error),
+            });
+            connectedUserIds = socketRegistry.roomUserIds(roomId);
+          }
+        }
+        try {
+          const room = await manager.syncConnections(roomId, connectedUserIds);
+          if (room) broadcastRoomState(room);
+        } catch (error) {
+          metrics.recordDbFailure("connection_sync");
+          logger.error("presence.connection_sync_failed", {
+            socketId,
+            userId: session.userId,
+            roomId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      });
     });
 
     socket.on("message", (raw) => {
-      const rawText = raw.toString();
-      if (Buffer.byteLength(rawText) > 32_000) {
-        socket.close(1009, "Message too large");
-        return;
-      }
-      let parsedJson: unknown;
-      try {
-        parsedJson = JSON.parse(rawText);
-      } catch {
-        socket.send(JSON.stringify({ type: "ERROR", code: "BAD_JSON" }));
-        return;
-      }
-      const parsed = wsClientMessageSchema.safeParse(parsedJson);
-      if (!parsed.success) {
-        socket.send(JSON.stringify({ type: "ERROR", code: "BAD_MESSAGE", issues: parsed.error.issues }));
-        return;
-      }
-
-      const message = parsed.data;
-      if (message.type === "PING") {
-        void presence.refresh(session, socketId, client.roomId).catch(() => undefined);
-        socket.send(JSON.stringify({ type: "PONG", nonce: message.nonce }));
-        return;
-      }
-      if (message.type === "JOIN_ROOM") {
-        if (!withinNamedLimit(`session:${session.userId}:join-room`, 30, 60_000)) {
-          send(client, { type: "ERROR", code: "RATE_LIMITED", message: "Too many join attempts" });
-          return;
-        }
-        void manager.joinRoom(message.roomId, session, message.asSpectator ?? false).then((joined) => {
-          if (!joined.ok) {
-            send(client, { type: "ERROR", code: joined.code, message: joined.message });
-            return;
-          }
-          attachClientToRoom(client, joined.room.id);
-          client.asSpectator = joined.room.spectators.has(session.userId) && !manager.isMember(joined.room, session.userId);
-          void presence.joinRoom(session, socketId, joined.room.id).then(async () => {
-            const synced = await manager.syncConnections(joined.room.id, await presence.roomUserIds(joined.room.id));
-            if (synced) broadcastRoomState(synced);
-            else broadcastRoomState(joined.room);
-          }).catch(() => undefined);
-        }).catch((error) => send(client, { type: "ERROR", code: "JOIN_FAILED", message: error instanceof Error ? error.message : "Join failed" }));
-        return;
-      }
-      if (message.type === "LEAVE_ROOM") {
-        const canonicalRoomId = manager.roomForRef(message.roomId)?.id ?? client.roomId ?? message.roomId;
-        void manager.leaveRoom(message.roomId, session).then((left) => {
-          if (!left.ok) {
-            send(client, { type: "ERROR", code: left.code, message: left.message });
-            return;
-          }
-          detachClientFromRoom(client, left.room.id);
-          client.asSpectator = false;
-          void presence.disconnect(session, socketId, left.room.id).catch(() => undefined);
-          send(client, { type: "ROOM_LEFT", roomId: left.room.id });
-          broadcastRoomState(left.room);
-        }).catch((error) => send(client, { type: "ERROR", code: "LEAVE_FAILED", message: error instanceof Error ? error.message : "Leave failed", roomId: canonicalRoomId }));
-        return;
-      }
-      if (message.type === "READY") {
-        void manager.setReady(message.roomId, session, message.ready).then((ready) => {
-          if (!ready.ok) {
-            send(client, { type: "ERROR", code: ready.code, message: ready.message });
-            return;
-          }
-          broadcastRoomState(ready.room);
-        }).catch((error) => send(client, { type: "ERROR", code: "READY_FAILED", message: error instanceof Error ? error.message : "Ready failed" }));
-        return;
-      }
-      if (message.type === "START_ROOM") {
-        void manager.startRoomByHost(message.roomId, session).then((started) => {
-          if (!started.ok) {
-            send(client, { type: "ERROR", code: started.code, message: started.message });
-            return;
-          }
-          broadcastRoomState(started.room);
-        }).catch((error) => send(client, { type: "ERROR", code: "START_FAILED", message: error instanceof Error ? error.message : "Start failed" }));
-        return;
-      }
-      if (message.type === "ADD_BOT") {
-        void manager.addLobbyBot(message.roomId, session).then((added) => {
-          if (!added.ok) {
-            send(client, { type: "ERROR", code: added.code, message: added.message });
-            return;
-          }
-          broadcastRoomState(added.room);
-        }).catch((error) => send(client, { type: "ERROR", code: "ADD_BOT_FAILED", message: error instanceof Error ? error.message : "Add bot failed" }));
-        return;
-      }
-      if (message.type === "REMOVE_BOT") {
-        void manager.removeLobbyBot(message.roomId, session, message.seatIndex).then((removed) => {
-          if (!removed.ok) {
-            send(client, { type: "ERROR", code: removed.code, message: removed.message });
-            return;
-          }
-          broadcastRoomState(removed.room);
-        }).catch((error) => send(client, { type: "ERROR", code: "REMOVE_BOT_FAILED", message: error instanceof Error ? error.message : "Remove bot failed" }));
-        return;
-      }
-      if (message.type === "UPDATE_ROOM_SETTINGS") {
-        const settings: Partial<Omit<RoomSettings, "mode">> = {};
-        if (message.settings.botFill !== undefined) settings.botFill = message.settings.botFill;
-        if (message.settings.ranked !== undefined) settings.ranked = message.settings.ranked;
-        if (message.settings.minPlayers !== undefined) settings.minPlayers = message.settings.minPlayers;
-        if (message.settings.maxPlayers !== undefined) settings.maxPlayers = message.settings.maxPlayers;
-        if (message.settings.botDifficulty !== undefined) settings.botDifficulty = message.settings.botDifficulty;
-        if (message.settings.rules) settings.rules = withoutUndefined(message.settings.rules);
-        void manager.updateRoomSettings(message.roomId, session, settings).then((updated) => {
-          if (!updated.ok) {
-            send(client, { type: "ERROR", code: updated.code, message: updated.message });
-            return;
-          }
-          broadcastRoomState(updated.room);
-        }).catch((error) => send(client, { type: "ERROR", code: "SETTINGS_FAILED", message: error instanceof Error ? error.message : "Settings update failed" }));
-        return;
-      }
-      if (message.type === "UPDATE_DISPLAY_NAME") {
-        void manager.updateDisplayName(session, message.displayName, client.roomId).then(() => {
-          if (client.roomId) {
-            const room = manager.roomForRef(client.roomId);
-            if (room) broadcastRoomState(room);
-          }
-        }).catch((error) => send(client, { type: "ERROR", code: "NAME_FAILED", message: error instanceof Error ? error.message : "Name update failed" }));
-        return;
-      }
-      if (message.type === "COMMAND") {
-        const commandStartedAt = Date.now();
-        if (!withinLimit(commandTimes, 30, 10_000)) {
-          metrics.recordCommand("rejected", message.command.type, Date.now() - commandStartedAt);
-          logger.warn("command.rejected", { code: "RATE_LIMITED", userId: session.userId, command: message.command.type });
-          send(client, { type: "COMMAND_REJECTED", code: "RATE_LIMITED", message: "Too many commands", clientSeq: message.clientSeq });
-          return;
-        }
-        const canonicalRoomId = manager.roomForRef(message.roomId)?.id ?? message.roomId;
-        void manager.submitCommand(message.roomId, session, message.clientSeq, message.command as GameCommand).then((result) => {
-          if (!result.ok) {
-            metrics.recordCommand("rejected", message.command.type, Date.now() - commandStartedAt);
-            logger.warn("command.rejected", { code: result.code, userId: session.userId, roomId: canonicalRoomId, command: message.command.type });
-            send(client, { type: "COMMAND_REJECTED", code: result.code, message: result.message, clientSeq: message.clientSeq });
-            return;
-          }
-          if (result.replayed) {
-            metrics.recordCommand("replayed", message.command.type, Date.now() - commandStartedAt);
-            logger.info("command.replayed", { userId: session.userId, roomId: canonicalRoomId, command: message.command.type, clientSeq: message.clientSeq });
-            send(client, {
-              type: "COMMAND_ACK",
-              roomId: canonicalRoomId,
-              clientSeq: message.clientSeq,
-              seqStart: result.seqStart,
-              seqEnd: result.seqEnd,
-            });
-            return;
-          }
-          metrics.recordCommand("accepted", message.command.type, Date.now() - commandStartedAt);
-          logger.info("command.accepted", { userId: session.userId, roomId: canonicalRoomId, command: message.command.type, events: result.events.length });
-          broadcastRoom(canonicalRoomId, (target) => ({
+      const receivedAt = Date.now();
+      enqueueConnectionTransition(() => handleWebSocketMessage(raw, {
+        client,
+        socketId,
+        manager,
+        presence,
+        metrics,
+        logger,
+        commandTimes,
+        chatTimes,
+        withinNamedLimit,
+        attachClientToRoom: (roomId) => attachClientToRoom(client, roomId),
+        detachClientFromRoom: (roomId) => detachClientFromRoom(client, roomId),
+        broadcastRoomState,
+        broadcastAcceptedCommand: (roomId, result) => {
+          broadcastRoom(roomId, (target) => ({
             type: "EVENTS",
-            roomId: canonicalRoomId,
+            roomId,
             events: serializeEventsForViewer(result.events, viewerIdFor(target), result.state.playerOrder, result.state.phase.type === "GAME_OVER"),
-            snapshot: snapshotFor(canonicalRoomId, result.state, target),
+            snapshot: snapshotFor(roomId, result.state, target),
           }));
-        }).catch((error) => {
-          metrics.recordCommand("rejected", message.command.type, Date.now() - commandStartedAt);
-          metrics.recordDbFailure("command");
-          logger.error("command.failed", { userId: session.userId, roomId: canonicalRoomId, command: message.command.type, message: error instanceof Error ? error.message : String(error) });
-          send(client, { type: "COMMAND_REJECTED", code: "COMMAND_FAILED", message: error instanceof Error ? error.message : "Command failed", clientSeq: message.clientSeq });
-        });
-        return;
-      }
-      if (message.type === "CHAT") {
-        if (!withinLimit(chatTimes, 6, 10_000)) {
-          send(client, { type: "ERROR", code: "RATE_LIMITED", message: "Too many chat messages" });
-          return;
-        }
-        const canonicalRoomId = manager.roomForRef(message.roomId)?.id ?? message.roomId;
-        void manager.addChat(message.roomId, session, message.message).then((chat) => {
-          if (!chat) send(client, { type: "ERROR", code: "CHAT_REJECTED" });
-          else broadcastRoom(canonicalRoomId, () => ({ type: "CHAT", roomId: canonicalRoomId, chat }));
-        }).catch((error) => send(client, { type: "ERROR", code: "CHAT_FAILED", message: error instanceof Error ? error.message : "Chat failed" }));
-        return;
-      }
-      if (message.type === "RESYNC") {
-        const canonicalRoomId = manager.roomForRef(message.roomId)?.id ?? message.roomId;
-        void manager.resync(message.roomId, session, message.lastSeq).then((resync) => {
-          send(client, resync ? { type: "RESYNC", roomId: canonicalRoomId, ...resync } : { type: "ERROR", code: "RESYNC_FAILED" });
-        }).catch((error) => send(client, { type: "ERROR", code: "RESYNC_FAILED", message: error instanceof Error ? error.message : "Resync failed" }));
-      }
+        },
+        broadcastChat: (roomId, chat) => broadcastRoom(roomId, () => ({ type: "CHAT", roomId, chat })),
+      }, receivedAt));
     });
   });
 
@@ -791,11 +465,5 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   await app.listen({ host, port });
   console.log(`Colonizt server listening on http://${host}:${port}`);
 
-  const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
-    console.log(`Colonizt server received ${signal}; draining sockets and closing resources`);
-    await app.close();
-    process.exit(0);
-  };
-  process.once("SIGTERM", () => void shutdown("SIGTERM"));
-  process.once("SIGINT", () => void shutdown("SIGINT"));
+  installGracefulShutdown(app);
 }

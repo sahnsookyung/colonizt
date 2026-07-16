@@ -462,11 +462,6 @@ const thiefMoveCommand = (state: GameState, playerId: PlayerId, type: "MOVE_THIE
       : undefined;
 };
 
-const preferredYearOfPlentyResources = (view: BotView): [Resource, Resource] => {
-  const wanted = [...resources].sort((left, right) => marginalValue(view, right) - marginalValue(view, left) || left.localeCompare(right));
-  return [wanted[0] ?? "grain", wanted[1] ?? wanted[0] ?? "ore"];
-};
-
 const commandPriority = (command: GameCommand): number => {
   switch (command.type) {
     case "UPGRADE_CITY":
@@ -533,8 +528,14 @@ const generateActionCandidates = (view: BotView, profile: BotProfile, idFactory:
     }
     if (action.type === "PLAY_YEAR_OF_PLENTY") {
       const cardId = action.cardIds[0];
-      const plenty = preferredYearOfPlentyResources(view);
-      if (cardId) commands.push({ type: "PLAY_YEAR_OF_PLENTY", playerId: view.botId, cardId, resources: plenty });
+      if (cardId) {
+        for (const [leftIndex, left] of action.resources.entries()) {
+          for (const right of action.resources.slice(leftIndex)) {
+            if (left === right && (state.resourceBank[left] ?? 0) < 2) continue;
+            commands.push({ type: "PLAY_YEAR_OF_PLENTY", playerId: view.botId, cardId, resources: [left, right] });
+          }
+        }
+      }
     }
   }
   const offer = profile !== "random" ? chooseTradeOffer(view, idFactory, profile) : undefined;

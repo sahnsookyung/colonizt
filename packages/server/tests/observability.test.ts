@@ -12,6 +12,11 @@ describe("observability", () => {
     metrics.recordDbFailure("append_events");
     metrics.recordRoomCleanup("EXPIRED", "EMPTY_LOBBY_TTL");
     metrics.recordWebSocket("connected");
+    metrics.recordHydration("snapshot");
+    metrics.recordHydration("snapshot_fallback");
+    metrics.recordStoreValidationFailure("room");
+    metrics.recordCommandConflict("accepted");
+    metrics.recordAutomationPause("budget");
 
     const rendered = metrics.render(manager, 1, "memory");
     expect(rendered).toContain('colonizt_commands_total{node_id="node-a",instance_mode="single",outcome="accepted",command="ROLL_DICE"} 1');
@@ -20,6 +25,11 @@ describe("observability", () => {
     expect(rendered).toContain('colonizt_db_failures_total{node_id="node-a",instance_mode="single",operation="append_events"} 1');
     expect(rendered).toContain('colonizt_room_cleanup_total{node_id="node-a",instance_mode="single",status="EXPIRED",reason="EMPTY_LOBBY_TTL"} 1');
     expect(rendered).toContain('colonizt_websocket_events_total{node_id="node-a",instance_mode="single",event="connected",reason="none"} 1');
+    expect(rendered).toContain('colonizt_room_hydration_total{node_id="node-a",instance_mode="single",outcome="snapshot"} 1');
+    expect(rendered).toContain('colonizt_room_hydration_total{node_id="node-a",instance_mode="single",outcome="snapshot_fallback"} 1');
+    expect(rendered).toContain('colonizt_store_validation_failures_total{node_id="node-a",instance_mode="single",record_type="room"} 1');
+    expect(rendered).toContain('colonizt_command_result_conflicts_total{node_id="node-a",instance_mode="single",path="accepted"} 1');
+    expect(rendered).toContain('colonizt_automation_pauses_total{node_id="node-a",instance_mode="single",reason="budget"} 1');
   });
 
   it("captures structured log records through an injected sink", () => {

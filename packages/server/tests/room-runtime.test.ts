@@ -74,4 +74,21 @@ describe("room-runtime helpers", () => {
 
     expect(roomTimerKey(room.game)).toBe("match_timer:4:ACTION_PHASE:u_host");
   });
+
+  it("uses a new timer key for each setup placement", () => {
+    const room = baseRoom();
+    room.game = {
+      schemaVersion: 3,
+      config: { matchId: "match_setup", seed: "timer", victoryPoints: 10, maxPlayers: 2, turnSeconds: 45, playerOrder: ["u_host", "u_guest"], playerNames: { u_host: "Host", u_guest: "Guest" }, playerColors: { u_host: "blue", u_guest: "red" } },
+      board: { hexes: {}, vertices: {}, edges: {}, ports: {}, adjacency: { hexToVertices: {}, vertexToEdges: {}, edgeToVertices: {} } },
+      players: {}, playerOrder: ["u_host", "u_guest"], resourceBank: { timber: 0, brick: 0, grain: 0, fiber: 0, ore: 0 },
+      phase: { type: "SETUP_PLACEMENT", activePlayerId: "u_host", setupIndex: 0 }, turn: 1,
+      roads: {}, settlements: {}, buildings: {}, playedKnightCounts: {}, trades: {}, developmentDeck: [], developmentDeckCursor: 0,
+      eventSeq: 0, rng: { seed: "timer", index: 0, policy: "SEEDED_DETERMINISTIC" },
+    };
+    const first = roomTimerKey(room.game);
+    room.game.phase = { type: "SETUP_PLACEMENT", activePlayerId: "u_host", setupIndex: 3 };
+
+    expect(roomTimerKey(room.game)).not.toBe(first);
+  });
 });

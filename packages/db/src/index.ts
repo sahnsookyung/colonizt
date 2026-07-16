@@ -179,6 +179,7 @@ const upsertRoomWithClient = async (client: pg.PoolClient, room: PersistRoomInpu
        ON CONFLICT (id) DO UPDATE
        SET mode = EXCLUDED.mode,
            status = EXCLUDED.status,
+           host_user_id = EXCLUDED.host_user_id,
            settings_json = EXCLUDED.settings_json,
            room_code = EXCLUDED.room_code,
            last_activity_at = EXCLUDED.last_activity_at,
@@ -219,6 +220,10 @@ const upsertRoomWithClient = async (client: pg.PoolClient, room: PersistRoomInpu
         [room.id, seat.seatIndex, seat.userId ?? null, seat.botId ?? null, seat.ready, seat.connected],
       );
   }
+  await client.query(
+    "DELETE FROM room_seats WHERE room_id = $1 AND seat_index >= $2",
+    [room.id, room.seats.length],
+  );
 };
 
 export const upsertRoom = async (pool: pg.Pool, room: PersistRoomInput): Promise<void> => {

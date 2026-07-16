@@ -27,5 +27,8 @@ export const livenessStateForRoom = (room: Room): RoomLivenessState => {
 
 export const roomTimerKey = (state?: GameState): string | undefined => {
   if (!state || !("activePlayerId" in state.phase)) return undefined;
-  return `${state.config.matchId}:${state.turn}:${state.phase.type}:${state.phase.activePlayerId}`;
+  const phaseKey = state.phase.type === "SETUP_PLACEMENT"
+    ? `${state.phase.type}:${state.phase.setupIndex}`
+    : state.phase.type;
+  return `${state.config.matchId}:${state.turn}:${phaseKey}:${state.phase.activePlayerId}`;
 };

@@ -42,19 +42,20 @@ jobs:
       COLONIZT_PRODUCTION_HOST: ${{ secrets.COLONIZT_PRODUCTION_HOST }}
       COLONIZT_PRODUCTION_USER: ${{ secrets.COLONIZT_PRODUCTION_USER || 'opc' }}
       COLONIZT_DEPLOY_KEY: ${{ secrets.COLONIZT_DEPLOY_KEY }}
+      COLONIZT_PRODUCTION_KNOWN_HOSTS: ${{ secrets.COLONIZT_PRODUCTION_KNOWN_HOSTS }}
       COLONIZT_PRODUCTION_ENV_B64: ${{ secrets.COLONIZT_PRODUCTION_ENV_B64 }}
       COLONIZT_GHCR_SECRET: ${{ secrets.COLONIZT_GHCR_SECRET }}
       COLONIZT_GHCR_USER: ${{ secrets.COLONIZT_GHCR_USER || 'sahnsookyung' }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Node
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
           cache: npm
@@ -110,7 +111,7 @@ jobs:
         run: |
           set -euo pipefail
           missing=0
-          for name in COLONIZT_PRODUCTION_HOST COLONIZT_PRODUCTION_USER COLONIZT_DEPLOY_KEY COLONIZT_PRODUCTION_ENV_B64; do
+          for name in COLONIZT_PRODUCTION_HOST COLONIZT_PRODUCTION_USER COLONIZT_DEPLOY_KEY COLONIZT_PRODUCTION_KNOWN_HOSTS COLONIZT_PRODUCTION_ENV_B64; do
             if [[ -z "${!name}" ]]; then
               echo "::error::$name is required in the production environment."
               missing=1
@@ -150,11 +151,14 @@ jobs:
           install -m 700 -d "$HOME/.ssh"
           printf '%s\n' "$COLONIZT_DEPLOY_KEY" > "$RUNNER_TEMP/colonizt_deploy_key"
           chmod 600 "$RUNNER_TEMP/colonizt_deploy_key"
+          printf '%s\n' "$COLONIZT_PRODUCTION_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
           cat > "$HOME/.ssh/config" <<EOF
           Host $COLONIZT_PRODUCTION_HOST
             IdentityFile $RUNNER_TEMP/colonizt_deploy_key
             IdentitiesOnly yes
-            StrictHostKeyChecking accept-new
+            StrictHostKeyChecking yes
+            UserKnownHostsFile $HOME/.ssh/known_hosts
           EOF
 
           printf '%s' "$COLONIZT_PRODUCTION_ENV_B64" | base64 --decode > "$RUNNER_TEMP/colonizt.env"
@@ -171,6 +175,7 @@ jobs:
           GHCR_USER="$COLONIZT_GHCR_USER" \
           COLONIZT_GHCR_SECRET="$COLONIZT_GHCR_SECRET" \
           COLONIZT_ENV_FILE="$RUNNER_TEMP/colonizt.env" \
+          COLONIZT_SSH_KNOWN_HOSTS_FILE="$HOME/.ssh/known_hosts" \
           ./ops/scripts/deploy-oci.sh "$COLONIZT_PRODUCTION_HOST" "$IMAGE_TAG"
 
       - name: Route deployed smoke traffic to OCI origin

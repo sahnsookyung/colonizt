@@ -47,6 +47,7 @@ services:
       NODE_ID: ${NODE_ID:-oci-colonizt-1}
       SERVER_HOST: ${SERVER_HOST:-0.0.0.0}
       SERVER_PORT: ${SERVER_PORT:-8787}
+      TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-1}
       PUBLIC_WEB_URL: ${PUBLIC_WEB_URL:-https://colonizt.sookyungahn.com}
       PUBLIC_API_URL: ${PUBLIC_API_URL:-https://colonizt.sookyungahn.com}
       PUBLIC_WS_URL: ${PUBLIC_WS_URL:-wss://colonizt.sookyungahn.com}
