@@ -47,6 +47,13 @@ describe("rate-limit buckets", () => {
     expect(buckets.size()).toBe(0);
     expect(buckets.allow("sessions", 2, 1_000)).toBe(true);
   });
+
+  it("can enforce a caller-supplied receipt time after processing is delayed", () => {
+    const buckets = new RateLimitBuckets(() => 10_000);
+    expect(buckets.allow("messages", 1, 1_000, 1_000)).toBe(true);
+    expect(buckets.allow("messages", 1, 1_000, 1_500)).toBe(false);
+    expect(buckets.allow("messages", 1, 1_000, 2_001)).toBe(true);
+  });
 });
 
 describe("WebSocket ticket store", () => {

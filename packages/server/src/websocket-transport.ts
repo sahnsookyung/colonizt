@@ -31,7 +31,7 @@ export interface WebSocketMessageContext {
   logger: StructuredLogger;
   commandTimes: number[];
   chatTimes: number[];
-  withinNamedLimit(key: string, limit: number, windowMs: number): boolean;
+  withinNamedLimit(key: string, limit: number, windowMs: number, now?: number): boolean;
   attachClientToRoom(roomId: string): void;
   detachClientFromRoom(roomId?: string): void;
   broadcastRoomState(room: Room): void;
@@ -39,7 +39,11 @@ export interface WebSocketMessageContext {
   broadcastChat(roomId: string, chat: unknown): void;
 }
 
-export const handleWebSocketMessage = (raw: { toString(): string }, context: WebSocketMessageContext): void => {
+export const handleWebSocketMessage = (
+  raw: { toString(): string },
+  context: WebSocketMessageContext,
+  receivedAt = Date.now(),
+): void | Promise<void> => {
   const {
     client,
     socketId,
@@ -72,7 +76,8 @@ export const handleWebSocketMessage = (raw: { toString(): string }, context: Web
 
   const message = parsed.data;
   if (message.type === "PING") {
-    void presence.refresh(session, socketId, client.roomId).catch((error) => {
+    send({ type: "PONG", nonce: message.nonce });
+    return presence.refresh(session, socketId, client.roomId).catch((error) => {
       metrics.recordDbFailure("presence_refresh");
       logger.warn("presence.refresh_failed", {
         socketId,
@@ -81,31 +86,30 @@ export const handleWebSocketMessage = (raw: { toString(): string }, context: Web
         message: error instanceof Error ? error.message : String(error),
       });
     });
-    send({ type: "PONG", nonce: message.nonce });
-    return;
   }
   if (message.type === "JOIN_ROOM") {
-    if (!context.withinNamedLimit(`session:${session.userId}:join-room`, 30, 60_000)) {
+    if (!context.withinNamedLimit(`session:${session.userId}:join-room`, 30, 60_000, receivedAt)) {
       send({ type: "ERROR", code: "RATE_LIMITED", message: "Too many join attempts" });
       return;
     }
-    const previousRoomId = client.roomId;
-    void manager.joinRoom(message.roomId, session, message.asSpectator ?? false).then((joined) => {
+    return manager.joinRoom(message.roomId, session, message.asSpectator ?? false).then(async (joined) => {
       if (!joined.ok) {
         send({ type: "ERROR", code: joined.code, message: joined.message });
         return;
       }
+      const previousRoomId = client.roomId;
       context.attachClientToRoom(joined.room.id);
       client.asSpectator = joined.room.spectators.has(session.userId) && !manager.isMember(joined.room, session.userId);
       context.broadcastRoomState(joined.room);
-      void presence.joinRoom(session, socketId, joined.room.id).then(async () => {
+      try {
+        await presence.joinRoom(session, socketId, joined.room.id);
         if (previousRoomId && previousRoomId !== joined.room.id) {
           const previous = await manager.syncConnections(previousRoomId, await presence.roomUserIds(previousRoomId));
           if (previous) context.broadcastRoomState(previous);
         }
         const synced = await manager.syncConnections(joined.room.id, await presence.roomUserIds(joined.room.id));
         context.broadcastRoomState(synced ?? joined.room);
-      }).catch((error) => {
+      } catch (error) {
         metrics.recordDbFailure("presence_join");
         logger.warn("presence.join_failed", {
           socketId,
@@ -113,20 +117,21 @@ export const handleWebSocketMessage = (raw: { toString(): string }, context: Web
           roomId: joined.room.id,
           message: error instanceof Error ? error.message : String(error),
         });
-      });
+      }
     }).catch((error) => send({ type: "ERROR", code: "JOIN_FAILED", message: error instanceof Error ? error.message : "Join failed" }));
-    return;
   }
   if (message.type === "LEAVE_ROOM") {
     const canonicalRoomId = manager.roomForRef(message.roomId)?.id ?? client.roomId ?? message.roomId;
-    void manager.leaveRoom(message.roomId, session).then((left) => {
+    return manager.leaveRoom(message.roomId, session).then(async (left) => {
       if (!left.ok) {
         send({ type: "ERROR", code: left.code, message: left.message });
         return;
       }
       context.detachClientFromRoom(left.room.id);
       client.asSpectator = false;
-      void presence.disconnect(session, socketId, left.room.id).catch((error) => {
+      try {
+        await presence.disconnect(session, socketId, left.room.id);
+      } catch (error) {
         metrics.recordDbFailure("presence_disconnect");
         logger.warn("presence.disconnect_failed", {
           socketId,
@@ -134,39 +139,34 @@ export const handleWebSocketMessage = (raw: { toString(): string }, context: Web
           roomId: left.room.id,
           message: error instanceof Error ? error.message : String(error),
         });
-      });
+      }
       send({ type: "ROOM_LEFT", roomId: left.room.id });
       context.broadcastRoomState(left.room);
     }).catch((error) => send({ type: "ERROR", code: "LEAVE_FAILED", message: error instanceof Error ? error.message : "Leave failed", roomId: canonicalRoomId }));
-    return;
   }
   if (message.type === "READY") {
-    void manager.setReady(message.roomId, session, message.ready).then((ready) => {
+    return manager.setReady(message.roomId, session, message.ready).then((ready) => {
       if (!ready.ok) send({ type: "ERROR", code: ready.code, message: ready.message });
       else context.broadcastRoomState(ready.room);
     }).catch((error) => send({ type: "ERROR", code: "READY_FAILED", message: error instanceof Error ? error.message : "Ready failed" }));
-    return;
   }
   if (message.type === "START_ROOM") {
-    void manager.startRoomByHost(message.roomId, session).then((started) => {
+    return manager.startRoomByHost(message.roomId, session).then((started) => {
       if (!started.ok) send({ type: "ERROR", code: started.code, message: started.message });
       else context.broadcastRoomState(started.room);
     }).catch((error) => send({ type: "ERROR", code: "START_FAILED", message: error instanceof Error ? error.message : "Start failed" }));
-    return;
   }
   if (message.type === "ADD_BOT") {
-    void manager.addLobbyBot(message.roomId, session).then((added) => {
+    return manager.addLobbyBot(message.roomId, session).then((added) => {
       if (!added.ok) send({ type: "ERROR", code: added.code, message: added.message });
       else context.broadcastRoomState(added.room);
     }).catch((error) => send({ type: "ERROR", code: "ADD_BOT_FAILED", message: error instanceof Error ? error.message : "Add bot failed" }));
-    return;
   }
   if (message.type === "REMOVE_BOT") {
-    void manager.removeLobbyBot(message.roomId, session, message.seatIndex).then((removed) => {
+    return manager.removeLobbyBot(message.roomId, session, message.seatIndex).then((removed) => {
       if (!removed.ok) send({ type: "ERROR", code: removed.code, message: removed.message });
       else context.broadcastRoomState(removed.room);
     }).catch((error) => send({ type: "ERROR", code: "REMOVE_BOT_FAILED", message: error instanceof Error ? error.message : "Remove bot failed" }));
-    return;
   }
   if (message.type === "UPDATE_ROOM_SETTINGS") {
     const settings: Partial<Omit<RoomSettings, "mode">> = {};
@@ -176,22 +176,20 @@ export const handleWebSocketMessage = (raw: { toString(): string }, context: Web
     if (message.settings.maxPlayers !== undefined) settings.maxPlayers = message.settings.maxPlayers;
     if (message.settings.botDifficulty !== undefined) settings.botDifficulty = message.settings.botDifficulty;
     if (message.settings.rules) settings.rules = withoutUndefined(message.settings.rules);
-    void manager.updateRoomSettings(message.roomId, session, settings).then((updated) => {
+    return manager.updateRoomSettings(message.roomId, session, settings).then((updated) => {
       if (!updated.ok) send({ type: "ERROR", code: updated.code, message: updated.message });
       else context.broadcastRoomState(updated.room);
     }).catch((error) => send({ type: "ERROR", code: "SETTINGS_FAILED", message: error instanceof Error ? error.message : "Settings update failed" }));
-    return;
   }
   if (message.type === "UPDATE_DISPLAY_NAME") {
-    void manager.updateDisplayName(session, message.displayName, client.roomId).then(() => {
+    return manager.updateDisplayName(session, message.displayName, client.roomId).then(() => {
       if (!client.roomId) return;
       const room = manager.roomForRef(client.roomId);
       if (room) context.broadcastRoomState(room);
     }).catch((error) => send({ type: "ERROR", code: "NAME_FAILED", message: error instanceof Error ? error.message : "Name update failed" }));
-    return;
   }
   if (message.type === "COMMAND") {
-    const commandStartedAt = Date.now();
+    const commandStartedAt = receivedAt;
     if (!withinSlidingWindow(commandTimes, 30, 10_000, commandStartedAt)) {
       metrics.recordCommand("rejected", message.command.type, Date.now() - commandStartedAt);
       logger.warn("command.rejected", { code: "RATE_LIMITED", userId: session.userId, command: message.command.type });
@@ -199,7 +197,7 @@ export const handleWebSocketMessage = (raw: { toString(): string }, context: Web
       return;
     }
     const canonicalRoomId = manager.roomForRef(message.roomId)?.id ?? message.roomId;
-    void manager.submitCommand(canonicalRoomId, session, message.clientSeq, message.command as GameCommand).then((result) => {
+    return manager.submitCommand(canonicalRoomId, session, message.clientSeq, message.command as GameCommand).then((result) => {
       if (!result.ok) {
         metrics.recordCommand("rejected", message.command.type, Date.now() - commandStartedAt);
         logger.warn("command.rejected", { code: result.code, userId: session.userId, roomId: canonicalRoomId, command: message.command.type });
@@ -231,23 +229,21 @@ export const handleWebSocketMessage = (raw: { toString(): string }, context: Web
       logger.error("command.failed", { userId: session.userId, roomId: canonicalRoomId, command: message.command.type, message: error instanceof Error ? error.message : String(error) });
       send({ type: "COMMAND_REJECTED", code: "COMMAND_FAILED", message: error instanceof Error ? error.message : "Command failed", clientSeq: message.clientSeq });
     });
-    return;
   }
   if (message.type === "CHAT") {
-    if (!withinSlidingWindow(chatTimes, 6, 10_000)) {
+    if (!withinSlidingWindow(chatTimes, 6, 10_000, receivedAt)) {
       send({ type: "ERROR", code: "RATE_LIMITED", message: "Too many chat messages" });
       return;
     }
     const canonicalRoomId = manager.roomForRef(message.roomId)?.id ?? message.roomId;
-    void manager.addChat(message.roomId, session, message.message).then((chat) => {
+    return manager.addChat(message.roomId, session, message.message).then((chat) => {
       if (!chat) send({ type: "ERROR", code: "CHAT_REJECTED" });
       else context.broadcastChat(canonicalRoomId, chat);
     }).catch((error) => send({ type: "ERROR", code: "CHAT_FAILED", message: error instanceof Error ? error.message : "Chat failed" }));
-    return;
   }
   if (message.type === "RESYNC") {
     const canonicalRoomId = manager.roomForRef(message.roomId)?.id ?? message.roomId;
-    void manager.resync(message.roomId, session, message.lastSeq).then((resync) => {
+    return manager.resync(message.roomId, session, message.lastSeq).then((resync) => {
       send(resync ? { type: "RESYNC", roomId: canonicalRoomId, ...resync } : { type: "ERROR", code: "RESYNC_FAILED" });
     }).catch((error) => send({ type: "ERROR", code: "RESYNC_FAILED", message: error instanceof Error ? error.message : "Resync failed" }));
   }

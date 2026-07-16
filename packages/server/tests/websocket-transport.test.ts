@@ -55,6 +55,23 @@ describe("websocket sliding-window limiter", () => {
 });
 
 describe("websocket message delivery boundaries", () => {
+  it("uses message receipt time when applying a deferred join limit", async () => {
+    const manager = new RoomManager();
+    const session = await manager.createSession("Limited Player");
+    const logs: StructuredLogRecord[] = [];
+    const { client, send } = socketClient(session);
+    const withinNamedLimit = vi.fn(() => false);
+
+    handleWebSocketMessage(
+      { toString: () => JSON.stringify({ type: "JOIN_ROOM", roomId: "ROOM01" }) },
+      messageContext(manager, client, logs, { withinNamedLimit }),
+      1_234,
+    );
+
+    expect(withinNamedLimit).toHaveBeenCalledWith(`session:${session.userId}:join-room`, 30, 60_000, 1_234);
+    expect(send).toHaveBeenCalledWith(JSON.stringify({ type: "ERROR", code: "RATE_LIMITED", message: "Too many join attempts" }));
+  });
+
   it("keeps heartbeat replies live while surfacing presence refresh failures", async () => {
     const manager = new RoomManager();
     const session = await manager.createSession("Player");

@@ -137,8 +137,8 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
   const requestStartedAt = new WeakMap<object, number>();
   const rateLimitBuckets = new RateLimitBuckets();
 
-  const withinNamedLimit = (key: string, limit: number, windowMs: number): boolean => {
-    return rateLimitBuckets.allow(key, limit, windowMs);
+  const withinNamedLimit = (key: string, limit: number, windowMs: number, now?: number): boolean => {
+    return rateLimitBuckets.allow(key, limit, windowMs, now);
   };
 
   const send = (client: SocketClient, payload: unknown): void => {
@@ -350,22 +350,37 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     const socketId = `sock_${nanoid(10)}`;
     const commandTimes: number[] = [];
     const chatTimes: number[] = [];
+    let transitionTail = Promise.resolve();
+    const enqueueConnectionTransition = (operation: () => void | Promise<void>): void => {
+      transitionTail = transitionTail.then(operation).catch((error) => {
+        metrics.recordWebSocket("rejected", "transition_failed");
+        logger.error("websocket.transition_failed", {
+          socketId,
+          userId: session.userId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
+    };
     socketRegistry.track(socketId, client);
     metrics.recordWebSocket("connected");
     logger.info("websocket.connected", { socketId, userId: session.userId });
-    void presence.connect(session, socketId).catch((error) => {
-      metrics.recordDbFailure("presence_connect");
-      logger.warn("presence.connect_failed", {
-        socketId,
-        userId: session.userId,
-        message: error instanceof Error ? error.message : String(error),
-      });
+    enqueueConnectionTransition(async () => {
+      try {
+        await presence.connect(session, socketId);
+      } catch (error) {
+        metrics.recordDbFailure("presence_connect");
+        logger.warn("presence.connect_failed", {
+          socketId,
+          userId: session.userId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
     });
     socket.on("close", () => {
-      const { tracked, roomId } = socketRegistry.untrack(socketId, client);
-      if (tracked) metrics.recordWebSocket("closed");
-      logger.info("websocket.closed", { socketId, userId: session.userId, roomId });
-      void (async () => {
+      enqueueConnectionTransition(async () => {
+        const { tracked, roomId } = socketRegistry.untrack(socketId, client);
+        if (tracked) metrics.recordWebSocket("closed");
+        logger.info("websocket.closed", { socketId, userId: session.userId, roomId });
         if (!roomId) return;
         let useLocalPresence = false;
         try {
@@ -397,42 +412,47 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
             connectedUserIds = socketRegistry.roomUserIds(roomId);
           }
         }
-        const room = await manager.syncConnections(roomId, connectedUserIds);
-        if (room) broadcastRoomState(room);
-      })().catch((error) => {
-        metrics.recordDbFailure("connection_sync");
-        logger.error("presence.connection_sync_failed", {
-          socketId,
-          userId: session.userId,
-          ...(roomId ? { roomId } : {}),
-          message: error instanceof Error ? error.message : String(error),
-        });
+        try {
+          const room = await manager.syncConnections(roomId, connectedUserIds);
+          if (room) broadcastRoomState(room);
+        } catch (error) {
+          metrics.recordDbFailure("connection_sync");
+          logger.error("presence.connection_sync_failed", {
+            socketId,
+            userId: session.userId,
+            roomId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
       });
     });
 
-    socket.on("message", (raw) => handleWebSocketMessage(raw, {
-      client,
-      socketId,
-      manager,
-      presence,
-      metrics,
-      logger,
-      commandTimes,
-      chatTimes,
-      withinNamedLimit,
-      attachClientToRoom: (roomId) => attachClientToRoom(client, roomId),
-      detachClientFromRoom: (roomId) => detachClientFromRoom(client, roomId),
-      broadcastRoomState,
-      broadcastAcceptedCommand: (roomId, result) => {
-        broadcastRoom(roomId, (target) => ({
-          type: "EVENTS",
-          roomId,
-          events: serializeEventsForViewer(result.events, viewerIdFor(target), result.state.playerOrder, result.state.phase.type === "GAME_OVER"),
-          snapshot: snapshotFor(roomId, result.state, target),
-        }));
-      },
-      broadcastChat: (roomId, chat) => broadcastRoom(roomId, () => ({ type: "CHAT", roomId, chat })),
-    }));
+    socket.on("message", (raw) => {
+      const receivedAt = Date.now();
+      enqueueConnectionTransition(() => handleWebSocketMessage(raw, {
+        client,
+        socketId,
+        manager,
+        presence,
+        metrics,
+        logger,
+        commandTimes,
+        chatTimes,
+        withinNamedLimit,
+        attachClientToRoom: (roomId) => attachClientToRoom(client, roomId),
+        detachClientFromRoom: (roomId) => detachClientFromRoom(client, roomId),
+        broadcastRoomState,
+        broadcastAcceptedCommand: (roomId, result) => {
+          broadcastRoom(roomId, (target) => ({
+            type: "EVENTS",
+            roomId,
+            events: serializeEventsForViewer(result.events, viewerIdFor(target), result.state.playerOrder, result.state.phase.type === "GAME_OVER"),
+            snapshot: snapshotFor(roomId, result.state, target),
+          }));
+        },
+        broadcastChat: (roomId, chat) => broadcastRoom(roomId, () => ({ type: "CHAT", roomId, chat })),
+      }, receivedAt));
+    });
   });
 
   return app;

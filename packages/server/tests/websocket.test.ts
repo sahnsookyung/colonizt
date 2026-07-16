@@ -78,6 +78,28 @@ const waitUntil = async (predicate: () => boolean | Promise<boolean>, timeoutMs 
   }
 };
 
+class DelayedJoinPresenceStore extends MemoryPresenceStore {
+  activeJoins = 0;
+  completedJoins = 0;
+  maxConcurrentJoins = 0;
+
+  constructor(private readonly delayMs = 40) {
+    super();
+  }
+
+  override async joinRoom(...args: Parameters<MemoryPresenceStore["joinRoom"]>): Promise<void> {
+    this.activeJoins += 1;
+    this.maxConcurrentJoins = Math.max(this.maxConcurrentJoins, this.activeJoins);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+      await super.joinRoom(...args);
+      this.completedJoins += 1;
+    } finally {
+      this.activeJoins -= 1;
+    }
+  }
+}
+
 const wsBase = (app: { server: { address(): string | AddressInfo | null } }): string => {
   const address = app.server.address();
   if (!address || typeof address === "string") throw new Error("No server address");
@@ -359,6 +381,77 @@ describe("WebSocket gateway", () => {
 
     expect(firstRoom.seats.find((seat) => seat.userId === host.userId)).toMatchObject({ connected: false });
     expect(secondRoom.seats.find((seat) => seat.userId === host.userId)).toMatchObject({ connected: true });
+  });
+
+  it("serializes delayed presence updates while switching rooms", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Serialized Host");
+    const firstRoom = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
+    const secondRoom = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
+    const presence = new DelayedJoinPresenceStore();
+    const app = await buildServer({ manager, presenceStore: presence });
+    servers.push({ close: () => app.close() });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const socket = await openSocket(app, host.token);
+
+    socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: firstRoom.code }));
+    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string } }>(socket, "ROOM_STATE", (message) => message.room.id === firstRoom.id);
+    socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: secondRoom.code }));
+    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string } }>(socket, "ROOM_STATE", (message) => message.room.id === secondRoom.id);
+    await waitUntil(() => presence.completedJoins === 2, 1_000);
+
+    expect(presence.maxConcurrentJoins).toBe(1);
+    expect(await presence.roomUserIds(firstRoom.id)).not.toContain(host.userId);
+    expect(await presence.roomUserIds(secondRoom.id)).toContain(host.userId);
+  });
+
+  it("preserves wire order when a command follows a delayed room join", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Ordering Host");
+    const guest = await manager.createSession("Ordering Guest");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
+    const joinRoom = manager.joinRoom.bind(manager);
+    vi.spyOn(manager, "joinRoom").mockImplementationOnce(async (...args) => {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      return joinRoom(...args);
+    });
+    const app = await buildServer({ manager });
+    servers.push({ close: () => app.close() });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const socket = await openSocket(app, guest.token);
+    const readyState = waitForMessageWhere<{
+      type: "ROOM_STATE";
+      room: { seats: Array<{ userId?: string; ready: boolean }> };
+    }>(socket, "ROOM_STATE", (message) => message.room.seats.some((seat) => seat.userId === guest.userId && seat.ready));
+
+    socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.code }));
+    socket.send(JSON.stringify({ type: "READY", roomId: room.code, ready: true }));
+
+    const update = await readyState;
+    expect(update.room.seats).toContainEqual(expect.objectContaining({ userId: guest.userId, ready: true }));
+  });
+
+  it("finishes a delayed join before close cleanup so presence cannot be recreated", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Closing Host");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
+    const presence = new DelayedJoinPresenceStore();
+    const app = await buildServer({ manager, presenceStore: presence });
+    servers.push({ close: () => app.close() });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const socket = await openSocket(app, host.token);
+
+    socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.code }));
+    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string } }>(socket, "ROOM_STATE", (message) => message.room.id === room.id);
+    const closed = waitForClose(socket);
+    socket.close();
+    await closed;
+    await waitUntil(() => presence.completedJoins === 1, 1_000);
+    await waitUntil(async () => !(await presence.roomUserIds(room.id)).has(host.userId), 1_000);
+    await waitUntil(() => room.seats.find((seat) => seat.userId === host.userId)?.connected === false, 1_000);
+
+    expect(await presence.roomUserIds(room.id)).not.toContain(host.userId);
+    expect(room.seats.find((seat) => seat.userId === host.userId)).toMatchObject({ connected: false });
   });
 
   it("resyncs lobby rooms by short code without surfacing RESYNC_FAILED", async () => {
