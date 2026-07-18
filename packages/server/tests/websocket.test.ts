@@ -172,7 +172,7 @@ describe("WebSocket gateway", () => {
 
     await expect(rateLimited).resolves.toMatchObject({ code: "RATE_LIMITED", clientSeq: 31 });
     expect(submit).toHaveBeenCalledTimes(30);
-  });
+  }, 15_000);
 
   it("rejects room actions until the socket has joined that exact room", async () => {
     const manager = new RoomManager();

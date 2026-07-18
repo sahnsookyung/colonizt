@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { MetricsRegistry, buildServer, createStructuredLogger, MemoryEventStore } from "../src/index.js";
+import { MetricsRegistry, buildServer, createStructuredLogger, MemoryEventStore, MemoryPresenceStore } from "../src/index.js";
 import { RoomManager } from "../src/room-manager.js";
 
 class CapturingAnalyticsStore extends MemoryEventStore {
@@ -22,14 +22,14 @@ describe("REST routes", () => {
     vi.setSystemTime(new Date("2026-07-18T00:00:00.000Z"));
     const manager = new RoomManager(new MemoryEventStore(), { sessionTtlMs: 1 });
     const session = await manager.createSession("Transient Guest");
-    const app = await buildServer({ manager, wsTicketTtlMs: 30_000 });
+    const app = await buildServer({ manager, presenceStore: new MemoryPresenceStore(), wsTicketTtlMs: 30_000 });
     try {
       expect(manager.sessions.has(session.token)).toBe(true);
       await vi.advanceTimersByTimeAsync(30_001);
       expect(manager.sessions.has(session.token)).toBe(false);
     } finally {
-      await app.close();
       vi.useRealTimers();
+      await app.close();
     }
   });
 
@@ -39,14 +39,14 @@ describe("REST routes", () => {
     const metrics = new MetricsRegistry("test", "single");
     const logger = createStructuredLogger("test", "single", (record) => events.push(record.event));
     const manager = new RoomManager(new FailingSessionSweepStore());
-    const app = await buildServer({ manager, metrics, logger, wsTicketTtlMs: 30_000 });
+    const app = await buildServer({ manager, metrics, logger, presenceStore: new MemoryPresenceStore(), wsTicketTtlMs: 30_000 });
     try {
       await vi.advanceTimersByTimeAsync(30_000);
       expect(events).toContain("session.sweep_failed");
       expect(metrics.render(manager, 0, "memory")).toContain('operation="session_sweep"');
     } finally {
-      await app.close();
       vi.useRealTimers();
+      await app.close();
     }
   });
 
