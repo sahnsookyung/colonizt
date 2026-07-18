@@ -73,6 +73,19 @@ const serializeTradeForViewer = (trade: TradeOffer, viewerId: PlayerId | "specta
 
 const bankResourcesForState = (state: GameState): ResourceBundle => state.resourceBank ?? projectedResourceBank(state);
 
+const phaseForViewer = (state: GameState, viewerId: PlayerId | "spectator"): GameState["phase"] => {
+  if (state.phase.type !== "DISCARDING") return state.phase;
+  return {
+    ...state.phase,
+    submitted: Object.fromEntries(
+      Object.entries(state.phase.submitted).map(([playerId, submitted]) => [
+        playerId,
+        playerId === viewerId ? submitted : {},
+      ]),
+    ),
+  };
+};
+
 const victoryBreakdownFor = (state: GameState, playerId: PlayerId, visibleSecretVictoryPoints: number): VictoryPointBreakdown => {
   const player = state.players[playerId];
   const buildings = Object.values(state.buildings).filter((building) => building.owner === playerId);
@@ -137,7 +150,7 @@ export const serializeForViewer = (state: GameState, viewerId: PlayerId | "spect
     };
   }),
   playerOrder: state.playerOrder,
-  phase: state.phase,
+  phase: phaseForViewer(state, viewerId),
   turn: state.turn,
   roads: state.roads,
   settlements: state.settlements,

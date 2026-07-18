@@ -604,6 +604,7 @@ const validateThiefMove = (state: GameState, playerId: PlayerId, hexId: HexId, s
   if (!state.board.hexes[hexId]) return error("INVALID_THIEF_MOVE", "Unknown thief destination");
   if (!validThiefHexes(state).includes(hexId)) return error("INVALID_THIEF_MOVE", "Thief must move to a different hex");
   const eligible = eligibleStealTargets(state, playerId, hexId);
+  if (eligible.length > 0 && !stealFromPlayerId) return error("INVALID_THIEF_MOVE", "Choose a player to steal from");
   if (stealFromPlayerId && !eligible.includes(stealFromPlayerId)) return error("INVALID_THIEF_MOVE", "Choose an eligible player to steal from");
   return null;
 };

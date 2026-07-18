@@ -64,6 +64,8 @@ describe("PostgresEventStore adapter", () => {
     expect(sessionInsert?.[1]?.[0]).not.toBe(session.token);
     expect(sessionInsert?.[1]).toEqual(expect.arrayContaining(["u_1", "Ada", expiresAt]));
     await expect(store.loadSessionByToken(session.token)).resolves.toEqual(session);
+    await expect(store.deleteExpiredSessions(new Date(expiresAt))).resolves.toBe(0);
+    expect(db.clientQuery).toHaveBeenCalledWith(expect.stringContaining("DELETE FROM sessions"), [expiresAt]);
 
     const missing = new PostgresEventStore(fakePool(() => queryResult()).pool);
     await expect(missing.loadSessionByToken("s_missing")).resolves.toBeUndefined();
@@ -81,7 +83,27 @@ describe("PostgresEventStore adapter", () => {
       JSON.stringify({ trade_1: 1_000 }), JSON.stringify(room.timer), room.archivedAt, room.cleanupReason,
     ]));
 
+    db.connect.mockClear();
+    db.clientQuery.mockClear();
+    await store.persistRooms([room, { ...roomFixture(null), id: "room_second", code: "SECOND" }]);
+    expect(db.connect).toHaveBeenCalledOnce();
+    expect(db.clientQuery.mock.calls.filter(([sql]) => String(sql).includes("INSERT INTO rooms"))).toHaveLength(2);
+    expect(db.clientQuery).toHaveBeenLastCalledWith("COMMIT");
+
+    db.connect.mockClear();
+    db.clientQuery.mockClear();
     await store.persistMatchStart(room, room.game);
+    expect(db.connect).toHaveBeenCalledOnce();
+    expect(db.clientQuery.mock.calls.map(([sql]) => String(sql))).toEqual([
+      "BEGIN",
+      expect.stringContaining("INSERT INTO rooms"),
+      ...Array.from({ length: room.seats.length }, () => expect.stringContaining("INSERT INTO room_seats")),
+      expect.stringContaining("DELETE FROM room_seats"),
+      expect.stringContaining("INSERT INTO matches"),
+      expect.stringContaining("INSERT INTO match_players"),
+      expect.stringContaining("INSERT INTO match_players"),
+      "COMMIT",
+    ]);
     const playerWrites = db.clientQuery.mock.calls.filter(([sql]) => String(sql).includes("INSERT INTO match_players"));
     expect(playerWrites.map(([, params]) => params)).toEqual([
       [room.game.config.matchId, "p1", 0],
@@ -203,9 +225,9 @@ describe("PostgresEventStore adapter", () => {
     await store.persistReport(lobby, { ...report, id: "report_2" });
     await store.persistAnalytics({ id: "analytics_1", userId: "p1", matchId: gameRoom.game?.config.matchId, eventName: "opened", payload: { source: "menu" } });
 
-    expect(db.query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO chat_messages"), ["chat_1", gameRoom.game?.config.matchId, "p1", "hello"]);
-    expect(db.query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO chat_messages"), ["chat_2", null, "p1", "hello"]);
-    expect(db.query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO reports"), expect.arrayContaining(["report_2", "p1", "p2", null]));
+    expect(db.clientQuery).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO chat_messages"), ["chat_1", gameRoom.id, gameRoom.game?.config.matchId, "p1", "hello", chat.createdAt]);
+    expect(db.clientQuery).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO chat_messages"), ["chat_2", lobby.id, null, "p1", "hello", chat.createdAt]);
+    expect(db.query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO reports"), expect.arrayContaining(["report_2", lobby.id, "p1", "p2", null]));
     expect(db.query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO analytics_events"), expect.any(Array));
   });
 

@@ -2,7 +2,7 @@ import type pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { getLegalActions } from "@colonizt/game-core";
 import { createPool, loadReplayLog, runMigrations } from "@colonizt/db";
-import { PostgresEventStore } from "../src/event-store.js";
+import { maxRoomChatMessages, PostgresEventStore } from "../src/event-store.js";
 import { RoomManager } from "../src/room-manager.js";
 
 const testDatabaseUrl = process.env.COLONIZT_TEST_DATABASE_URL;
@@ -83,10 +83,13 @@ describePostgres("PostgresEventStore integration", () => {
     const resolved = await restarted.resolveSession(session.token);
     const expiredStatus = await restarted.loadRoomStatusByRef(emptyRoom.code);
     const loadedReplay = await restarted.getReplayById(room.id);
+    const recoveredRoom = restarted.roomForRef(room.id);
 
     expect(resolved?.userId).toBe(session.userId);
     expect(expiredStatus).toMatchObject({ status: "EXPIRED", cleanupReason: "EMPTY_LOBBY_TTL" });
     expect(loadedReplay?.events.map((event) => event.seq)).toEqual([1]);
+    expect(recoveredRoom?.chat).toEqual([expect.objectContaining({ id: chat?.id, message: "hello from postgres" })]);
+    expect(recoveredRoom?.reports).toEqual([expect.objectContaining({ id: report?.id, reason: "test report", roomId: room.id })]);
   });
 
   it("persists latest match snapshots and rejects row/payload replay mismatches", async () => {
@@ -161,5 +164,42 @@ describePostgres("PostgresEventStore integration", () => {
     expect(recovered?.hostUserId).toBe(guest.userId);
     expect(recovered?.seats).toHaveLength(2);
     expect(recovered?.seats.some((seat) => seat.userId === guest.userId)).toBe(true);
+  });
+
+  it("atomically switches rooms, bounds durable chat, and deletes expired sessions", async () => {
+    const store = new PostgresEventStore(pool);
+    const manager = new RoomManager(store);
+    const oldHost = await manager.createSession("Old Host");
+    const newHost = await manager.createSession("New Host");
+    const guest = await manager.createSession("Switching Guest");
+    const idleGuest = await manager.createSession("Idle Guest");
+    const oldRoom = await manager.createRoom(oldHost, { mode: "CLASSIC", botFill: false, ranked: false });
+    const newRoom = await manager.createRoom(newHost, { mode: "CLASSIC", botFill: false, ranked: false });
+    await manager.joinRoom(oldRoom.id, guest);
+
+    await expect(manager.switchRoom(oldRoom.id, newRoom.id, guest)).resolves.toMatchObject({ ok: true, room: { id: newRoom.id } });
+    for (let index = 0; index < maxRoomChatMessages + 5; index += 1) {
+      await manager.addChat(newRoom.id, guest, `postgres chat ${index}`);
+    }
+    guest.expiresAt = new Date(Date.now() - 1).toISOString();
+    idleGuest.expiresAt = guest.expiresAt;
+    await store.persistSession(guest);
+    await store.persistSession(idleGuest);
+    await expect(manager.sweepExpiredSessions()).resolves.toMatchObject({ cached: 2, persisted: 2 });
+
+    const restarted = new RoomManager(store);
+    await restarted.hydrateFromStore();
+    const recoveredOldRoom = restarted.roomForRef(oldRoom.id);
+    const recoveredNewRoom = restarted.roomForRef(newRoom.id);
+    const persistedChatCount = await pool.query("SELECT COUNT(*)::int AS count FROM chat_messages WHERE room_id = $1", [newRoom.id]);
+    const retainedUsers = await pool.query("SELECT id FROM users WHERE id = ANY($1::text[]) ORDER BY id", [[guest.userId, idleGuest.userId]]);
+
+    expect(recoveredOldRoom?.seats.some((seat) => seat.userId === guest.userId)).toBe(false);
+    expect(recoveredNewRoom?.seats.some((seat) => seat.userId === guest.userId)).toBe(true);
+    expect(recoveredNewRoom?.chat).toHaveLength(maxRoomChatMessages);
+    expect(recoveredNewRoom?.chat[0]?.message).toBe("postgres chat 5");
+    expect(persistedChatCount.rows[0]?.count).toBe(maxRoomChatMessages);
+    expect(retainedUsers.rows).toEqual([{ id: guest.userId }]);
+    await expect(restarted.resolveSession(guest.token)).resolves.toBeUndefined();
   });
 });

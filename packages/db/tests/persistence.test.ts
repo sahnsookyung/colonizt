@@ -5,12 +5,14 @@ import {
   appendMatchEvents,
   commitMatchEvents,
   createPool,
+  deleteExpiredSessions,
   findCommandResult,
   findPersistedRoomByRef,
   findPersistedSessionByTokenHash,
   insertAnalyticsEvent,
   insertChatMessage,
   insertMatch,
+  insertMatchAndRoom,
   insertReport,
   listMatchSummaries,
   listPersistedRooms,
@@ -19,6 +21,7 @@ import {
   loadReplayLog,
   loadReplayLogByRoomId,
   markMatchFinished,
+  maxRoomChatMessages,
   persistedRoomCodeExists,
   readMigration,
   releaseRoomLease,
@@ -26,6 +29,7 @@ import {
   saveMatchSnapshot,
   upsertCommandResult,
   upsertRoom,
+  upsertRooms,
   upsertSession,
   type PersistRoomInput,
 } from "../src/index.js";
@@ -91,9 +95,12 @@ describe("database contracts", () => {
 
     expect(appliedNames).not.toContain("001_init.sql");
     expect(appliedNames).toContain("007_room_timer.sql");
-    expect(clientQuery.mock.calls.filter(([sql]) => sql === "BEGIN")).toHaveLength(6);
-    expect(clientQuery.mock.calls.filter(([sql]) => sql === "COMMIT")).toHaveLength(6);
-    expect(release).toHaveBeenCalledTimes(6);
+    expect(appliedNames).toContain("008_room_content.sql");
+    expect(appliedNames).toContain("009_session_expiry_index.sql");
+    expect(appliedNames).toContain("010_chat_retention_sequence.sql");
+    expect(clientQuery.mock.calls.filter(([sql]) => sql === "BEGIN")).toHaveLength(9);
+    expect(clientQuery.mock.calls.filter(([sql]) => sql === "COMMIT")).toHaveLength(9);
+    expect(release).toHaveBeenCalledTimes(9);
   });
 
   it("rolls back and releases a failed migration", async () => {
@@ -139,7 +146,7 @@ describe("database contracts", () => {
 
   it("persists and hydrates sessions including timestamp representations", async () => {
     const expiresAt = new Date("2026-08-01T00:00:00.000Z");
-    const { pool, query } = fakePool((sql) => {
+    const { pool, query, clientQuery } = fakePool((sql) => {
       if (sql.includes("FROM sessions") && sql.includes("ORDER BY")) {
         return queryResult([
           { token: "hash_1", user_id: "u_1", display_name: "Ada", expires_at: expiresAt },
@@ -150,6 +157,7 @@ describe("database contracts", () => {
       if (sql.includes("UPDATE sessions")) {
         return queryResult([{ token: "hash_1", user_id: "u_1", display_name: "Ada", expires_at: expiresAt }]);
       }
+      if (sql.startsWith("DELETE FROM sessions")) return queryResult([{ user_id: "u_1" }, { user_id: "u_2" }]);
       return queryResult();
     });
 
@@ -164,6 +172,9 @@ describe("database contracts", () => {
     await expect(findPersistedSessionByTokenHash(pool, "hash_1")).resolves.toEqual({
       tokenHash: "hash_1", userId: "u_1", displayName: "Ada", expiresAt: expiresAt.toISOString(),
     });
+    await expect(deleteExpiredSessions(pool, expiresAt)).resolves.toBe(2);
+    expect(clientQuery).toHaveBeenCalledWith(expect.stringContaining("DELETE FROM sessions"), [expiresAt.toISOString()]);
+    expect(clientQuery).toHaveBeenCalledWith(expect.stringContaining("DELETE FROM users"), [["u_1", "u_2"]]);
 
     const missing = fakePool(() => queryResult());
     await expect(findPersistedSessionByTokenHash(missing.pool, "missing")).resolves.toBeUndefined();
@@ -193,12 +204,32 @@ describe("database contracts", () => {
     expect(clientQuery).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO match_players"), ["match_1", "bot_2", 1]);
   });
 
+  it("persists multiple room states in one transaction", async () => {
+    const { pool, clientQuery, connect, release } = fakePool(() => queryResult());
+    await upsertRooms(pool, [roomInput(), roomInput({ id: "room_2", code: "ROOM02", hostUserId: "u_guest" })]);
+
+    expect(connect).toHaveBeenCalledOnce();
+    expect(clientQuery.mock.calls.filter(([sql]) => String(sql).includes("INSERT INTO rooms"))).toHaveLength(2);
+    expect(clientQuery).toHaveBeenLastCalledWith("COMMIT");
+    expect(release).toHaveBeenCalledOnce();
+    await expect(upsertRooms(pool, [])).resolves.toBeUndefined();
+    expect(connect).toHaveBeenCalledOnce();
+  });
+
   it("rolls back room, match, and snapshot transactions on write failures", async () => {
     const failure = new Error("write failed");
     for (const operation of [
       (pool: Pool) => upsertRoom(pool, roomInput()),
+      (pool: Pool) => upsertRooms(pool, [roomInput(), roomInput({ id: "room_2" })]),
       (pool: Pool) => insertMatch(pool, { id: "match_1", roomId: "room_1", mode: "CLASSIC", ranked: false, seedHash: "seed", config: {}, board: {}, players: [] }),
+      (pool: Pool) => insertMatchAndRoom(
+        pool,
+        { id: "match_1", roomId: "room_1", mode: "CLASSIC", ranked: false, seedHash: "seed", config: {}, board: {}, players: [] },
+        roomInput({ status: "IN_GAME" }),
+      ),
       (pool: Pool) => saveMatchSnapshot(pool, { matchId: "match_1", seq: 4, state: { eventSeq: 4 } }),
+      (pool: Pool) => insertChatMessage(pool, { id: "chat_1", roomId: "room_1", userId: "u_host", message: "hello" }),
+      (pool: Pool) => deleteExpiredSessions(pool),
     ]) {
       const failed = fakePool(
         () => queryResult(),
@@ -213,16 +244,17 @@ describe("database contracts", () => {
     }
   });
 
-  it("writes match completion, chat, reports, and analytics with nullable links", async () => {
-    const { pool, query } = fakePool(() => queryResult());
+  it("writes match completion, room-linked content, and analytics with nullable match links", async () => {
+    const { pool, query, clientQuery } = fakePool(() => queryResult());
     await markMatchFinished(pool, "match_1", "u_host");
-    await insertChatMessage(pool, { id: "chat_1", userId: "u_host", message: "hello" });
-    await insertReport(pool, { id: "report_1", reporterUserId: "u_host", reportedUserId: "u_guest", reason: "spam", status: "OPEN" });
+    await insertChatMessage(pool, { id: "chat_1", roomId: "room_1", userId: "u_host", message: "hello" });
+    await insertReport(pool, { id: "report_1", roomId: "room_1", reporterUserId: "u_host", reportedUserId: "u_guest", reason: "spam", status: "OPEN" });
     await insertAnalyticsEvent(pool, { id: "analytics_1", eventName: "opened", payload: { source: "menu" } });
 
     expect(query).toHaveBeenCalledWith(expect.stringContaining("UPDATE matches"), ["match_1", "u_host"]);
-    expect(query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO chat_messages"), ["chat_1", null, "u_host", "hello"]);
-    expect(query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO reports"), ["report_1", "u_host", "u_guest", null, "spam", "OPEN"]);
+    expect(clientQuery).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO chat_messages"), ["chat_1", "room_1", null, "u_host", "hello", null]);
+    expect(clientQuery).toHaveBeenCalledWith(expect.stringContaining("DELETE FROM chat_messages"), ["room_1", maxRoomChatMessages]);
+    expect(query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO reports"), ["report_1", "room_1", "u_host", "u_guest", null, "spam", "OPEN"]);
     expect(query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO analytics_events"), ["analytics_1", null, null, "opened", { source: "menu" }]);
   });
 
@@ -373,6 +405,41 @@ describe("database contracts", () => {
     })]);
 
     await expect(findPersistedRoomByRef(pool, " room01 ")).resolves.toMatchObject({ id: "room_1", code: "ROOM01" });
+  });
+
+  it("hydrates multiple rooms with a fixed batch of relation queries", async () => {
+    const roomRows = [
+      { id: "room_1", room_code: "ROOM01", mode: "CLASSIC", status: "IN_GAME", host_user_id: "u_1", settings_json: {}, created_at: "2026-07-14T00:00:00.000Z" },
+      { id: "room_2", room_code: "ROOM02", mode: "DUEL", status: "IN_GAME", host_user_id: "u_2", settings_json: {}, created_at: "2026-07-14T00:01:00.000Z" },
+    ];
+    const { pool, query } = fakePool((sql) => {
+      if (sql.includes("FROM rooms")) return queryResult(roomRows);
+      if (sql.includes("FROM room_seats")) return queryResult([
+        { room_id: "room_1", seat_index: 0, user_id: "u_1", bot_id: null, ready: true },
+        { room_id: "room_2", seat_index: 0, user_id: "u_2", bot_id: null, ready: true },
+      ]);
+      if (sql.includes("FROM matches") && sql.includes("config_json")) return queryResult([
+        { room_id: "room_1", id: "match_1", config_json: { matchId: "match_1" }, board_json: {} },
+        { room_id: "room_2", id: "match_2", config_json: { matchId: "match_2" }, board_json: {} },
+      ]);
+      if (sql.includes("FROM match_events")) return queryResult([
+        { match_id: "match_1", seq: 1, event_type: "TURN_ENDED", payload_json: { seq: 1, type: "TURN_ENDED" } },
+        { match_id: "match_2", seq: 1, event_type: "GAME_OVER", payload_json: { seq: 1, type: "GAME_OVER" } },
+      ]);
+      if (sql.includes("FROM chat_messages")) return queryResult([
+        { room_id: "room_2", id: "chat_2", user_id: "u_2", message: "latest", created_at: "2026-07-14T00:02:00.000Z" },
+      ]);
+      return queryResult();
+    });
+
+    const records = await listPersistedRooms(pool, 200);
+
+    expect(query).toHaveBeenCalledTimes(7);
+    expect(records).toEqual([
+      expect.objectContaining({ id: "room_1", seats: [expect.objectContaining({ userId: "u_1" })], match: expect.objectContaining({ id: "match_1", events: [{ seq: 1, type: "TURN_ENDED" }] }) }),
+      expect.objectContaining({ id: "room_2", chat: [expect.objectContaining({ message: "latest" })], match: expect.objectContaining({ id: "match_2", events: [{ seq: 1, type: "GAME_OVER" }] }) }),
+    ]);
+    expect(query).toHaveBeenCalledWith(expect.stringContaining("ROW_NUMBER() OVER"), [["room_1", "room_2"], maxRoomChatMessages]);
   });
 
   it("hydrates minimal rooms without matches and handles missing lookups", async () => {

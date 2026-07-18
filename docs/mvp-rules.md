@@ -19,7 +19,7 @@ Colonizt is an original resource-route board game built to demonstrate determini
 - Maritime trades use 4:1 by default, 3:1 with a generic port, and 2:1 with a matching resource port.
 - Harbor bonuses belong to the two marked coastal corners connected to the ship badge. A settlement or city on either marked corner grants the port; the coastal edge itself does not.
 - The board view owns the primary action buttons: trade, special card, road, settlement, city, and end/wait. Clicking the dice also rolls when rolling is legal.
-- Turn clocks prevent stalled games: waiting-for-roll has a 60-second deadline that auto-rolls for the active human player, and post-roll action phase has a four-minute deadline that auto-ends the turn.
+- Turn clocks prevent stalled games: waiting-for-roll has a 60-second deadline, while setup, discard, thief movement, and post-roll action phases have four-minute deadlines with phase-appropriate automatic actions.
 - Timers, reconnect, spectators, replay, and viewer-safe state are part of the product contract.
 
 ## Optional Rules
@@ -36,9 +36,9 @@ The random board generator uses the base 19-hex island shape and seeded shuffles
 ## Deferred
 
 - Exact CATAN rules parity.
-- Full development-card effects, robber/discard depth, expansions, map editor, cosmetics, tournaments, and full ranked seasons.
+- Expansions, map editor, cosmetics, tournaments, and full ranked seasons.
 - Deeper bot strategy beyond the current goal-driven build/trade heuristics.
 
-## Robber/Discard Placeholder
+## Thief and Discard
 
-The MVP treats a roll of seven as a no-op `SEVEN_ROLLED` event. That keeps the phase machine explicit without pretending the full robber/discard system exists.
+A roll of seven requires every player holding more than seven resources to discard half their hand, rounded down. Submitted resource bundles remain private to the submitting player. The roller must then move the thief to a different hex and, when one or more adjacent opponents hold resources, choose an eligible opponent to steal from. The stolen resource remains hidden from uninvolved viewers.

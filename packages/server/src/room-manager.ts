@@ -40,7 +40,7 @@ import {
   type CommandResult,
 } from "./command-idempotency.js";
 import { DueWorkIndex } from "./due-work.js";
-import { MemoryEventStore, type EventStore, type StoredCommandResult, type StoredMatchSummary, type StoredRoomRecord } from "./event-store.js";
+import { maxRoomChatMessages, MemoryEventStore, type EventStore, type StoredCommandResult, type StoredMatchSummary, type StoredRoomRecord } from "./event-store.js";
 import { applyLobbySettings, canStartLobby, publicSeatsForRoom, startableSeatsForRoom, type LobbySettingsUpdate } from "./lobby.js";
 import type { RoomOwnershipStore } from "./ownership.js";
 import { hydrateGameFromStoredMatchWithOutcome } from "./replay-hydration.js";
@@ -48,7 +48,7 @@ import { persistAcceptedEvents } from "./command-commit.js";
 import { createAnalyticsRecord, createChatMessage, createModerationReport } from "./room-content.js";
 import { noOpRoomDiagnostics, type RoomDiagnostics } from "./room-diagnostics.js";
 import { applyRoomCleanupPolicy, cleanupDueAt, resumeRoomIfNeeded } from "./room-lifecycle.js";
-import { connectedSeatedHumanCount, connectedUserCount, isActiveRoom, livenessStateForRoom, roomTimerKey } from "./room-runtime.js";
+import { actionTurnDurationMs, connectedSeatedHumanCount, connectedUserCount, isActiveRoom, livenessStateForRoom, roomTimerKey, roomTurnDurationMs } from "./room-runtime.js";
 
 const tradeResponseWindowMs = 15_000;
 const roomCodeAlphabet = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
@@ -262,6 +262,18 @@ export class RoomManager {
     return persisted;
   }
 
+  async sweepExpiredSessions(now = Date.now()): Promise<{ cached: number; persisted: number }> {
+    let cached = 0;
+    for (const [token, session] of this.sessions) {
+      if (!this.sessionIsActive(session, now)) {
+        this.sessions.delete(token);
+        cached += 1;
+      }
+    }
+    const persisted = await this.eventStore.deleteExpiredSessions(new Date(now));
+    return { cached, persisted };
+  }
+
   private seatCountForSettings(settings: RoomSettings): number {
     const seatCount = settings.maxPlayers ?? (settings.mode === "DUEL" ? 2 : 4);
     if (!Number.isInteger(seatCount) || seatCount < 2 || seatCount > 4) {
@@ -447,7 +459,7 @@ export class RoomManager {
     return this.eventStore.listMatches(limit);
   }
 
-  publicRoom(room: Room, viewerId: PlayerId | "spectator" = "spectator") {
+  publicRoom(room: Room, viewerId: PlayerId | "spectator" = "spectator", includeChat = viewerId !== "spectator") {
     const game = room.game ? this.viewerState(room, room.game, viewerId) : undefined;
     return {
       id: room.id,
@@ -464,7 +476,7 @@ export class RoomManager {
       liveness: this.livenessState(room),
       cleanupReason: room.cleanupReason,
       events: serializeEventsForViewer(room.events, viewerId, room.game?.playerOrder, room.game?.phase.type === "GAME_OVER"),
-      chat: room.chat,
+      ...(includeChat ? { chat: room.chat.slice(-maxRoomChatMessages) } : {}),
       timer: room.timer,
       game,
     };
@@ -501,24 +513,34 @@ export class RoomManager {
     Object.assign(session, candidateSession);
     this.sessions.set(session.token, session);
     const candidateRooms = roomRef ? [await this.ensureRoomLoadedByRef(roomRef)] : [...this.rooms.values()];
-    await Promise.all(candidateRooms.filter((room): room is Room => Boolean(room)).map(async (targetRoom) => {
-      const room = this.roomForRef(targetRoom.id) ?? targetRoom;
-      if (!await this.claimRoom(room)) return;
-      const candidate = structuredClone(room) as Room;
-      const seat = candidate.seats.find((candidateSeat) => candidateSeat.userId === session.userId);
-      if (!seat || seat.displayName === nextName) return;
-      seat.displayName = nextName;
-      this.touchRoom(candidate);
-      await this.eventStore.persistRoom(candidate);
-      replaceRoomState(room, candidate);
-      this.updateRoomDueWork(room);
-    }));
+    await Promise.all(candidateRooms.filter((room): room is Room => Boolean(room)).map((targetRoom) =>
+      this.enqueueRoom(targetRoom.id, async () => {
+        const room = this.roomForRef(targetRoom.id) ?? targetRoom;
+        if (!await this.claimRoom(room)) return;
+        const candidate = structuredClone(room) as Room;
+        const seat = candidate.seats.find((candidateSeat) => candidateSeat.userId === session.userId);
+        if (!seat || seat.displayName === nextName) return;
+        seat.displayName = nextName;
+        this.touchRoom(candidate);
+        await this.eventStore.persistRoom(candidate);
+        replaceRoomState(room, candidate);
+        this.updateRoomDueWork(room);
+      }),
+    ));
     return session;
   }
 
   async joinRoom(roomId: string, session: Session, asSpectator = false): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
     const targetRoom = await this.ensureRoomLoadedByRef(roomId);
     if (!targetRoom) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
+    const retainedActiveRoom = [...this.rooms.values()].find((room) =>
+      room.id !== targetRoom.id
+      && room.status === "IN_GAME"
+      && room.seats.some((seat) => seat.userId === session.userId),
+    );
+    if (retainedActiveRoom) {
+      return { ok: false, code: "ROOM_SWITCH_ACTIVE_GAME", message: "You cannot join another room while seated in an active game" };
+    }
     return this.enqueueRoom(targetRoom.id, () => this.joinRoomNow(targetRoom, session, asSpectator));
   }
 
@@ -529,6 +551,16 @@ export class RoomManager {
     if (room.archivedAt) return { ok: false, code: "ROOM_CLOSED", message: "Room is closed" };
     if (!await this.claimRoom(room)) return { ok: false, code: "ROOM_NOT_OWNED", message: "Room is owned by another server" };
 
+    const joined = this.joinCandidate(room, session, asSpectator);
+    if (!joined.ok) return joined;
+    const candidate = joined.room;
+    await this.eventStore.persistRoom(candidate);
+    replaceRoomState(room, candidate);
+    this.updateRoomDueWork(room);
+    return { ok: true, room };
+  }
+
+  private joinCandidate(room: Room, session: Session, asSpectator: boolean): { ok: true; room: Room } | { ok: false; code: string; message: string } {
     const candidate = structuredClone(room) as Room;
     const existing = candidate.seats.find((seat) => seat.userId === session.userId);
     if (existing) {
@@ -537,18 +569,12 @@ export class RoomManager {
       this.repairLobbyHost(candidate);
       this.touchRoom(candidate);
       resumeRoomIfNeeded(candidate);
-      await this.eventStore.persistRoom(candidate);
-      replaceRoomState(room, candidate);
-      this.updateRoomDueWork(room);
-      return { ok: true, room };
+      return { ok: true, room: candidate };
     }
     if (asSpectator || candidate.status !== "LOBBY") {
       candidate.spectators.add(session.userId);
       this.touchRoom(candidate);
-      await this.eventStore.persistRoom(candidate);
-      replaceRoomState(room, candidate);
-      this.updateRoomDueWork(room);
-      return { ok: true, room };
+      return { ok: true, room: candidate };
     }
     const seat = candidate.seats.find((candidateSeat) => !candidateSeat.userId && !candidateSeat.botId);
     if (!seat) return { ok: false, code: "ROOM_FULL", message: "Room is full" };
@@ -557,10 +583,55 @@ export class RoomManager {
     seat.connected = true;
     this.repairLobbyHost(candidate);
     this.touchRoom(candidate);
-    await this.eventStore.persistRoom(candidate);
-    replaceRoomState(room, candidate);
-    this.updateRoomDueWork(room);
-    return { ok: true, room };
+    return { ok: true, room: candidate };
+  }
+
+  async switchRoom(previousRoomId: string, destinationRoomId: string, session: Session, asSpectator = false, now = Date.now()): Promise<
+    { ok: true; room: Room; previousRoom: Room } | { ok: false; code: string; message: string }
+  > {
+    if (previousRoomId === destinationRoomId) {
+      const joined = await this.joinRoom(destinationRoomId, session, asSpectator);
+      return joined.ok ? { ...joined, previousRoom: joined.room } : joined;
+    }
+    const [previousTarget, destinationTarget] = await Promise.all([
+      this.ensureRoomLoadedByRef(previousRoomId),
+      this.ensureRoomLoadedByRef(destinationRoomId),
+    ]);
+    if (!previousTarget) return { ok: false, code: "ROOM_NOT_FOUND", message: "Previous room not found" };
+    if (!destinationTarget) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
+    if (previousTarget.id === destinationTarget.id) {
+      const joined = await this.joinRoom(destinationTarget.id, session, asSpectator);
+      return joined.ok ? { ...joined, previousRoom: joined.room } : joined;
+    }
+
+    return this.enqueueRooms([previousTarget.id, destinationTarget.id], async () => {
+      const previousRoom = this.roomForRef(previousTarget.id) ?? previousTarget;
+      const destinationRoom = this.roomForRef(destinationTarget.id) ?? destinationTarget;
+      if (destinationRoom.status === "EXPIRED") return { ok: false, code: "ROOM_EXPIRED", message: "Room expired because everyone left the lobby" };
+      if (destinationRoom.status === "ABANDONED") return { ok: false, code: "ROOM_ABANDONED", message: "Room was abandoned because all seated players disconnected" };
+      if (destinationRoom.archivedAt) return { ok: false, code: "ROOM_CLOSED", message: "Room is closed" };
+      if (previousRoom.archivedAt || previousRoom.status === "EXPIRED" || previousRoom.status === "ABANDONED") {
+        return { ok: false, code: "ROOM_SWITCH_FAILED", message: "Previous room is closed" };
+      }
+      const retainedSeat = previousRoom.seats.find((seat) => seat.userId === session.userId);
+      if (retainedSeat && previousRoom.status !== "LOBBY") {
+        return { ok: false, code: "ROOM_SWITCH_ACTIVE_GAME", message: "You cannot join another room while seated in an active game" };
+      }
+      if (!await this.claimRoom(previousRoom) || !await this.claimRoom(destinationRoom)) {
+        return { ok: false, code: "ROOM_NOT_OWNED", message: "A room is owned by another server" };
+      }
+
+      const joined = this.joinCandidate(destinationRoom, session, asSpectator);
+      if (!joined.ok) return joined;
+      const previousCandidate = structuredClone(previousRoom) as Room;
+      this.applyDeparture(previousCandidate, session, now);
+      await this.eventStore.persistRooms([previousCandidate, joined.room]);
+      replaceRoomState(previousRoom, previousCandidate);
+      replaceRoomState(destinationRoom, joined.room);
+      this.updateRoomDueWork(previousRoom, now);
+      this.updateRoomDueWork(destinationRoom, now);
+      return { ok: true, room: destinationRoom, previousRoom };
+    });
   }
 
   async setReady(roomId: string, session: Session, ready: boolean): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
@@ -701,6 +772,16 @@ export class RoomManager {
     if (!await this.claimRoom(room)) return { ok: false, code: "ROOM_NOT_OWNED", message: "Room is owned by another server" };
 
     const candidate = structuredClone(room) as Room;
+    const changed = this.applyDeparture(candidate, session, now);
+    if (changed) {
+      await this.eventStore.persistRoom(candidate);
+      replaceRoomState(room, candidate);
+      this.updateRoomDueWork(room, now);
+    }
+    return { ok: true, room };
+  }
+
+  private applyDeparture(candidate: Room, session: Session, now: number): boolean {
     let changed = false;
     if (candidate.spectators.delete(session.userId)) changed = true;
     const seat = candidate.seats.find((candidateSeat) => candidateSeat.userId === session.userId);
@@ -744,16 +825,18 @@ export class RoomManager {
 
     if (changed) {
       this.touchRoom(candidate, now);
-      await this.eventStore.persistRoom(candidate);
-      replaceRoomState(room, candidate);
-      this.updateRoomDueWork(room, now);
     }
-    return { ok: true, room };
+    return changed;
   }
 
   async syncConnections(roomId: string, connectedUserIds: Set<PlayerId>, now = Date.now()): Promise<Room | undefined> {
-    const room = this.roomForRef(roomId);
-    if (!room) return undefined;
+    const targetRoom = this.roomForRef(roomId);
+    if (!targetRoom) return undefined;
+    return this.enqueueRoom(targetRoom.id, () => this.syncConnectionsNow(targetRoom, connectedUserIds, now));
+  }
+
+  private async syncConnectionsNow(targetRoom: Room, connectedUserIds: Set<PlayerId>, now: number): Promise<Room | undefined> {
+    const room = this.roomForRef(targetRoom.id) ?? targetRoom;
     if (!await this.claimRoom(room)) return undefined;
     const candidate = structuredClone(room) as Room;
     let changed = false;
@@ -805,29 +888,31 @@ export class RoomManager {
     const candidates = roomIds
       ? roomIds.map((roomId) => this.rooms.get(roomId)).filter((room): room is Room => Boolean(room))
       : [...this.rooms.values()];
-    for (const room of candidates) {
-      if (room.archivedAt) continue;
-      if (!await this.claimRoom(room)) continue;
-      const candidate = structuredClone(room) as Room;
-      const changed = applyRoomCleanupPolicy(candidate, this.cleanupPolicy, now);
-
-      if (!changed) continue;
-      this.touchRoom(candidate, now);
-      await this.eventStore.persistRoom(candidate);
-      if (candidate.archivedAt || candidate.status === "EXPIRED" || candidate.status === "ABANDONED") {
-        this.rooms.delete(room.id);
-        this.removeRoomRuntimeState(room.id);
-        await this.releaseRoom(room.id);
-        cleaned.push({
-          roomId: candidate.id,
-          code: candidate.code,
-          status: candidate.status,
-          ...(candidate.cleanupReason ? { cleanupReason: candidate.cleanupReason } : {}),
-        });
-      } else {
+    for (const targetRoom of candidates) {
+      const result = await this.enqueueRoom(targetRoom.id, async () => {
+        const room = this.rooms.get(targetRoom.id);
+        if (!room || room.archivedAt || !await this.claimRoom(room)) return undefined;
+        const candidate = structuredClone(room) as Room;
+        const changed = applyRoomCleanupPolicy(candidate, this.cleanupPolicy, now);
+        if (!changed) return undefined;
+        this.touchRoom(candidate, now);
+        await this.eventStore.persistRoom(candidate);
+        if (candidate.archivedAt || candidate.status === "EXPIRED" || candidate.status === "ABANDONED") {
+          this.rooms.delete(room.id);
+          this.removeRoomRuntimeState(room.id);
+          await this.releaseRoom(room.id);
+          return {
+            roomId: candidate.id,
+            code: candidate.code,
+            status: candidate.status,
+            ...(candidate.cleanupReason ? { cleanupReason: candidate.cleanupReason } : {}),
+          };
+        }
         replaceRoomState(room, candidate);
         this.updateRoomDueWork(room, now);
-      }
+        return undefined;
+      });
+      if (result) cleaned.push(result);
     }
     return cleaned;
   }
@@ -946,7 +1031,7 @@ export class RoomManager {
       seed: room.id,
       victoryPoints: 10,
       maxPlayers: playerOrder.length,
-      turnSeconds: 45,
+      turnSeconds: actionTurnDurationMs / 1000,
       playerOrder,
       playerNames,
       playerColors,
@@ -1184,12 +1269,19 @@ export class RoomManager {
   }
 
   async addChat(roomId: string, session: Session, message: string): Promise<ChatMessage | undefined> {
-    const room = this.roomForRef(roomId);
-    if (!room || !this.isMember(room, session.userId)) return undefined;
+    const targetRoom = this.roomForRef(roomId);
+    if (!targetRoom) return undefined;
+    return this.enqueueRoom(targetRoom.id, () => this.addChatNow(targetRoom, session, message));
+  }
+
+  private async addChatNow(targetRoom: Room, session: Session, message: string): Promise<ChatMessage | undefined> {
+    const room = this.roomForRef(targetRoom.id) ?? targetRoom;
+    if (!this.isMember(room, session.userId)) return undefined;
     if (!await this.claimRoom(room)) return undefined;
     const chat = createChatMessage(session, message);
     const candidate = structuredClone(room) as Room;
     candidate.chat.push(chat);
+    if (candidate.chat.length > maxRoomChatMessages) candidate.chat.splice(0, candidate.chat.length - maxRoomChatMessages);
     this.touchRoom(candidate);
     await this.eventStore.persistChat(candidate, chat);
     replaceRoomState(room, candidate);
@@ -1197,8 +1289,15 @@ export class RoomManager {
   }
 
   async createReport(roomId: string, reporter: Session, reportedUserId: string, reason: string): Promise<Report | undefined> {
-    const room = this.roomForRef(roomId);
-    if (!room || !this.isMember(room, reporter.userId)) return undefined;
+    const targetRoom = this.roomForRef(roomId);
+    if (!targetRoom) return undefined;
+    return this.enqueueRoom(targetRoom.id, () => this.createReportNow(targetRoom, reporter, reportedUserId, reason));
+  }
+
+  private async createReportNow(targetRoom: Room, reporter: Session, reportedUserId: string, reason: string): Promise<Report | undefined> {
+    const room = this.roomForRef(targetRoom.id) ?? targetRoom;
+    if (!this.isMember(room, reporter.userId)) return undefined;
+    if (!room.seats.some((seat) => seat.userId === reportedUserId || seat.botId === reportedUserId)) return undefined;
     if (!await this.claimRoom(room)) return undefined;
     const report = createModerationReport(room, reporter, reportedUserId, reason);
     const candidate = structuredClone(room) as Room;
@@ -1274,7 +1373,7 @@ export class RoomManager {
     }
     room.timer = {
       activePlayerId: room.game.phase.activePlayerId,
-      expiresAt: now + room.game.config.turnSeconds * 1000,
+      expiresAt: now + roomTurnDurationMs(room.game),
     };
   }
 
@@ -1389,6 +1488,14 @@ export class RoomManager {
     }
   }
 
+  private async enqueueRooms<T>(roomIds: readonly string[], task: () => Promise<T>): Promise<T> {
+    const sortedRoomIds = [...new Set(roomIds)].sort();
+    const acquire = (index: number): Promise<T> => index >= sortedRoomIds.length
+      ? task()
+      : this.enqueueRoom(sortedRoomIds[index]!, () => acquire(index + 1));
+    return acquire(0);
+  }
+
   private timeoutCommand(state: GameState, playerId: PlayerId): GameCommand | undefined {
     if (state.phase.type === "DISCARDING") {
       const count = state.phase.pending[playerId] ?? 0;
@@ -1442,8 +1549,8 @@ export class RoomManager {
       createdAt: record.createdAt,
       lastActivityAt: record.lastActivityAt ?? record.createdAt,
       events: record.match?.events ?? [],
-      chat: [],
-      reports: [],
+      chat: (record.chat ?? []).slice(-maxRoomChatMessages),
+      reports: record.reports ?? [],
       processedClientCommands: new Map(),
       tradeResponseDeadlines: new Map(Object.entries(record.tradeResponseDeadlines ?? {})),
     };

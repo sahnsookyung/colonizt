@@ -2,6 +2,8 @@ import type { BotDifficulty, GameCommand, GameConfig, GameEvent, ViewerState } f
 import type { CreateSessionResponse, MatchSummaryPayload, PublicRoomPayload, ReplayLogPayload, RuntimeNetworkConfig, WsTicketResponse } from "@colonizt/protocol";
 
 export type MatchSummary = MatchSummaryPayload;
+export type NetworkTimer = NonNullable<PublicRoomPayload["timer"]>;
+export const webSocketOpenTimeoutMs = 10_000;
 export type RoomLookupResult =
   | { ok: true; room: PublicRoomPayload }
   | { ok: false; code: string; status?: string; cleanupReason?: string };
@@ -14,7 +16,7 @@ export interface NetworkClient {
   loadReplay(replayId: string, token?: string): Promise<ReplayLogPayload>;
   createWebSocketTicket(token: string): Promise<WsTicketResponse>;
   connect(token: string, handlers: {
-    onEvents: (events: GameEvent[], snapshot?: ViewerState) => void;
+    onEvents: (events: GameEvent[], snapshot?: ViewerState, timer?: NetworkTimer) => void;
     onRoom: (room: unknown) => void;
     onError: (error: unknown) => void;
     onOpen?: (socket: WebSocket) => void;
@@ -162,7 +164,9 @@ export const createNetworkClient = (baseUrl = configuredBaseUrl): NetworkClient 
       method: "POST",
       headers: { "x-session-token": token },
     });
-    if (!response.ok) throw new Error("WebSocket ticket creation failed");
+    if (!response.ok) {
+      throw await errorPayload(response, response.status === 401 ? "UNAUTHORIZED" : "WS_TICKET_FAILED", "WebSocket ticket creation failed");
+    }
     return response.json() as Promise<WsTicketResponse>;
   },
   async connect(token, handlers) {
@@ -170,26 +174,35 @@ export const createNetworkClient = (baseUrl = configuredBaseUrl): NetworkClient 
     const ticket = await this.createWebSocketTicket(token);
     const socket = new WebSocket(`${config.wsBaseUrl}/ws?ticket=${encodeURIComponent(ticket.ticket)}`);
     let heartbeat: ReturnType<typeof setInterval> | undefined;
+    const openTimeout = setTimeout(() => {
+      handlers.onError({ type: "ERROR", code: "CONNECTION_TIMEOUT", message: "Online connection timed out" });
+      socket.close(4000, "Connection timeout");
+    }, webSocketOpenTimeoutMs);
     socket.addEventListener("open", () => {
+      clearTimeout(openTimeout);
       heartbeat = setInterval(() => {
         if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "PING", nonce: String(Date.now()) }));
       }, 15_000);
       handlers.onOpen?.(socket);
     });
     socket.addEventListener("close", () => {
+      clearTimeout(openTimeout);
       if (heartbeat) clearInterval(heartbeat);
       handlers.onClose?.();
     });
+    socket.addEventListener("error", () => {
+      handlers.onError({ type: "ERROR", code: "CONNECTION_FAILED", message: "Online connection failed" });
+    });
     socket.addEventListener("message", (event) => {
-      let message: { type: string; events?: GameEvent[]; snapshot?: ViewerState; room?: unknown };
+      let message: { type: string; events?: GameEvent[]; snapshot?: ViewerState; room?: unknown; timer?: NetworkTimer };
       try {
-        message = JSON.parse(String(event.data)) as { type: string; events?: GameEvent[]; snapshot?: ViewerState; room?: unknown };
+        message = JSON.parse(String(event.data)) as { type: string; events?: GameEvent[]; snapshot?: ViewerState; room?: unknown; timer?: NetworkTimer };
       } catch {
         handlers.onError({ type: "ERROR", code: "BAD_JSON" });
         return;
       }
-      if (message.type === "EVENTS") handlers.onEvents(message.events ?? [], message.snapshot);
-      else if (message.type === "RESYNC") handlers.onEvents(message.events ?? [], message.snapshot);
+      if (message.type === "EVENTS") handlers.onEvents(message.events ?? [], message.snapshot, message.timer);
+      else if (message.type === "RESYNC") handlers.onEvents(message.events ?? [], message.snapshot, message.timer);
       else if (message.type === "ROOM_STATE") handlers.onRoom(message.room);
       else if (message.type === "COMMAND_ACK") handlers.onAck?.();
       else if (message.type === "ERROR" || message.type === "COMMAND_REJECTED") handlers.onError(message);

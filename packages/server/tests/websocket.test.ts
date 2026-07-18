@@ -134,7 +134,7 @@ const openSocket = async (
 };
 
 describe("WebSocket gateway", () => {
-  it("enforces the per-socket command burst budget before invoking room logic", async () => {
+  it("enforces the session command burst budget before invoking room logic", async () => {
     const manager = new RoomManager();
     const host = await manager.createSession("Burst Host");
     const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
@@ -142,14 +142,20 @@ describe("WebSocket gateway", () => {
     const app = await buildServer({ manager });
     servers.push({ close: () => app.close() });
     await app.listen({ host: "127.0.0.1", port: 0 });
-    const socket = await openSocket(app, host.token);
+    const firstSocket = await openSocket(app, host.token);
+    const secondSocket = await openSocket(app, host.token);
+    firstSocket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.id }));
+    secondSocket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.id }));
+    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string } }>(firstSocket, "ROOM_STATE", (message) => message.room.id === room.id);
+    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string } }>(secondSocket, "ROOM_STATE", (message) => message.room.id === room.id);
     const rateLimited = waitForMessageWhere<{ type: "COMMAND_REJECTED"; code: string; clientSeq: number }>(
-      socket,
+      secondSocket,
       "COMMAND_REJECTED",
       (message) => message.code === "RATE_LIMITED",
     );
 
-    for (let clientSeq = 1; clientSeq <= 31; clientSeq += 1) {
+    for (let clientSeq = 1; clientSeq <= 30; clientSeq += 1) {
+      const socket = clientSeq <= 15 ? firstSocket : secondSocket;
       socket.send(JSON.stringify({
         type: "COMMAND",
         roomId: room.id,
@@ -157,9 +163,39 @@ describe("WebSocket gateway", () => {
         command: { type: "ROLL_DICE", playerId: host.userId },
       }));
     }
+    secondSocket.send(JSON.stringify({
+      type: "COMMAND",
+      roomId: room.id,
+      clientSeq: 31,
+      command: { type: "ROLL_DICE", playerId: host.userId },
+    }));
 
     await expect(rateLimited).resolves.toMatchObject({ code: "RATE_LIMITED", clientSeq: 31 });
     expect(submit).toHaveBeenCalledTimes(30);
+  });
+
+  it("rejects room actions until the socket has joined that exact room", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Unjoined Host");
+    const firstRoom = await manager.createRoom(host, { mode: "CLASSIC", botFill: true, ranked: false });
+    const secondRoom = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
+    const app = await buildServer({ manager });
+    servers.push({ close: () => app.close() });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const socket = await openSocket(app, host.token);
+
+    const unjoined = waitForMessageWhere<{ type: "ERROR"; code: string }>(socket, "ERROR", (message) => message.code === "NOT_JOINED_ROOM");
+    socket.send(JSON.stringify({ type: "READY", roomId: firstRoom.id, ready: true }));
+    await expect(unjoined).resolves.toMatchObject({ code: "NOT_JOINED_ROOM" });
+    expect(firstRoom.status).toBe("LOBBY");
+    expect(firstRoom.seats[0]).toMatchObject({ ready: false, connected: false });
+
+    socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: firstRoom.id }));
+    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string } }>(socket, "ROOM_STATE", (message) => message.room.id === firstRoom.id);
+    const wrongRoom = waitForMessageWhere<{ type: "ERROR"; code: string; roomId: string }>(socket, "ERROR", (message) => message.code === "NOT_JOINED_ROOM");
+    socket.send(JSON.stringify({ type: "READY", roomId: secondRoom.id, ready: true }));
+    await expect(wrongRoom).resolves.toMatchObject({ code: "NOT_JOINED_ROOM", roomId: secondRoom.id });
+    expect(secondRoom.seats[0]).toMatchObject({ ready: false, connected: false });
   });
 
   it("translates asynchronous manager failures into stable gateway errors and rejects unsafe frames", async () => {
@@ -170,6 +206,8 @@ describe("WebSocket gateway", () => {
     servers.push({ close: () => app.close() });
     await app.listen({ host: "127.0.0.1", port: 0 });
     const socket = await openSocket(app, host.token);
+    socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.id }));
+    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string } }>(socket, "ROOM_STATE", (message) => message.room.id === room.id);
 
     const expectError = async (message: unknown, code: string) => {
       const received = waitForMessageWhere<{ type: "ERROR" | "COMMAND_REJECTED"; code: string }>(socket, code === "COMMAND_FAILED" ? "COMMAND_REJECTED" : "ERROR", (candidate) => candidate.code === code);
@@ -225,6 +263,8 @@ describe("WebSocket gateway", () => {
     servers.push({ close: () => app.close() });
     await app.listen({ host: "127.0.0.1", port: 0 });
     const socket = await openSocket(app, host.token);
+    socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.id }));
+    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string } }>(socket, "ROOM_STATE", (message) => message.room.id === room.id);
 
     const expectError = async (message: unknown, code: string, type = "ERROR") => {
       const received = waitForMessageWhere<{ type: string; code: string }>(socket, type, (candidate) => candidate.code === code);
@@ -350,7 +390,7 @@ describe("WebSocket gateway", () => {
 
     const vertexId = getLegalActions(ready.room.game, host.userId).find((action) => action.type === "PLACE_SETUP")!.vertices[0]!;
     const edgeId = ready.room.game.board.adjacency.vertexToEdges[vertexId]![0]!;
-    const events = waitForMessage<{ type: "EVENTS"; roomId: string; events: GameEvent[] }>(hostSocket, "EVENTS");
+    const events = waitForMessage<{ type: "EVENTS"; roomId: string; events: GameEvent[]; timer?: { activePlayerId: string; expiresAt: number } }>(hostSocket, "EVENTS");
     hostSocket.send(JSON.stringify({
       type: "COMMAND",
       roomId: room.code,
@@ -361,6 +401,7 @@ describe("WebSocket gateway", () => {
     const message = await events;
     expect(message.roomId).toBe(room.id);
     expect(message.events[0]).toMatchObject({ type: "SETUP_PLACED" });
+    expect(message.timer).toMatchObject({ activePlayerId: expect.any(String), expiresAt: expect.any(Number) });
   });
 
   it("removes a socket's presence from its previous room when switching rooms", async () => {
@@ -377,9 +418,9 @@ describe("WebSocket gateway", () => {
     await waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string } }>(socket, "ROOM_STATE", (message) => message.room.id === firstRoom.id);
     socket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: secondRoom.code }));
     await waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string } }>(socket, "ROOM_STATE", (message) => message.room.id === secondRoom.id);
-    await waitUntil(() => firstRoom.seats.find((seat) => seat.userId === host.userId)?.connected === false);
+    await waitUntil(() => !firstRoom.seats.some((seat) => seat.userId === host.userId));
 
-    expect(firstRoom.seats.find((seat) => seat.userId === host.userId)).toMatchObject({ connected: false });
+    expect(firstRoom.seats.some((seat) => seat.userId === host.userId)).toBe(false);
     expect(secondRoom.seats.find((seat) => seat.userId === host.userId)).toMatchObject({ connected: true });
   });
 

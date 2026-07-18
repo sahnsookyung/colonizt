@@ -82,6 +82,32 @@ describe("RoomAutomationScheduler", () => {
     vi.useRealTimers();
   });
 
+  it("keeps scheduling cleanup when due-work discovery fails", async () => {
+    vi.useFakeTimers();
+    const manager = new RoomManager();
+    const dueWork = vi.spyOn(manager, "dueCleanupRoomIds")
+      .mockImplementationOnce(() => { throw new Error("cleanup index unavailable"); })
+      .mockReturnValue([]);
+    const scheduler = new RoomAutomationScheduler({
+      manager,
+      cleanupPolicy: defaultRoomCleanupPolicy,
+      automationIntervalMs: 100_000,
+      cleanupIntervalMs: 10,
+      logger: silentLogger,
+      metrics: new MetricsRegistry("test", "single"),
+      onEvents: () => undefined,
+      onRoomClosed: () => undefined,
+    });
+
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(dueWork).toHaveBeenCalledTimes(2);
+    scheduler.stop();
+    vi.useRealTimers();
+  });
+
   it("continues processing and requeues later automation rooms after one room fails", async () => {
     const manager = new RoomManager();
     vi.spyOn(manager, "dueAutomationRoomIds").mockReturnValue(["room-first", "room-second"]);
@@ -219,6 +245,37 @@ describe("RoomAutomationScheduler", () => {
     await scheduler.tickAutomation();
 
     expect(rejected).toEqual([{ roomId: "room_bad_timeout", result: { ok: false, code: "BAD_TIMEOUT_COMMAND", message: "bad timeout command" } }]);
+  });
+
+  it("backs off instead of immediately spinning on rejected overdue automation", async () => {
+    vi.useFakeTimers();
+    const manager = new RoomManager();
+    vi.spyOn(manager, "dueAutomationRoomIds").mockReturnValue(["room_overdue"]);
+    const expireTurn = vi.spyOn(manager, "expireTurn").mockResolvedValue({ ok: false, code: "EVENT_COMMIT_FAILED", message: "database unavailable" });
+    vi.spyOn(manager, "runDueBotAutomation").mockResolvedValue(undefined);
+    vi.spyOn(manager, "refreshRoomDueWork").mockImplementation(() => undefined);
+    vi.spyOn(manager, "nextAutomationDueAt").mockReturnValue(0);
+    const scheduler = new RoomAutomationScheduler({
+      manager,
+      cleanupPolicy: defaultRoomCleanupPolicy,
+      automationIntervalMs: 100,
+      cleanupIntervalMs: 100_000,
+      logger: silentLogger,
+      metrics: new MetricsRegistry("test", "single"),
+      onEvents: () => undefined,
+      onRoomClosed: () => undefined,
+    });
+
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(expireTurn).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(99);
+    expect(expireTurn).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(expireTurn).toHaveBeenCalledTimes(2);
+
+    scheduler.stop();
+    vi.useRealTimers();
   });
 
   it("reports cleaned rooms through the close callback", async () => {

@@ -20,6 +20,22 @@ const roomTimerSchema = z.object({
   expiresAt: z.number().finite().nonnegative(),
 });
 
+const chatMessageSchema = z.object({
+  id: z.string().min(1),
+  userId: z.string().min(1),
+  message: z.string(),
+  createdAt: z.string().min(1),
+});
+
+const reportSchema = z.object({
+  id: z.string().min(1),
+  reporterUserId: z.string().min(1),
+  reportedUserId: z.string().min(1),
+  roomId: z.string().min(1),
+  reason: z.string(),
+  status: z.enum(["OPEN", "RESOLVED"]),
+});
+
 const matchSnapshotSchema = z.object({
   matchId: z.string().min(1),
   seq: z.number().int().nonnegative(),
@@ -52,6 +68,8 @@ const storedRoomRecordSchema = z.object({
   archivedAt: z.string().optional(),
   cleanupReason: z.string().optional(),
   seats: z.array(roomSeatSchema).min(2).max(4),
+  chat: z.array(chatMessageSchema).optional(),
+  reports: z.array(reportSchema).optional(),
   match: storedMatchSchema.optional(),
 });
 

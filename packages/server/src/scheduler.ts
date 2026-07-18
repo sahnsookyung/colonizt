@@ -17,6 +17,8 @@ export class RoomAutomationScheduler {
   private automationTimer: ReturnType<typeof setTimeout> | undefined;
   private cleanupTimer: ReturnType<typeof setTimeout> | undefined;
   private running = false;
+  private automationFailureStreak = 0;
+  private cleanupFailureStreak = 0;
 
   constructor(private readonly options: RoomAutomationSchedulerOptions) {}
 
@@ -37,7 +39,8 @@ export class RoomAutomationScheduler {
     this.automationTimer = setTimeout(() => {
       void this.tickAutomation().catch((error) => {
         this.recordFailure("automation", error);
-        this.scheduleAutomation(this.options.automationIntervalMs ?? 1000);
+        this.automationFailureStreak += 1;
+        this.scheduleAutomation(this.retryDelay(this.automationFailureStreak, this.options.automationIntervalMs ?? 1000));
       });
     }, delayMs);
     this.automationTimer.unref?.();
@@ -48,7 +51,8 @@ export class RoomAutomationScheduler {
     this.cleanupTimer = setTimeout(() => {
       void this.tickCleanup().catch((error) => {
         this.recordFailure("cleanup", error);
-        this.scheduleCleanup(this.options.cleanupIntervalMs ?? 30_000);
+        this.cleanupFailureStreak += 1;
+        this.scheduleCleanup(this.retryDelay(this.cleanupFailureStreak, this.options.cleanupIntervalMs ?? 30_000));
       });
     }, delayMs);
     this.cleanupTimer.unref?.();
@@ -66,6 +70,7 @@ export class RoomAutomationScheduler {
   async tickAutomation(): Promise<void> {
     this.options.metrics.recordScheduler("automation_tick");
     const now = Date.now();
+    let hadFailure = false;
     for (const roomId of this.options.manager.dueAutomationRoomIds(now)) {
       try {
         const expired = await this.options.manager.expireTurn(roomId, now);
@@ -75,6 +80,7 @@ export class RoomAutomationScheduler {
           if (expired.events.some((event) => event.type === "TRADE_CLOSED" && event.reason === "RESPONSE_TIMEOUT")) this.options.metrics.recordScheduler("trade_timeout");
           this.options.onEvents(roomId, expired);
         } else if (expired && !expired.ok) {
+          hadFailure = true;
           this.options.metrics.recordScheduler("turn_expiry_rejected");
           this.options.onAutomationRejected?.(roomId, expired);
         }
@@ -85,6 +91,7 @@ export class RoomAutomationScheduler {
           if (bot.events.some((event) => event.type === "TRADE_CLOSED" && event.reason === "RESPONSE_TIMEOUT")) this.options.metrics.recordScheduler("trade_timeout");
           this.options.onEvents(roomId, bot);
         } else if (bot && !bot.ok) {
+          hadFailure = true;
           this.options.metrics.recordScheduler("bot_rejected");
           this.options.onAutomationRejected?.(roomId, bot);
         }
@@ -92,6 +99,7 @@ export class RoomAutomationScheduler {
           this.options.metrics.recordScheduler("stalled_automation");
         }
       } catch (error) {
+        hadFailure = true;
         this.recordFailure("automation_room", error);
       } finally {
         this.options.manager.refreshRoomDueWork(roomId, Date.now());
@@ -99,13 +107,17 @@ export class RoomAutomationScheduler {
     }
     const nextDue = this.options.manager.nextAutomationDueAt(Date.now());
     const fallback = this.options.automationIntervalMs ?? 1000;
-    this.scheduleAutomation(nextDue ? Math.max(0, Math.min(nextDue - Date.now(), fallback)) : fallback);
+    this.automationFailureStreak = hadFailure ? this.automationFailureStreak + 1 : 0;
+    this.scheduleAutomation(hadFailure
+      ? this.retryDelay(this.automationFailureStreak, fallback)
+      : nextDue ? Math.max(0, Math.min(nextDue - Date.now(), fallback)) : fallback);
   }
 
   async tickCleanup(): Promise<void> {
     this.options.metrics.recordScheduler("cleanup_tick");
     const now = Date.now();
     const dueRoomIds = this.options.manager.dueCleanupRoomIds(now);
+    let hadFailure = false;
     for (const roomId of dueRoomIds) {
       try {
         const closedRooms = await this.options.manager.cleanupRooms(now, [roomId]);
@@ -115,6 +127,7 @@ export class RoomAutomationScheduler {
           this.options.onRoomClosed(closed);
         }
       } catch (error) {
+        hadFailure = true;
         this.recordFailure("cleanup_room", error);
       } finally {
         this.options.manager.refreshRoomDueWork(roomId, Date.now());
@@ -122,7 +135,14 @@ export class RoomAutomationScheduler {
     }
     const nextDue = this.options.manager.nextCleanupDueAt(Date.now());
     const fallback = this.options.cleanupIntervalMs ?? 30_000;
-    this.scheduleCleanup(nextDue ? Math.max(0, Math.min(nextDue - Date.now(), fallback)) : fallback);
+    this.cleanupFailureStreak = hadFailure ? this.cleanupFailureStreak + 1 : 0;
+    this.scheduleCleanup(hadFailure
+      ? this.retryDelay(this.cleanupFailureStreak, fallback)
+      : nextDue ? Math.max(0, Math.min(nextDue - Date.now(), fallback)) : fallback);
+  }
+
+  private retryDelay(failureStreak: number, baseMs: number): number {
+    return Math.min(30_000, baseMs * 2 ** Math.min(Math.max(0, failureStreak - 1), 5));
   }
 
   private recordFailure(operation: string, error: unknown): void {

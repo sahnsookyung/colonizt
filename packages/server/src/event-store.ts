@@ -3,12 +3,13 @@ import type { BoardGraph, GameConfig, GameEvent, GameState } from "@colonizt/gam
 import {
   appendMatchEvents,
   commitMatchEvents,
+  deleteExpiredSessions,
   findPersistedRoomByRef,
   findCommandResult,
   findPersistedSessionByTokenHash,
   insertAnalyticsEvent,
   insertChatMessage,
-  insertMatch,
+  insertMatchAndRoom,
   insertReport,
   listMatchSummaries,
   listPersistedRooms,
@@ -16,11 +17,13 @@ import {
   loadReplayLog,
   loadReplayLogByRoomId,
   markMatchFinished,
+  maxRoomChatMessages as persistedRoomChatLimit,
   persistedRoomCodeExists,
   saveMatchSnapshot,
   upsertCommandResult,
   upsertSession,
   upsertRoom,
+  upsertRooms,
   type MatchSummary,
   type PersistedCommandResultRecord,
   type PersistedMatchSnapshotRecord,
@@ -31,6 +34,7 @@ import { hashSessionToken } from "./security.js";
 import { validateStoredCommandResult, validateStoredRoomRecord } from "./store-validation.js";
 
 const snapshotIntervalEvents = 25;
+export const maxRoomChatMessages = persistedRoomChatLimit;
 const shouldSnapshot = (state: GameState, events: readonly GameEvent[] = []): boolean =>
   state.eventSeq > 0 && (state.phase.type === "GAME_OVER" || events.some((event) => event.seq % snapshotIntervalEvents === 0));
 
@@ -59,6 +63,8 @@ export interface StoredRoomRecord {
   archivedAt?: string;
   cleanupReason?: string;
   seats: Room["seats"];
+  chat?: ChatMessage[];
+  reports?: Report[];
   match?: {
     id: string;
     config: GameConfig;
@@ -73,7 +79,9 @@ export interface StoredRoomRecord {
 export interface EventStore {
   persistSession(session: Session): Promise<void>;
   loadSessionByToken?(token: string): Promise<Session | undefined>;
+  deleteExpiredSessions(now?: Date): Promise<number>;
   persistRoom(room: Room): Promise<void>;
+  persistRooms(rooms: readonly Room[]): Promise<void>;
   persistMatchStart(room: Room, state: GameState): Promise<void>;
   appendEvents(room: Room, events: GameEvent[]): Promise<void>;
   commitEvents?(room: Room, events: GameEvent[], result?: StoredCommandResult): Promise<void>;
@@ -129,8 +137,23 @@ export class MemoryEventStore implements EventStore {
     return this.sessions.get(token);
   }
 
+  async deleteExpiredSessions(now = new Date()): Promise<number> {
+    let deleted = 0;
+    for (const [token, session] of this.sessions) {
+      if (session.expiresAt && Date.parse(session.expiresAt) <= now.getTime()) {
+        this.sessions.delete(token);
+        deleted += 1;
+      }
+    }
+    return deleted;
+  }
+
   async persistRoom(room: Room): Promise<void> {
     this.rooms.set(room.id, room);
+  }
+
+  async persistRooms(rooms: readonly Room[]): Promise<void> {
+    for (const room of rooms) this.rooms.set(room.id, room);
   }
 
   async persistMatchStart(room: Room, state: GameState): Promise<void> {
@@ -226,6 +249,8 @@ export class MemoryEventStore implements EventStore {
       createdAt: room.createdAt,
       lastActivityAt: room.lastActivityAt,
       seats: room.seats,
+      chat: room.chat,
+      reports: room.reports,
     };
     if (room.emptySince) record.emptySince = room.emptySince;
     if (room.pausedAt) record.pausedAt = room.pausedAt;
@@ -317,29 +342,21 @@ export class PostgresEventStore implements EventStore {
     return hydrated;
   }
 
+  async deleteExpiredSessions(now = new Date()): Promise<number> {
+    return deleteExpiredSessions(this.pool, now);
+  }
+
   async persistRoom(room: Room): Promise<void> {
-    await upsertRoom(this.pool, {
-      id: room.id,
-      mode: room.settings.mode,
-      status: room.status,
-      hostUserId: room.hostUserId,
-      settings: room.settings,
-      seats: room.seats,
-      code: room.code,
-      lastActivityAt: room.lastActivityAt,
-      ...(room.emptySince ? { emptySince: room.emptySince } : {}),
-      ...(room.pausedAt ? { pausedAt: room.pausedAt } : {}),
-      ...(room.pauseReason ? { pauseReason: room.pauseReason } : {}),
-      ...(room.tradeResponseDeadlines.size > 0 ? { tradeResponseDeadlines: Object.fromEntries(room.tradeResponseDeadlines) } : {}),
-      ...(room.timer ? { timer: room.timer } : {}),
-      ...(room.archivedAt ? { archivedAt: room.archivedAt } : {}),
-      ...(room.cleanupReason ? { cleanupReason: room.cleanupReason } : {}),
-    });
+    await upsertRoom(this.pool, this.persistedRoom(room));
+  }
+
+  async persistRooms(rooms: readonly Room[]): Promise<void> {
+    await upsertRooms(this.pool, rooms.map((room) => this.persistedRoom(room)));
   }
 
   async persistMatchStart(room: Room, state: GameState): Promise<void> {
     const playerIds = new Set(state.config.playerOrder);
-    await insertMatch(this.pool, {
+    const match = {
       id: state.config.matchId,
       roomId: room.id,
       mode: room.settings.mode,
@@ -351,8 +368,8 @@ export class PostgresEventStore implements EventStore {
         const id = seat.userId ?? seat.botId;
         return id && playerIds.has(id) ? [{ userId: id, seatIndex: seat.seatIndex }] : [];
       }),
-    });
-    await this.persistRoom(room);
+    };
+    await insertMatchAndRoom(this.pool, match, this.persistedRoom(room));
   }
 
   async appendEvents(room: Room, events: GameEvent[]): Promise<void> {
@@ -360,9 +377,8 @@ export class PostgresEventStore implements EventStore {
     await appendMatchEvents(this.pool, room.game.config.matchId, events.map((event) => ({ seq: event.seq, type: event.type, payload: event })));
   }
 
-  async commitEvents(room: Room, events: GameEvent[], result?: StoredCommandResult): Promise<void> {
-    if (!room.game) throw new Error("Cannot commit events before game start");
-    const persistedRoom = {
+  private persistedRoom(room: Room) {
+    return {
       id: room.id,
       mode: room.settings.mode,
       status: room.status,
@@ -379,6 +395,11 @@ export class PostgresEventStore implements EventStore {
       ...(room.archivedAt ? { archivedAt: room.archivedAt } : {}),
       ...(room.cleanupReason ? { cleanupReason: room.cleanupReason } : {}),
     };
+  }
+
+  async commitEvents(room: Room, events: GameEvent[], result?: StoredCommandResult): Promise<void> {
+    if (!room.game) throw new Error("Cannot commit events before game start");
+    const persistedRoom = this.persistedRoom(room);
     const persistedResult = result ? {
       roomId: result.roomId,
       userId: result.userId,
@@ -421,8 +442,10 @@ export class PostgresEventStore implements EventStore {
   async persistChat(room: Room, chat: ChatMessage): Promise<void> {
     const message = {
       id: chat.id,
+      roomId: room.id,
       userId: chat.userId,
       message: chat.message,
+      createdAt: chat.createdAt,
     };
     await insertChatMessage(this.pool, room.game ? { ...message, matchId: room.game.config.matchId } : message);
   }
@@ -430,6 +453,7 @@ export class PostgresEventStore implements EventStore {
   async persistReport(room: Room, report: Report): Promise<void> {
     const persistedReport = {
       id: report.id,
+      roomId: room.id,
       reporterUserId: report.reporterUserId,
       reportedUserId: report.reportedUserId,
       reason: report.reason,
@@ -485,6 +509,8 @@ export class PostgresEventStore implements EventStore {
         ...(record.archivedAt ? { archivedAt: record.archivedAt } : {}),
         ...(record.cleanupReason ? { cleanupReason: record.cleanupReason } : {}),
         seats: record.seats,
+        chat: record.chat,
+        reports: record.reports,
       };
       if (record.match) {
         stored.match = {
@@ -524,6 +550,8 @@ export class PostgresEventStore implements EventStore {
       ...(record.archivedAt ? { archivedAt: record.archivedAt } : {}),
       ...(record.cleanupReason ? { cleanupReason: record.cleanupReason } : {}),
       seats: record.seats,
+      chat: record.chat,
+      reports: record.reports,
     };
     if (record.match) {
       stored.match = {

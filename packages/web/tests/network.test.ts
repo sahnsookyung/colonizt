@@ -302,23 +302,64 @@ describe("network client", () => {
     socket.emit("open");
     socket.emit("message", "not json");
     socket.emit("message", JSON.stringify({ type: "EVENTS" }));
-    socket.emit("message", JSON.stringify({ type: "RESYNC", events: [{ seq: 1 }], snapshot: { phase: "TEST" } }));
+    const timer = { activePlayerId: "p1", expiresAt: 123_456 };
+    socket.emit("message", JSON.stringify({ type: "RESYNC", events: [{ seq: 1 }], snapshot: { phase: "TEST" }, timer }));
     socket.emit("message", JSON.stringify({ type: "ROOM_STATE", room: { id: "room_1" } }));
     socket.emit("message", JSON.stringify({ type: "COMMAND_ACK" }));
     socket.emit("message", JSON.stringify({ type: "ERROR", code: "ROOM_ERROR" }));
     socket.emit("message", JSON.stringify({ type: "COMMAND_REJECTED", code: "ILLEGAL_COMMAND" }));
     socket.emit("message", JSON.stringify({ type: "UNRECOGNIZED" }));
+    socket.emit("error");
     socket.close();
 
     expect(onOpen).toHaveBeenCalledWith(socket);
-    expect(onEvents).toHaveBeenNthCalledWith(1, [], undefined);
-    expect(onEvents).toHaveBeenNthCalledWith(2, [{ seq: 1 }], { phase: "TEST" });
+    expect(onEvents).toHaveBeenNthCalledWith(1, [], undefined, undefined);
+    expect(onEvents).toHaveBeenNthCalledWith(2, [{ seq: 1 }], { phase: "TEST" }, timer);
     expect(onRoom).toHaveBeenCalledWith({ id: "room_1" });
     expect(onAck).toHaveBeenCalledOnce();
     expect(onError).toHaveBeenNthCalledWith(1, { type: "ERROR", code: "BAD_JSON" });
     expect(onError).toHaveBeenNthCalledWith(2, { type: "ERROR", code: "ROOM_ERROR" });
     expect(onError).toHaveBeenNthCalledWith(3, { type: "COMMAND_REJECTED", code: "ILLEGAL_COMMAND" });
+    expect(onError).toHaveBeenNthCalledWith(4, { type: "ERROR", code: "CONNECTION_FAILED", message: "Online connection failed" });
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("closes and reports sockets that never finish opening", async () => {
+    vi.useFakeTimers();
+    class HangingWebSocket {
+      static readonly OPEN = 1;
+      readonly readyState = 0;
+      readonly close = vi.fn();
+      addEventListener(): void {
+        return;
+      }
+      send(): void {
+        return;
+      }
+    }
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://hanging-bootstrap.example/config") {
+        return new Response(JSON.stringify({ apiBaseUrl: "https://hanging-api.example", wsBaseUrl: "wss://hanging-socket.example" }), { status: 200 });
+      }
+      if (url === "https://hanging-api.example/ws-tickets") {
+        return new Response(JSON.stringify({ ticket: "hanging_ticket", expiresAt: "2026-06-17T00:00:00.000Z", ttlMs: 30_000 }), { status: 201 });
+      }
+      return new Response("not found", { status: 404 });
+    }));
+    vi.stubGlobal("WebSocket", HangingWebSocket);
+    const onError = vi.fn();
+    const socket = await createNetworkClient("https://hanging-bootstrap.example").connect("token", {
+      onEvents: () => undefined,
+      onRoom: () => undefined,
+      onError,
+    }) as unknown as HangingWebSocket;
+
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(onError).toHaveBeenCalledWith({ type: "ERROR", code: "CONNECTION_TIMEOUT", message: "Online connection timed out" });
+    expect(socket.close).toHaveBeenCalledWith(4000, "Connection timeout");
+    vi.useRealTimers();
   });
 
   it("creates sessions, sends commands, and preserves endpoint failure behavior", async () => {
@@ -344,7 +385,9 @@ describe("network client", () => {
     await expect(client.createSession("Ada")).resolves.toMatchObject({ token: "token_1", displayName: "Ada" });
     await expect(client.createRoom("token_1")).rejects.toThrow("Room creation failed");
     await expect(client.listMatches()).rejects.toThrow("Match history failed");
-    await expect(client.createWebSocketTicket("token_1")).rejects.toThrow("WebSocket ticket creation failed");
+    await expect(client.createWebSocketTicket("token_1")).rejects.toEqual({
+      code: "UNAUTHORIZED", message: "WebSocket ticket creation failed", status: 401,
+    });
     await expect(client.getRoom("MISSING")).resolves.toEqual({ ok: false, code: "ROOM_NOT_FOUND" });
     await expect(client.loadReplay("missing")).rejects.toEqual({
       code: "REPLAY_NOT_FOUND", message: "Replay load failed", status: 404,

@@ -153,6 +153,13 @@ export interface RoomSeatPayload {
   connected: boolean;
 }
 
+export interface RoomChatMessagePayload {
+  id: string;
+  userId: PlayerId;
+  message: string;
+  createdAt: string;
+}
+
 export interface LobbyReadiness {
   readyCount: number;
   occupiedCount: number;
@@ -217,6 +224,7 @@ export interface PublicRoomPayload {
     expiresAt: number;
   };
   events?: GameEvent[];
+  chat?: RoomChatMessagePayload[];
   game?: ViewerState;
 }
 

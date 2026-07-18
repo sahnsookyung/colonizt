@@ -832,7 +832,10 @@ export const chooseBotCommand = (view: BotView, profile: BotProfile = view.profi
     return placement ? { type: "PLACE_SETUP", playerId: view.botId, ...placement } : undefined;
   }
   if (view.state.phase.type === "WAITING_FOR_ROLL") return { type: "ROLL_DICE", playerId: view.botId };
-  if (view.state.phase.type !== "ACTION_PHASE" && view.state.phase.type !== "DISCARDING" && view.state.phase.type !== "MOVING_THIEF") return undefined;
+  if (view.state.phase.type === "DISCARDING" || view.state.phase.type === "MOVING_THIEF") {
+    return generateActionCandidates(view, profile, idFactory)[0];
+  }
+  if (view.state.phase.type !== "ACTION_PHASE") return undefined;
   return chooseActionCommand(view, profile, idFactory);
 };
 

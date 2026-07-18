@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { boardHexComponentCount, createSeededBoard, emptyResources, getLegalActions, resourceCount, serializeForViewer, type GameCommand, type GameState, type TradeOffer } from "@colonizt/game-core";
-import { MemoryEventStore, type EventStore, type StoredCommandResult, type StoredRoomRecord } from "../src/event-store.js";
+import { maxRoomChatMessages, MemoryEventStore, type EventStore, type StoredCommandResult, type StoredRoomRecord } from "../src/event-store.js";
 import { MemoryRoomOwnershipStore } from "../src/ownership.js";
 import { RoomCapacityError, RoomManager, type ChatMessage, type Report, type Room, type Session } from "../src/room-manager.js";
 import type { GameEvent } from "@colonizt/game-core";
@@ -253,6 +253,39 @@ class FailNextRoomPersistStore extends MemoryEventStore {
       throw new Error("planned report persistence failure");
     }
     await super.persistReport(room, report);
+  }
+}
+
+class OrderedRoomPersistStore extends MemoryEventStore {
+  private armed = false;
+  private readyWriteStarted = false;
+  private resolveReadyStarted!: () => void;
+  private resolveReadyWrite!: () => void;
+  private resolveReadyPersisted!: () => void;
+  readonly readyStarted = new Promise<void>((resolve) => { this.resolveReadyStarted = resolve; });
+  private readonly readyWrite = new Promise<void>((resolve) => { this.resolveReadyWrite = resolve; });
+  private readonly readyPersisted = new Promise<void>((resolve) => { this.resolveReadyPersisted = resolve; });
+
+  arm(): void {
+    this.armed = true;
+  }
+
+  releaseReadyWrite(): void {
+    this.resolveReadyWrite();
+  }
+
+  override async persistRoom(room: Room): Promise<void> {
+    const hostReady = room.seats[0]?.ready === true;
+    if (this.armed && hostReady && !this.readyWriteStarted) {
+      this.readyWriteStarted = true;
+      this.resolveReadyStarted();
+      await this.readyWrite;
+      await super.persistRoom(room);
+      this.resolveReadyPersisted();
+      return;
+    }
+    if (this.armed && this.readyWriteStarted && !hostReady) await this.readyPersisted;
+    await super.persistRoom(room);
   }
 }
 
@@ -551,6 +584,23 @@ describe("RoomManager", () => {
     expect(manager.dueCleanupRoomIds(2_000)).toContain(room.id);
   });
 
+  it("serializes connection snapshots behind accepted room mutations", async () => {
+    const store = new OrderedRoomPersistStore();
+    const manager = new RoomManager(store);
+    const host = await manager.createSession("Queued Host");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
+    store.arm();
+
+    const readyPromise = manager.setReady(room.id, host, true);
+    await store.readyStarted;
+    const connectionsPromise = manager.syncConnections(room.id, new Set([host.userId]));
+    store.releaseReadyWrite();
+    const [ready] = await Promise.all([readyPromise, connectionsPromise]);
+
+    expect(ready).toMatchObject({ ok: true });
+    expect(room.seats[0]).toMatchObject({ ready: true, connected: true });
+  });
+
   it("does not expose unpersisted sessions, names, chat, or reports", async () => {
     const store = new FailNextRoomPersistStore();
     const manager = new RoomManager(store);
@@ -571,7 +621,7 @@ describe("RoomManager", () => {
     expect(room.chat).toEqual([]);
 
     store.failNextReportPersist = true;
-    await expect(manager.createReport(room.id, host, "u_other", "not durable")).rejects.toThrow("planned report persistence failure");
+    await expect(manager.createReport(room.id, host, host.userId, "not durable")).rejects.toThrow("planned report persistence failure");
     expect(room.reports).toEqual([]);
   });
 
@@ -592,6 +642,61 @@ describe("RoomManager", () => {
     expect(left.room.status).toBe("LOBBY");
     expect(left.room.seats.some((seat) => seat.userId === guest.userId)).toBe(false);
     expect(left.room.seats[1]).toMatchObject({ ready: false, connected: false });
+  });
+
+  it("treats room-code and canonical-id joins as the same room during a switch", async () => {
+    const manager = new RoomManager();
+    const host = await manager.createSession("Host");
+    const room = await manager.createRoom(host, { mode: "CLASSIC", botFill: false, ranked: false });
+
+    const switched = await manager.switchRoom(room.id, room.code, host);
+
+    expect(switched).toMatchObject({ ok: true, room: { id: room.id }, previousRoom: { id: room.id } });
+    expect(room.seats.filter((seat) => seat.userId === host.userId)).toHaveLength(1);
+  });
+
+  it("does not let an explicit socket leave bypass the retained active-game seat guard", async () => {
+    const manager = new RoomManager();
+    const player = await manager.createSession("Active Player");
+    const otherHost = await manager.createSession("Other Host");
+    const activeRoom = await manager.createRoom(player, { mode: "CLASSIC", botFill: true, ranked: false });
+    const destination = await manager.createRoom(otherHost, { mode: "CLASSIC", botFill: false, ranked: false });
+    await manager.setReady(activeRoom.id, player, true);
+    await manager.leaveRoom(activeRoom.id, player);
+
+    await expect(manager.joinRoom(destination.id, player)).resolves.toMatchObject({ ok: false, code: "ROOM_SWITCH_ACTIVE_GAME" });
+    expect(manager.isMember(activeRoom, player.userId)).toBe(true);
+    expect(manager.isMember(destination, player.userId)).toBe(false);
+  });
+
+  it("preserves previous membership when a destination is full or owned elsewhere", async () => {
+    const ownership = new MemoryRoomOwnershipStore();
+    const manager = new RoomManager(undefined, { ownerId: "node_a", ownershipStore: ownership });
+    const oldHost = await manager.createSession("Old Host");
+    const destinationHost = await manager.createSession("Destination Host");
+    const guest = await manager.createSession("Guest");
+    const occupant = await manager.createSession("Occupant");
+    const oldRoom = await manager.createRoom(oldHost, { mode: "CLASSIC", botFill: false, ranked: false });
+    const fullRoom = await manager.createRoom(destinationHost, { mode: "DUEL", botFill: false, ranked: false, maxPlayers: 2 });
+    await manager.joinRoom(oldRoom.id, guest);
+    await manager.joinRoom(fullRoom.id, occupant);
+
+    await expect(manager.switchRoom(oldRoom.id, fullRoom.id, guest)).resolves.toMatchObject({ ok: false, code: "ROOM_FULL" });
+    expect(manager.isMember(oldRoom, guest.userId)).toBe(true);
+    expect(manager.isMember(fullRoom, guest.userId)).toBe(false);
+
+    const openRoom = await manager.createRoom(destinationHost, { mode: "CLASSIC", botFill: false, ranked: false });
+    await ownership.release(openRoom.id, "node_a");
+    await ownership.acquire(openRoom.id, "node_b", 60_000);
+    await expect(manager.switchRoom(oldRoom.id, openRoom.id, guest)).resolves.toMatchObject({ ok: false, code: "ROOM_NOT_OWNED" });
+    expect(manager.isMember(oldRoom, guest.userId)).toBe(true);
+    expect(manager.isMember(openRoom, guest.userId)).toBe(false);
+
+    const closedRoom = await manager.createRoom(destinationHost, { mode: "CLASSIC", botFill: false, ranked: false });
+    closedRoom.archivedAt = new Date().toISOString();
+    await expect(manager.switchRoom(oldRoom.id, closedRoom.id, guest)).resolves.toMatchObject({ ok: false, code: "ROOM_CLOSED" });
+    expect(manager.isMember(oldRoom, guest.userId)).toBe(true);
+    expect(manager.isMember(closedRoom, guest.userId)).toBe(false);
   });
 
   it("transfers a bot-only lobby to the next human who joins", async () => {
@@ -1203,6 +1308,17 @@ describe("RoomManager", () => {
     expect(await new RoomManager(store).resolveSession(session.token)).toBeUndefined();
   });
 
+  it("sweeps every expired session from manager and store caches without token lookups", async () => {
+    const store = new MemoryEventStore();
+    const manager = new RoomManager(store, { sessionTtlMs: 1 });
+    await Promise.all(Array.from({ length: 25 }, (_, index) => manager.createSession(`Guest ${index}`)));
+    const afterExpiry = Math.max(...[...manager.sessions.values()].map((session) => Date.parse(session.expiresAt!))) + 1;
+
+    await expect(manager.sweepExpiredSessions(afterExpiry)).resolves.toEqual({ cached: 25, persisted: 25 });
+    expect(manager.sessions.size).toBe(0);
+    expect(store.sessions.size).toBe(0);
+  });
+
   it("reconstructs replay from stored events", async () => {
     const { manager, session, room } = await startedRoom();
     const vertexId = getLegalActions(room.game!, session.userId).find((action) => action.type === "PLACE_SETUP")!.vertices[0]!;
@@ -1602,6 +1718,33 @@ describe("RoomManager", () => {
     expect(chat?.message).toBe("hello table");
     expect(report?.status).toBe("OPEN");
     expect(room.events).toHaveLength(0);
+  });
+
+  it("rejects reports for identities that are not seated in the room", async () => {
+    const { manager, session, room } = await startedRoom();
+
+    await expect(manager.createReport(room.id, session, "u_not_in_room", "fabricated target")).resolves.toBeUndefined();
+    expect(room.reports).toEqual([]);
+  });
+
+  it("retains only the newest bounded chat window in room state", async () => {
+    const { manager, session, room } = await startedRoom();
+    for (let index = 0; index < maxRoomChatMessages + 5; index += 1) {
+      await manager.addChat(room.id, session, `message ${index}`);
+    }
+
+    expect(room.chat).toHaveLength(maxRoomChatMessages);
+    expect(room.chat[0]?.message).toBe("message 5");
+    expect(room.chat.at(-1)?.message).toBe(`message ${maxRoomChatMessages + 4}`);
+    expect(manager.publicRoom(room, session.userId).chat).toHaveLength(maxRoomChatMessages);
+
+    room.chat.unshift(...Array.from({ length: 5 }, (_, index) => ({
+      id: `legacy_${index}`,
+      userId: session.userId,
+      message: `legacy ${index}`,
+      createdAt: new Date(index).toISOString(),
+    })));
+    expect(manager.publicRoom(room, session.userId).chat?.[0]?.message).toBe("message 5");
   });
 
   it("keeps reports and event history out of public room summaries", async () => {

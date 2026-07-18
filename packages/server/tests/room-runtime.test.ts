@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { connectedSeatedHumanCount, connectedUserCount, livenessStateForRoom, roomTimerKey } from "../src/room-runtime.js";
+import { actionTurnDurationMs, connectedSeatedHumanCount, connectedUserCount, livenessStateForRoom, rollTurnDurationMs, roomTimerKey, roomTurnDurationMs } from "../src/room-runtime.js";
 import type { Room } from "../src/room-manager.js";
 
 const baseRoom = (overrides: Partial<Room> = {}): Room => ({
@@ -90,5 +90,21 @@ describe("room-runtime helpers", () => {
     room.game.phase = { type: "SETUP_PLACEMENT", activePlayerId: "u_host", setupIndex: 3 };
 
     expect(roomTimerKey(room.game)).not.toBe(first);
+  });
+
+  it("uses the product roll and action deadlines from server truth", () => {
+    const state = baseRoom().game ?? {
+      schemaVersion: 3,
+      config: { matchId: "timer", seed: "timer", victoryPoints: 10, maxPlayers: 2, turnSeconds: 240, playerOrder: ["p1", "p2"], playerNames: {}, playerColors: {} },
+      board: { hexes: {}, vertices: {}, edges: {}, ports: {}, adjacency: { hexToVertices: {}, vertexToEdges: {}, edgeToVertices: {} } },
+      players: {}, playerOrder: ["p1", "p2"], resourceBank: { timber: 0, brick: 0, grain: 0, fiber: 0, ore: 0 },
+      phase: { type: "WAITING_FOR_ROLL" as const, activePlayerId: "p1" }, turn: 1,
+      roads: {}, settlements: {}, buildings: {}, playedKnightCounts: {}, trades: {}, developmentDeck: [], developmentDeckCursor: 0,
+      eventSeq: 0, rng: { seed: "timer", index: 0, policy: "SEEDED_DETERMINISTIC" as const },
+    };
+    state.phase = { type: "WAITING_FOR_ROLL", activePlayerId: "p1" };
+    expect(roomTurnDurationMs(state)).toBe(rollTurnDurationMs);
+    state.phase = { type: "ACTION_PHASE", activePlayerId: "p1" };
+    expect(roomTurnDurationMs(state)).toBe(actionTurnDurationMs);
   });
 });

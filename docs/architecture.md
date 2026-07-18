@@ -409,7 +409,7 @@ flowchart TB
   events --> activeRooms
 ```
 
-PostgreSQL is durable match truth when `DATABASE_URL` is configured. The server runs migrations on startup, hydrates recent sessions and rooms, preserves public room codes, lobby seats, trade deadlines, and active turn timers, validates stored room and command-result payloads before hydration, validates stored replay rows, and reconstructs game state from persisted config, board, snapshots, and tail events. Full snapshots are server-only acceleration data; viewer APIs continue to receive redacted state and events.
+PostgreSQL is durable match truth when `DATABASE_URL` is configured. The server runs migrations on startup, hydrates recent sessions and rooms with fixed-count batched relation queries, preserves public room codes, lobby seats, trade deadlines, and active turn timers, validates stored room and command-result payloads before hydration, validates stored replay rows, and reconstructs game state from persisted config, board, snapshots, and tail events. Cross-room lobby/spectator switches persist both room records in one transaction. Expired sessions are swept from memory and PostgreSQL, while room chat retains only the newest 100 messages. Full snapshots are server-only acceleration data; viewer APIs continue to receive redacted state and events.
 
 ## Persistence Model
 

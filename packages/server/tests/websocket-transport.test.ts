@@ -1,8 +1,9 @@
 import { createDemoGame } from "@colonizt/test-utils";
 import { describe, expect, it, vi } from "vitest";
+import { MemoryEventStore } from "../src/event-store.js";
 import { MetricsRegistry, createStructuredLogger, type StructuredLogRecord } from "../src/observability.js";
 import { MemoryPresenceStore } from "../src/presence.js";
-import { RoomManager } from "../src/room-manager.js";
+import { RoomManager, type Room } from "../src/room-manager.js";
 import { handleWebSocketMessage, withinSlidingWindow, type SocketClient, type WebSocketMessageContext } from "../src/websocket-transport.js";
 
 const messageContext = (
@@ -17,8 +18,6 @@ const messageContext = (
   presence: new MemoryPresenceStore(),
   metrics: new MetricsRegistry("test", "single"),
   logger: createStructuredLogger("test", "single", (record) => logs.push(record)),
-  commandTimes: [],
-  chatTimes: [],
   withinNamedLimit: () => true,
   attachClientToRoom: (roomId) => { client.roomId = roomId; },
   detachClientFromRoom: () => { delete client.roomId; },
@@ -33,6 +32,15 @@ const socketClient = (session: SocketClient["session"]) => {
   const client: SocketClient = { socket: { send, close: vi.fn(), on: vi.fn() }, session };
   return { client, send };
 };
+
+class FailingRoomSwitchStore extends MemoryEventStore {
+  failSwitch = false;
+
+  override async persistRooms(rooms: readonly Room[]): Promise<void> {
+    if (this.failSwitch) throw new Error("atomic room switch failed");
+    await super.persistRooms(rooms);
+  }
+}
 
 describe("websocket sliding-window limiter", () => {
   it("expires every timestamp older than the active window, including epoch zero", () => {
@@ -143,12 +151,90 @@ describe("websocket message delivery boundaries", () => {
     expect(client.roomId).toBe(room.id);
   });
 
+  it("switches lobby membership and broadcasts both authoritative room states", async () => {
+    const manager = new RoomManager();
+    const oldHost = await manager.createSession("Old Host");
+    const newHost = await manager.createSession("New Host");
+    const guest = await manager.createSession("Guest");
+    const oldRoom = await manager.createRoom(oldHost, { mode: "CLASSIC", botFill: false, ranked: false });
+    const newRoom = await manager.createRoom(newHost, { mode: "CLASSIC", botFill: false, ranked: false });
+    await manager.joinRoom(oldRoom.id, guest);
+    const logs: StructuredLogRecord[] = [];
+    const { client } = socketClient(guest);
+    client.roomId = oldRoom.id;
+    const broadcastRoomState = vi.fn();
+
+    await handleWebSocketMessage(
+      { toString: () => JSON.stringify({ type: "JOIN_ROOM", roomId: newRoom.id }) },
+      messageContext(manager, client, logs, { broadcastRoomState }),
+    );
+
+    expect(client.roomId).toBe(newRoom.id);
+    expect(manager.isMember(oldRoom, guest.userId)).toBe(false);
+    expect(manager.isMember(newRoom, guest.userId)).toBe(true);
+    expect(broadcastRoomState).toHaveBeenCalledWith(expect.objectContaining({ id: oldRoom.id }));
+    expect(broadcastRoomState).toHaveBeenCalledWith(expect.objectContaining({ id: newRoom.id }));
+  });
+
+  it("keeps both live rooms unchanged when the atomic switch write fails", async () => {
+    const store = new FailingRoomSwitchStore();
+    const manager = new RoomManager(store);
+    const oldHost = await manager.createSession("Old Host");
+    const newHost = await manager.createSession("New Host");
+    const guest = await manager.createSession("Guest");
+    const oldRoom = await manager.createRoom(oldHost, { mode: "CLASSIC", botFill: false, ranked: false });
+    const newRoom = await manager.createRoom(newHost, { mode: "CLASSIC", botFill: false, ranked: false });
+    await manager.joinRoom(oldRoom.id, guest);
+    store.failSwitch = true;
+    const logs: StructuredLogRecord[] = [];
+    const { client, send } = socketClient(guest);
+    client.roomId = oldRoom.id;
+
+    await handleWebSocketMessage(
+      { toString: () => JSON.stringify({ type: "JOIN_ROOM", roomId: newRoom.id }) },
+      messageContext(manager, client, logs),
+    );
+
+    expect(send).toHaveBeenCalledWith(JSON.stringify({ type: "ERROR", code: "JOIN_FAILED", message: "atomic room switch failed" }));
+    expect(client.roomId).toBe(oldRoom.id);
+    expect(manager.isMember(oldRoom, guest.userId)).toBe(true);
+    expect(manager.isMember(newRoom, guest.userId)).toBe(false);
+  });
+
+  it("rejects switching away from a retained active-game seat", async () => {
+    const manager = new RoomManager();
+    const oldHost = await manager.createSession("Active Host");
+    const newHost = await manager.createSession("New Host");
+    const oldRoom = await manager.createRoom(oldHost, { mode: "CLASSIC", botFill: true, ranked: false });
+    const newRoom = await manager.createRoom(newHost, { mode: "CLASSIC", botFill: false, ranked: false });
+    await manager.setReady(oldRoom.id, oldHost, true);
+    expect(oldRoom.status).toBe("IN_GAME");
+    const logs: StructuredLogRecord[] = [];
+    const { client, send } = socketClient(oldHost);
+    client.roomId = oldRoom.id;
+
+    await handleWebSocketMessage(
+      { toString: () => JSON.stringify({ type: "JOIN_ROOM", roomId: newRoom.id }) },
+      messageContext(manager, client, logs),
+    );
+
+    expect(send).toHaveBeenCalledWith(JSON.stringify({
+      type: "ERROR",
+      code: "ROOM_SWITCH_ACTIVE_GAME",
+      message: "You cannot join another room while seated in an active game",
+    }));
+    expect(client.roomId).toBe(oldRoom.id);
+    expect(manager.isMember(oldRoom, oldHost.userId)).toBe(true);
+    expect(manager.isMember(newRoom, oldHost.userId)).toBe(false);
+  });
+
   it("does not report a persisted command as rejected when its broadcast fails", async () => {
     const manager = new RoomManager();
     const session = await manager.createSession("Player");
     vi.spyOn(manager, "submitCommand").mockResolvedValue({ ok: true, events: [], state: createDemoGame("broadcast-failure") });
     const logs: StructuredLogRecord[] = [];
     const { client, send } = socketClient(session);
+    client.roomId = "room-a";
     const context = messageContext(manager, client, logs, {
       broadcastAcceptedCommand: () => { throw new Error("broadcast failed"); },
     });

@@ -21,6 +21,9 @@ export const migrationFiles = [
   "005_room_lifecycle_and_invites.sql",
   "006_liveness_and_room_leases.sql",
   "007_room_timer.sql",
+  "008_room_content.sql",
+  "009_session_expiry_index.sql",
+  "010_chat_retention_sequence.sql",
 ];
 
 export const readMigration = async (name: string): Promise<string> => readFile(join(migrationsDir, name), "utf8");
@@ -133,6 +136,45 @@ export interface PersistedSessionRecord {
   expiresAt?: string;
 }
 
+export const deleteExpiredSessions = async (pool: pg.Pool, now = new Date()): Promise<number> => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const expired = await client.query(
+      `DELETE FROM sessions
+       WHERE expires_at IS NOT NULL AND expires_at <= $1
+       RETURNING user_id`,
+      [now.toISOString()],
+    );
+    const userIds = [...new Set(expired.rows.map((row) => String(row.user_id)))];
+    if (userIds.length > 0) {
+      await client.query(
+        `DELETE FROM users AS candidate
+         WHERE candidate.id = ANY($1::text[])
+           AND candidate.banned_at IS NULL
+           AND NOT EXISTS (SELECT 1 FROM sessions WHERE user_id = candidate.id)
+           AND NOT EXISTS (SELECT 1 FROM rooms WHERE host_user_id = candidate.id)
+           AND NOT EXISTS (SELECT 1 FROM room_seats WHERE user_id = candidate.id)
+           AND NOT EXISTS (SELECT 1 FROM matches WHERE winner_user_id = candidate.id)
+           AND NOT EXISTS (SELECT 1 FROM match_players WHERE user_id = candidate.id)
+           AND NOT EXISTS (SELECT 1 FROM command_results WHERE user_id = candidate.id)
+           AND NOT EXISTS (SELECT 1 FROM ratings WHERE user_id = candidate.id)
+           AND NOT EXISTS (SELECT 1 FROM chat_messages WHERE user_id = candidate.id)
+           AND NOT EXISTS (SELECT 1 FROM reports WHERE reporter_user_id = candidate.id OR reported_user_id = candidate.id)
+           AND NOT EXISTS (SELECT 1 FROM analytics_events WHERE user_id = candidate.id)`,
+        [userIds],
+      );
+    }
+    await client.query("COMMIT");
+    return expired.rowCount ?? 0;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
 export const listPersistedSessions = async (pool: pg.Pool, limit = 200): Promise<PersistedSessionRecord[]> => {
   const result = await pool.query(
     `SELECT token, user_id, display_name, expires_at
@@ -240,24 +282,58 @@ export const upsertRoom = async (pool: pg.Pool, room: PersistRoomInput): Promise
   }
 };
 
+export const upsertRooms = async (pool: pg.Pool, rooms: readonly PersistRoomInput[]): Promise<void> => {
+  if (rooms.length === 0) return;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const room of rooms) await upsertRoomWithClient(client, room);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
+const insertMatchWithClient = async (client: pg.PoolClient, match: PersistMatchInput): Promise<void> => {
+  await client.query(
+    `INSERT INTO matches(id, room_id, mode, ranked, seed_hash, config_json, board_json)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (id) DO NOTHING`,
+    [match.id, match.roomId, match.mode, match.ranked, match.seedHash, match.config, match.board],
+  );
+  for (const player of match.players) {
+    await client.query(
+      `INSERT INTO match_players(match_id, user_id, seat_index)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (match_id, user_id) DO NOTHING`,
+      [match.id, player.userId, player.seatIndex],
+    );
+  }
+};
+
 export const insertMatch = async (pool: pg.Pool, match: PersistMatchInput): Promise<void> => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await client.query(
-      `INSERT INTO matches(id, room_id, mode, ranked, seed_hash, config_json, board_json)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (id) DO NOTHING`,
-      [match.id, match.roomId, match.mode, match.ranked, match.seedHash, match.config, match.board],
-    );
-    for (const player of match.players) {
-      await client.query(
-        `INSERT INTO match_players(match_id, user_id, seat_index)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (match_id, user_id) DO NOTHING`,
-        [match.id, player.userId, player.seatIndex],
-      );
-    }
+    await insertMatchWithClient(client, match);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
+export const insertMatchAndRoom = async (pool: pg.Pool, match: PersistMatchInput, room: PersistRoomInput): Promise<void> => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await upsertRoomWithClient(client, room);
+    await insertMatchWithClient(client, match);
     await client.query("COMMIT");
   } catch (error) {
     await client.query("ROLLBACK");
@@ -271,27 +347,51 @@ export const markMatchFinished = async (pool: pg.Pool, matchId: string, winnerUs
   await pool.query("UPDATE matches SET ended_at = now(), winner_user_id = $2 WHERE id = $1", [matchId, winnerUserId]);
 };
 
+export const maxRoomChatMessages = 100;
+
 export const insertChatMessage = async (
   pool: pg.Pool,
-  message: { id: string; matchId?: string; userId: string; message: string },
+  message: { id: string; roomId: string; matchId?: string; userId: string; message: string; createdAt?: string },
 ): Promise<void> => {
-  await pool.query(
-    `INSERT INTO chat_messages(id, match_id, user_id, message)
-     VALUES ($1, $2, $3, $4)
-     ON CONFLICT (id) DO NOTHING`,
-    [message.id, message.matchId ?? null, message.userId, message.message],
-  );
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO chat_messages(id, room_id, match_id, user_id, message, created_at)
+       VALUES ($1, $2, $3, $4, $5, COALESCE($6::timestamptz, now()))
+       ON CONFLICT (id) DO NOTHING`,
+      [message.id, message.roomId, message.matchId ?? null, message.userId, message.message, message.createdAt ?? null],
+    );
+    await client.query(
+      `DELETE FROM chat_messages
+       WHERE room_id = $1
+         AND id NOT IN (
+           SELECT id
+           FROM chat_messages
+           WHERE room_id = $1
+           ORDER BY retention_seq DESC
+           LIMIT $2
+         )`,
+      [message.roomId, maxRoomChatMessages],
+    );
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 };
 
 export const insertReport = async (
   pool: pg.Pool,
-  report: { id: string; reporterUserId: string; reportedUserId: string; matchId?: string; reason: string; status: string },
+  report: { id: string; roomId: string; reporterUserId: string; reportedUserId: string; matchId?: string; reason: string; status: string },
 ): Promise<void> => {
   await pool.query(
-    `INSERT INTO reports(id, reporter_user_id, reported_user_id, match_id, reason, status)
-     VALUES ($1, $2, $3, $4, $5, $6)
+    `INSERT INTO reports(id, room_id, reporter_user_id, reported_user_id, match_id, reason, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      ON CONFLICT (id) DO NOTHING`,
-    [report.id, report.reporterUserId, report.reportedUserId, report.matchId ?? null, report.reason, report.status],
+    [report.id, report.roomId, report.reporterUserId, report.reportedUserId, report.matchId ?? null, report.reason, report.status],
   );
 };
 
@@ -605,6 +705,8 @@ export interface PersistedRoomRecord {
   archivedAt?: string;
   cleanupReason?: string;
   seats: Array<{ seatIndex: number; userId?: string; botId?: string; ready: boolean; connected: boolean }>;
+  chat: Array<{ id: string; userId: string; message: string; createdAt: string }>;
+  reports: Array<{ id: string; reporterUserId: string; reportedUserId: string; roomId: string; reason: string; status: "OPEN" | "RESOLVED" }>;
   match?: {
     id: string;
     config: unknown;
@@ -621,40 +723,128 @@ const dateString = (value: unknown): string | undefined => {
   return value instanceof Date ? value.toISOString() : String(value);
 };
 
+const rowsGroupedBy = (rows: pg.QueryResultRow[], field: string, fallbackKey?: string): Map<string, pg.QueryResultRow[]> => {
+  const grouped = new Map<string, pg.QueryResultRow[]>();
+  for (const row of rows) {
+    const rawKey = row[field] ?? fallbackKey;
+    if (typeof rawKey !== "string") continue;
+    const values = grouped.get(rawKey) ?? [];
+    values.push(row);
+    grouped.set(rawKey, values);
+  }
+  return grouped;
+};
+
 const hydratePersistedRoomRecords = async (pool: pg.Pool, rows: pg.QueryResultRow[]): Promise<PersistedRoomRecord[]> => {
+  if (rows.length === 0) return [];
+  const roomIds = rows.map((row) => String(row.id));
+  const onlyRoomId = roomIds.length === 1 ? roomIds[0] : undefined;
+  const [seatsResult, matchesResult, chatResult, reportsResult] = await Promise.all([
+    pool.query(
+      `SELECT room_id, seat_index, user_id, bot_id, ready, connected
+       FROM room_seats
+       WHERE room_id = ANY($1::text[])
+       ORDER BY room_id ASC, seat_index ASC`,
+      [roomIds],
+    ),
+    pool.query(
+      `SELECT DISTINCT ON (room_id) room_id, id, config_json, board_json, ended_at, winner_user_id
+       FROM matches
+       WHERE room_id = ANY($1::text[])
+       ORDER BY room_id ASC, started_at DESC`,
+      [roomIds],
+    ),
+    pool.query(
+      `SELECT id, room_id, user_id, message, created_at, retention_seq
+       FROM (
+         SELECT id, room_id, user_id, message, created_at, retention_seq,
+                ROW_NUMBER() OVER (PARTITION BY room_id ORDER BY retention_seq DESC) AS room_rank
+         FROM chat_messages
+         WHERE room_id = ANY($1::text[])
+       ) recent_chat
+       WHERE room_rank <= $2
+       ORDER BY room_id ASC, retention_seq ASC`,
+      [roomIds, maxRoomChatMessages],
+    ),
+    pool.query(
+      `SELECT id, room_id, reporter_user_id, reported_user_id, reason, status
+       FROM reports
+       WHERE room_id = ANY($1::text[])
+       ORDER BY room_id ASC, created_at ASC, id ASC`,
+      [roomIds],
+    ),
+  ]);
+
+  const matchesByRoom = rowsGroupedBy(matchesResult.rows, "room_id", onlyRoomId);
+  const matchIds = matchesResult.rows.map((row) => String(row.id));
+  const onlyMatchId = matchIds.length === 1 ? matchIds[0] : undefined;
+  const [eventsResult, snapshotsResult] = matchIds.length > 0
+    ? await Promise.all([
+      pool.query(
+        `SELECT match_id, seq, event_type, payload_json
+         FROM match_events
+         WHERE match_id = ANY($1::text[])
+         ORDER BY match_id ASC, seq ASC`,
+        [matchIds],
+      ),
+      pool.query(
+        `SELECT DISTINCT ON (match_id) match_id, seq, state_json
+         FROM match_snapshots
+         WHERE match_id = ANY($1::text[])
+         ORDER BY match_id ASC, seq DESC`,
+        [matchIds],
+      ),
+    ])
+    : [{ rows: [] }, { rows: [] }];
+
+  const seatsByRoom = rowsGroupedBy(seatsResult.rows, "room_id", onlyRoomId);
+  const chatByRoom = rowsGroupedBy(chatResult.rows, "room_id", onlyRoomId);
+  const reportsByRoom = rowsGroupedBy(reportsResult.rows, "room_id", onlyRoomId);
+  const eventRowsByMatch = rowsGroupedBy(eventsResult.rows, "match_id", onlyMatchId);
+  const snapshotsByMatch = rowsGroupedBy(snapshotsResult.rows, "match_id", onlyMatchId);
   const records: PersistedRoomRecord[] = [];
   for (const row of rows) {
-    const seats = await pool.query(
-      `SELECT seat_index, user_id, bot_id, ready, connected
-       FROM room_seats
-       WHERE room_id = $1
-       ORDER BY seat_index ASC`,
-      [row.id],
-    );
-    const match = await pool.query(
-      `SELECT id, config_json, board_json, ended_at, winner_user_id
-       FROM matches
-       WHERE room_id = $1
-       ORDER BY started_at DESC
-       LIMIT 1`,
-      [row.id],
-    );
-    const matchRow = match.rows[0];
-    const events = matchRow ? await loadMatchEventPayloads(pool, matchRow.id) : undefined;
-    const snapshot = matchRow ? await loadLatestMatchSnapshot(pool, matchRow.id) : undefined;
+    const roomId = String(row.id);
+    const seatRows = seatsByRoom.get(roomId) ?? [];
+    const chatRows = chatByRoom.get(roomId) ?? [];
+    const reportRows = reportsByRoom.get(roomId) ?? [];
+    const matchRow = matchesByRoom.get(roomId)?.[0];
+    const matchId = matchRow ? String(matchRow.id) : undefined;
+    const eventRows = matchId ? eventRowsByMatch.get(matchId) ?? [] : [];
+    const events = matchRow ? validatePersistedEventRows(eventRows) : undefined;
+    const snapshotRow = matchId ? snapshotsByMatch.get(matchId)?.[0] : undefined;
+    const snapshot = snapshotRow ? {
+      matchId: String(snapshotRow.match_id ?? matchId),
+      seq: Number(snapshotRow.seq),
+      state: snapshotRow.state_json,
+    } : undefined;
     const record: PersistedRoomRecord = {
-      id: row.id,
+      id: roomId,
       mode: row.mode,
       status: row.status,
       hostUserId: row.host_user_id,
       settings: row.settings_json,
       createdAt: dateString(row.created_at) ?? new Date().toISOString(),
-      seats: seats.rows.map((seat) => ({
+      seats: seatRows.map((seat) => ({
         seatIndex: seat.seat_index,
         userId: seat.user_id ?? undefined,
         botId: seat.bot_id ?? undefined,
         ready: seat.ready,
         connected: false,
+      })),
+      chat: chatRows.map((chat) => ({
+        id: chat.id,
+        userId: chat.user_id,
+        message: chat.message,
+        createdAt: dateString(chat.created_at) ?? new Date(0).toISOString(),
+      })),
+      reports: reportRows.map((report) => ({
+        id: report.id,
+        reporterUserId: report.reporter_user_id,
+        reportedUserId: report.reported_user_id,
+        roomId,
+        reason: report.reason,
+        status: report.status === "RESOLVED" ? "RESOLVED" : "OPEN",
       })),
     };
     if (row.room_code) record.code = row.room_code;
@@ -682,7 +872,7 @@ const hydratePersistedRoomRecords = async (pool: pg.Pool, rows: pg.QueryResultRo
     }
     if (matchRow) {
       record.match = {
-        id: matchRow.id,
+        id: String(matchRow.id),
         config: matchRow.config_json,
         board: matchRow.board_json,
         events: events ?? [],

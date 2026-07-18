@@ -145,7 +145,7 @@ export const registerHttpRoutes = (app: FastifyInstance, context: HttpRouteConte
 
   app.get("/rooms", async (request, reply) => {
     if (!withinNamedLimit(`ip:${clientIp(request)}:room-list`, 120, 60_000)) return reply.status(429).send({ code: "RATE_LIMITED" });
-    return manager.listRooms();
+    return [];
   });
 
   app.get<{ Params: { roomRef: string } }>("/rooms/:roomRef", async (request, reply) => {

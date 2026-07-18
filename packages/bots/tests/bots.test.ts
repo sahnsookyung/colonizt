@@ -408,6 +408,24 @@ describe("bot policies", () => {
     expect(move && applyCommand(state, move).ok).toBe(true);
   });
 
+  it("chooses a discard after another player's submitted bundle is redacted", () => {
+    let state = completeSetup(createDemoGame("bot-redacted-discard", { botDifficulty: "hard" })).state;
+    state = withResources(state, "p2", { timber: 8 });
+    state = withResources(state, "p3", { fiber: 8 });
+    state.phase = {
+      type: "DISCARDING",
+      activePlayerId: "p3",
+      rollerId: "p1",
+      pending: { p2: 4, p3: 4 },
+      submitted: { p2: { timber: 4 } },
+    };
+
+    const command = chooseBotCommand(createBotView(state, "p3", greedyBot.profile, "hard"), greedyBot.profile);
+
+    expect(command?.type).toBe("DISCARD_RESOURCES");
+    expect(command && applyCommand(state, command).ok).toBe(true);
+  });
+
   it("chooses legal thief moves on alternate maps", () => {
     for (const mapPreset of alternateMapPresets) {
       let state = completeSetup(createDemoGame(`bot-thief-${mapPreset}`, { botDifficulty: "hard", rules: { mapPreset, mapRandomized: true } })).state;

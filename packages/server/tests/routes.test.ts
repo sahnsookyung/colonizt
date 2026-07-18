@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MetricsRegistry, buildServer, createStructuredLogger, MemoryEventStore } from "../src/index.js";
 import { RoomManager } from "../src/room-manager.js";
 
@@ -10,7 +10,46 @@ class CapturingAnalyticsStore extends MemoryEventStore {
   }
 }
 
+class FailingSessionSweepStore extends MemoryEventStore {
+  override async deleteExpiredSessions(): Promise<number> {
+    throw new Error("session store unavailable");
+  }
+}
+
 describe("REST routes", () => {
+  it("periodically reclaims expired sessions without requiring a token lookup", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-18T00:00:00.000Z"));
+    const manager = new RoomManager(new MemoryEventStore(), { sessionTtlMs: 1 });
+    const session = await manager.createSession("Transient Guest");
+    const app = await buildServer({ manager, wsTicketTtlMs: 30_000 });
+    try {
+      expect(manager.sessions.has(session.token)).toBe(true);
+      await vi.advanceTimersByTimeAsync(30_001);
+      expect(manager.sessions.has(session.token)).toBe(false);
+    } finally {
+      await app.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it("records and logs periodic session-sweep failures without crashing the server", async () => {
+    vi.useFakeTimers();
+    const events: string[] = [];
+    const metrics = new MetricsRegistry("test", "single");
+    const logger = createStructuredLogger("test", "single", (record) => events.push(record.event));
+    const manager = new RoomManager(new FailingSessionSweepStore());
+    const app = await buildServer({ manager, metrics, logger, wsTicketTtlMs: 30_000 });
+    try {
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(events).toContain("session.sweep_failed");
+      expect(metrics.render(manager, 0, "memory")).toContain('operation="session_sweep"');
+    } finally {
+      await app.close();
+      vi.useRealTimers();
+    }
+  });
+
   it("serves public runtime config for deployed clients", async () => {
     const app = await buildServer({
       manager: new RoomManager(),
@@ -253,10 +292,18 @@ describe("REST routes", () => {
       headers: { "x-session-token": session.token },
       payload: { reportedUserId: "bot_2", reason: "x".repeat(501) },
     });
+    const unknownTarget = await app.inject({
+      method: "POST",
+      url: `/rooms/${room.id}/reports`,
+      headers: { "x-session-token": session.token },
+      payload: { reportedUserId: "u_not_in_room", reason: "fabricated target" },
+    });
     await app.close();
 
     expect(blank.statusCode).toBe(400);
     expect(long.statusCode).toBe(400);
+    expect(unknownTarget.statusCode).toBe(404);
+    expect(unknownTarget.json()).toEqual({ code: "REPORT_REJECTED" });
   });
 
   it("issues websocket tickets only for authenticated sessions", async () => {
@@ -347,6 +394,23 @@ describe("REST routes", () => {
     expect(createdBody.inviteUrl).toBe(`https://colonizt.example/?room=${createdBody.code}`);
     expect(byCode.statusCode).toBe(200);
     expect(byCode.json()).toMatchObject({ id: createdBody.id, code: createdBody.code });
+  });
+
+  it("keeps private room codes and chat out of unauthenticated discovery responses", async () => {
+    const manager = new RoomManager();
+    const session = await manager.createSession("Private Host");
+    const room = await manager.createRoom(session, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
+    await manager.addChat(room.id, session, "private lobby message");
+    const app = await buildServer({ manager });
+
+    const listed = await app.inject({ method: "GET", url: "/rooms" });
+    const lookup = await app.inject({ method: "GET", url: `/rooms/${room.code}` });
+    await app.close();
+
+    expect(listed.json()).toEqual([]);
+    expect(lookup.statusCode).toBe(200);
+    expect(lookup.json()).toMatchObject({ id: room.id, code: room.code });
+    expect(lookup.json()).not.toHaveProperty("chat");
   });
 
   it("creates room-code lobbies with the requested player capacity", async () => {

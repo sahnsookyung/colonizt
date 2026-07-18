@@ -5,7 +5,7 @@ export interface TurnDeadline {
   key: string;
   dueAt: number;
   durationMs: number;
-  mode: "roll" | "action" | "discard" | "thief";
+  mode: "roll" | "action" | "discard" | "thief" | "setup";
 }
 
 export interface UseTurnTimerOptions {
@@ -54,7 +54,9 @@ export const useTurnTimer = ({
           ? "discard"
           : state.phase.type === "MOVING_THIEF"
             ? "thief"
-            : null;
+            : state.phase.type === "SETUP_PLACEMENT"
+              ? "setup"
+              : null;
     if (!phaseMode || !activePlayer || paused || state.phase.type === "GAME_OVER") {
       setTurnDeadline(null);
       return undefined;
@@ -63,8 +65,11 @@ export const useTurnTimer = ({
     const durationMs = phaseMode === "roll" ? rollDeadlineMs : actionDeadlineMs;
     const key = turnDeadlineKey(state, activePlayer);
     const now = Date.now();
-    const serverDueAt = networkRoomId && serverTimer?.activePlayerId === activePlayer ? serverTimer.expiresAt : undefined;
-    const dueAt = serverDueAt ?? now + durationMs;
+    if (networkRoomId && (!serverTimer || serverTimer.activePlayerId !== activePlayer)) {
+      setTurnDeadline(null);
+      return undefined;
+    }
+    const dueAt = networkRoomId ? serverTimer!.expiresAt : now + durationMs;
     setNowMs(now);
     setTurnDeadline((current) => current?.key === key && current.dueAt === dueAt ? current : { key, dueAt, durationMs, mode: phaseMode });
 

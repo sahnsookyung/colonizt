@@ -1,3 +1,18 @@
+const terminalOnlineCodes = new Set([
+  "UNAUTHORIZED",
+  "ROOM_NOT_FOUND",
+  "ROOM_EXPIRED",
+  "ROOM_ABANDONED",
+  "ROOM_CLOSED",
+  "ROOM_FULL",
+  "ROOM_ALREADY_STARTED",
+]);
+
+export const isTerminalOnlineError = (input: unknown): boolean => {
+  const code = typeof input === "object" && input && "code" in input ? String((input as { code?: unknown }).code) : "";
+  return terminalOnlineCodes.has(code);
+};
+
 export const networkErrorMessage = (input: unknown): string => {
   const code = typeof input === "object" && input && "code" in input ? String((input as { code?: unknown }).code) : "";
   switch (code) {
@@ -11,6 +26,8 @@ export const networkErrorMessage = (input: unknown): string => {
       return "Room closed";
     case "ROOM_FULL":
       return "Room is full";
+    case "ROOM_SWITCH_ACTIVE_GAME":
+      return "Finish your active game before joining another room";
     case "ROOM_PAUSED":
       return "Room is paused";
     case "REPLAY_NOT_READY":

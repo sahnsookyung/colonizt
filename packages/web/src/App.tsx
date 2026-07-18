@@ -78,7 +78,7 @@ import {
 import { boardBounds, firstStealTarget, roadBuildingCandidateEdgesFor } from "./board-interactions.js";
 import { defaultMatchOptions, mapPresetLabels, onlineRoomCapacityText, toPlayerCount, type MatchOptions } from "./match-options.js";
 import { createNetworkClient } from "./network.js";
-import { networkErrorMessage } from "./network-errors.js";
+import { isTerminalOnlineError, networkErrorMessage } from "./network-errors.js";
 import { canSubmitDiscardDraft, incrementDiscardDraft } from "./discard-policy.js";
 import { buildUnavailableReason, selectActionHint, type BuildMode } from "./game-guidance.js";
 import { clearResumeState, readResumeState, writeResumeState } from "./resume.js";
@@ -190,6 +190,7 @@ export const App = () => {
   const networkRoomInfoRef = useSyncedRef(networkRoomInfo);
   const initialOnlineConnectRef = useRef(false);
   const networkGenerationRef = useRef(0);
+  const networkJoinTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hydratedFinishedReplayRef = useRef<string | null>(null);
   const soundCursorRef = useRef<{ matchId: string; seq: number; initialized: boolean }>({ matchId: liveState.config.matchId, seq: 0, initialized: false });
 
@@ -479,6 +480,11 @@ export const App = () => {
       track("network_command_sent", { mode: "network", platform: platform(), command: command.type, latencyMs: performance.now() - started });
       return;
     }
+    if (networkRoomId) {
+      setNetworkStatus("Waiting for online connection");
+      setError("Online connection is unavailable. Reconnect before taking game actions.");
+      return;
+    }
     const result = applyLocalCommand(command);
     if (result.error) return;
     track("command_applied", { mode: "local", platform: platform(), command: command.type, latencyMs: performance.now() - started });
@@ -527,7 +533,7 @@ export const App = () => {
   const stagedTradeSeconds = stagedTradeDeadline ? Math.max(0, Math.ceil((stagedTradeDeadline - nowMs) / 1000)) : undefined;
   const turnSecondsRemaining = turnDeadline ? Math.max(0, Math.ceil((turnDeadline.dueAt - nowMs) / 1000)) : undefined;
   const turnTimerLabel = turnDeadline && turnSecondsRemaining !== undefined
-    ? `${turnDeadline.mode === "roll" ? "Roll" : turnDeadline.mode === "discard" ? "Discard" : turnDeadline.mode === "thief" ? "Robber" : "Action"} ${formatTimer(turnSecondsRemaining)}`
+    ? `${turnDeadline.mode === "roll" ? "Roll" : turnDeadline.mode === "discard" ? "Discard" : turnDeadline.mode === "thief" ? "Robber" : turnDeadline.mode === "setup" ? "Setup" : "Action"} ${formatTimer(turnSecondsRemaining)}`
     : undefined;
 
   const cancelPendingSetupPlacement = () => {
@@ -613,11 +619,17 @@ export const App = () => {
     }
   };
 
+  const clearNetworkJoinTimeout = () => {
+    if (networkJoinTimeoutRef.current) clearTimeout(networkJoinTimeoutRef.current);
+    networkJoinTimeoutRef.current = null;
+  };
+
   const resetNetworkSession = () => {
     networkGenerationRef.current += 1;
     shouldReconnectRef.current = false;
     resetReconnectState();
     clearPendingCommands();
+    clearNetworkJoinTimeout();
     socketRef.current?.close();
     socketRef.current = null;
     setNetworkSession(null);
@@ -1139,14 +1151,22 @@ export const App = () => {
           openSocket.close();
           return;
         }
-        resetReconnectState();
         socketRef.current = openSocket;
         setNetworkSocketOpen(true);
+        clearNetworkJoinTimeout();
+        networkJoinTimeoutRef.current = setTimeout(() => {
+          if (!isNetworkGeneration(generation)) return;
+          setNetworkStatus("Online join timed out");
+          setError("The server did not confirm the room join. Reconnecting...");
+          openSocket.close(4001, "Room join timeout");
+        }, 10_000);
         openSocket.send(JSON.stringify({ type: "JOIN_ROOM", roomId }));
         if (ready) openSocket.send(JSON.stringify({ type: "READY", roomId, ready: true }));
       },
-      onEvents: (incomingEvents, snapshot) => {
+      onEvents: (incomingEvents, snapshot, timer) => {
         if (!isNetworkGeneration(generation)) return;
+        clearNetworkJoinTimeout();
+        resetReconnectState();
         clearPendingCommands();
         const roomInfo = networkRoomInfoRef.current;
         const canonicalRoomId = roomInfo?.id ?? roomId;
@@ -1175,11 +1195,17 @@ export const App = () => {
           setAppScreen("onlineGame");
           if (projectedState.phase.type === "GAME_OVER") void hydrateFinishedReplayEvents(canonicalRoomId, session, generation);
         }
+        if (timer) {
+          setNetworkRoom((current) => current ? { ...current, timer } : current);
+          setNetworkRoomInfo((current) => current ? { ...current, timer } : current);
+        }
         writeNetworkResume(session, canonicalRoomId, roomInfo?.code ?? (roomId.startsWith("room_") ? undefined : roomId));
         setNetworkStatus(`Online ${roomInfo?.code ?? roomId}`);
       },
       onRoom: (incomingRoom) => {
         if (!isNetworkGeneration(generation)) return;
+        clearNetworkJoinTimeout();
+        resetReconnectState();
         const publicRoom = incomingRoom as PublicRoomPayload;
         setLobbyPending({ ready: false, settings: false, start: false, name: false });
         setNetworkRoom(publicRoom);
@@ -1234,10 +1260,13 @@ export const App = () => {
         if (!isNetworkGeneration(generation)) return;
         clearPendingCommands();
         setLobbyPending({ ready: false, settings: false, start: false, name: false });
-        const code = typeof incomingError === "object" && incomingError && "code" in incomingError ? String((incomingError as { code?: unknown }).code) : "";
-        if (code === "ROOM_EXPIRED" || code === "ROOM_ABANDONED" || code === "ROOM_CLOSED") {
+        if (isTerminalOnlineError(incomingError)) {
+          const message = networkErrorMessage(incomingError);
           resetNetworkSession();
-          setNetworkStatus("Room closed");
+          setAppScreen("setup");
+          setNetworkStatus(message);
+          setError(message);
+          return;
         }
         setError(networkErrorMessage(incomingError));
       },
@@ -1246,6 +1275,7 @@ export const App = () => {
       },
       onClose: () => {
         if (!isNetworkGeneration(generation)) return;
+        clearNetworkJoinTimeout();
         setNetworkSocketOpen(false);
         if (!shouldReconnectRef.current) return;
         setNetworkStatus("Online connection closed");
@@ -1259,6 +1289,15 @@ export const App = () => {
       socketRef.current = socket;
     }).catch((connectError) => {
       if (!isNetworkGeneration(generation)) return;
+      clearNetworkJoinTimeout();
+      if (isTerminalOnlineError(connectError)) {
+        const message = networkErrorMessage(connectError);
+        resetNetworkSession();
+        setAppScreen("setup");
+        setNetworkStatus(message);
+        setError(message);
+        return;
+      }
       setNetworkStatus("Online unavailable");
       setError(networkErrorMessage(connectError));
       if (shouldReconnectRef.current) {
@@ -1350,6 +1389,7 @@ export const App = () => {
     networkGenerationRef.current += 1;
     shouldReconnectRef.current = false;
     resetReconnectState();
+    clearNetworkJoinTimeout();
     socketRef.current?.close();
     setNetworkSocketOpen(false);
   };

@@ -81,6 +81,7 @@ const renderOnlineGame = async (game: GameState, options: { replayResponse?: () 
 
   class FakeWebSocket extends EventTarget {
     static readonly OPEN = 1;
+    static readonly CLOSED = 3;
     readyState = FakeWebSocket.OPEN;
 
     constructor(readonly url: string) {
@@ -98,6 +99,7 @@ const renderOnlineGame = async (game: GameState, options: { replayResponse?: () 
     }
 
     close(): void {
+      this.readyState = FakeWebSocket.CLOSED;
       this.dispatchEvent(new Event("close"));
     }
 
@@ -132,6 +134,7 @@ describe("App", () => {
       "ROOM_ABANDONED",
       "ROOM_CLOSED",
       "ROOM_FULL",
+      "ROOM_SWITCH_ACTIVE_GAME",
       "ROOM_PAUSED",
       "REPLAY_NOT_READY",
       "REPLAY_FORBIDDEN",
@@ -144,6 +147,7 @@ describe("App", () => {
       "Room abandoned",
       "Room closed",
       "Room is full",
+      "Finish your active game before joining another room",
       "Room is paused",
       "Replay is available after the game is finished",
       "Replay is only available to players in this match",
@@ -779,7 +783,7 @@ describe("App", () => {
     expect(screen.getByLabelText("Discard resources")).toBeInTheDocument();
     const discardPanel = screen.getByLabelText("Discard resources");
     expect(within(screen.getByLabelText("Match information and players")).queryByLabelText("Discard resources")).not.toBeInTheDocument();
-    await waitFor(() => expect(within(discardPanel).getByText(/0\/4 · \d+:\d{2}/)).toBeInTheDocument());
+    expect(within(discardPanel).getByText("0/4")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Select Timber to discard" }));
     expect(screen.queryByLabelText("Trade interface")).not.toBeInTheDocument();
     expect(screen.getByText("x1")).toBeInTheDocument();
@@ -1384,6 +1388,21 @@ describe("App", () => {
     expect(await screen.findByText("BAD_JSON")).toBeInTheDocument();
   });
 
+  it("never applies online commands locally while the socket is disconnected", async () => {
+    const game = completeSetup(createDemoGame("online-disconnected-command")).state;
+    game.phase = { type: "WAITING_FOR_ROLL", activePlayerId: "p1" };
+    const { sentMessages, sockets } = await renderOnlineGame(game);
+    const socket = sockets[0];
+    if (!socket) throw new Error("expected online socket");
+
+    act(() => socket.close());
+    fireEvent.click(screen.getByRole("button", { name: "Roll dice" }));
+
+    expect(sentMessages.some((message) => message.type === "COMMAND")).toBe(false);
+    expect(screen.getByText("WAITING FOR ROLL")).toBeInTheDocument();
+    expect(screen.getByText("Online connection is unavailable. Reconnect before taking game actions.")).toBeInTheDocument();
+  });
+
   it("hydrates a finished online replay and closes terminal rooms on server errors", async () => {
     const game = completeSetup(createDemoGame("online-game-over")).state;
     const { sockets } = await renderOnlineGame(game);
@@ -1665,5 +1684,35 @@ describe("App", () => {
     expect(sentMessages).toContainEqual({ type: "JOIN_ROOM", roomId: "RESUME" });
     expect(fetchSpy.mock.calls.some(([input]) => String(input).endsWith("/sessions"))).toBe(false);
     expect(screen.getByText("RESUME")).toBeInTheDocument();
+  });
+
+  it("clears an expired saved session instead of reconnecting forever", async () => {
+    const savedValues = new Map<string, string>();
+    const resumeStorage = {
+      getItem: (key: string) => savedValues.get(key) ?? null,
+      setItem: (key: string, value: string) => savedValues.set(key, value),
+      removeItem: (key: string) => savedValues.delete(key),
+    };
+    vi.stubGlobal("localStorage", resumeStorage);
+    writeResumeState(
+      { token: "s_expired", userId: "u_expired", roomId: "room_expired", roomCode: "EXPIRE", clientSeq: 4, lastSeq: 2 },
+      resumeStorage,
+    );
+    let ticketRequests = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith("/ws-tickets")) {
+        ticketRequests += 1;
+        return new Response(JSON.stringify({ code: "UNAUTHORIZED" }), { status: 401 });
+      }
+      return new Response("unexpected", { status: 500 });
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByLabelText("Match setup")).toBeInTheDocument();
+    expect(screen.getByText("Session expired")).toBeInTheDocument();
+    expect(resumeStorage.getItem("colonizt.resume")).toBeNull();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(ticketRequests).toBe(1);
   });
 });

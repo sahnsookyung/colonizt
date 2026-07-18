@@ -1,6 +1,12 @@
 import type { GameState, PlayerId } from "@colonizt/game-core";
 import type { Room, RoomLivenessState } from "./room-manager.js";
 
+export const rollTurnDurationMs = 60_000;
+export const actionTurnDurationMs = 240_000;
+
+export const roomTurnDurationMs = (state: GameState): number =>
+  state.phase.type === "WAITING_FOR_ROLL" ? rollTurnDurationMs : actionTurnDurationMs;
+
 export const connectedSeatedHumanCount = (room: Pick<Room, "seats">): number =>
   room.seats.filter((seat) => seat.userId && seat.connected).length;
 

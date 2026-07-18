@@ -13,6 +13,7 @@ import {
   createGame,
   createSeededBoard,
   emptyResources,
+  eligibleStealTargets,
   getLegalActions,
   maritimeTradeRatio,
   maxRoadsPerPlayer,
@@ -967,6 +968,25 @@ describe("serialization and replay", () => {
     expect(serializeForViewer(state, "unknown-viewer").trades[0]?.offered).toEqual(emptyResources());
   });
 
+  it("redacts submitted discard bundles from other players and spectators", () => {
+    const state = withResources(completeSetup(createDemoGame("discard-viewer-redaction")).state, "p2", { timber: 3, ore: 1 });
+    state.phase = {
+      type: "DISCARDING",
+      activePlayerId: "p3",
+      rollerId: "p1",
+      pending: { p2: 4, p3: 2 },
+      submitted: { p2: { timber: 3, ore: 1 } },
+    };
+
+    const ownPhase = serializeForViewer(state, "p2").phase;
+    const opponentPhase = serializeForViewer(state, "p3").phase;
+    const spectatorPhase = serializeForViewer(state, "spectator").phase;
+
+    expect(ownPhase.type === "DISCARDING" ? ownPhase.submitted.p2 : undefined).toEqual({ timber: 3, ore: 1 });
+    expect(opponentPhase.type === "DISCARDING" ? opponentPhase.submitted.p2 : undefined).toEqual({});
+    expect(spectatorPhase.type === "DISCARDING" ? spectatorPhase.submitted.p2 : undefined).toEqual({});
+  });
+
   it("redacts open ANY trade events for viewers outside the game", () => {
     const tradeEvent = {
       schemaVersion: 1 as const,
@@ -1162,9 +1182,30 @@ describe("development cards, thief, and adjudication", () => {
     expect(discarded.state.phase).toMatchObject({ type: "MOVING_THIEF", activePlayerId: "p1" });
 
     const hexId = Object.keys(discarded.state.board.hexes).find((candidate) => candidate !== discarded.state.thiefHexId) as string;
-    const moved = applyOrThrow(discarded.state, { type: "MOVE_THIEF", playerId: "p1", hexId });
+    const stealFromPlayerId = eligibleStealTargets(discarded.state, "p1", hexId)[0];
+    const moved = applyOrThrow(discarded.state, {
+      type: "MOVE_THIEF",
+      playerId: "p1",
+      hexId,
+      ...(stealFromPlayerId ? { stealFromPlayerId } : {}),
+    });
     expect(moved.state.thiefHexId).toBe(hexId);
     expect(moved.state.phase).toMatchObject({ type: "ACTION_PHASE", activePlayerId: "p1" });
+  });
+
+  it("requires a thief target whenever an eligible player can be robbed", () => {
+    let state = completeSetup(createDemoGame("mandatory-thief-target")).state;
+    state = withResources(state, "p2", { timber: 1 });
+    state.phase = { type: "MOVING_THIEF", activePlayerId: "p1", rollerId: "p1", reason: "ROLL_7" };
+    const hexId = Object.keys(state.board.hexes).find((candidate) =>
+      candidate !== state.thiefHexId && eligibleStealTargets(state, "p1", candidate).includes("p2"),
+    ) as HexId | undefined;
+    expect(hexId).toBeDefined();
+    if (!hexId) throw new Error("Expected a thief destination adjacent to p2");
+
+    expectReject(state, { type: "MOVE_THIEF", playerId: "p1", hexId }, "INVALID_THIEF_MOVE");
+    expect(applyOrThrow(state, { type: "MOVE_THIEF", playerId: "p1", hexId, stealFromPlayerId: "p2" }).events)
+      .toContainEqual(expect.objectContaining({ type: "THIEF_MOVED", stealFromPlayerId: "p2", stolenResource: expect.any(String) }));
   });
 
   it("creates seeded random forced discard bundles", () => {

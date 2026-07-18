@@ -182,13 +182,14 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     request: { headers: Record<string, unknown>; protocol?: string; hostname?: string } | undefined,
     room: Room,
     viewerId: Session["userId"] | "spectator" = "spectator",
+    includeChat = viewerId !== "spectator",
   ) => ({
-    ...manager.publicRoom(room, viewerId),
+    ...manager.publicRoom(room, viewerId, includeChat),
     inviteUrl: roomInviteUrl(request, room),
   });
 
   const broadcastRoomState = (room: Room): void => {
-    broadcastRoom(room.id, (target) => ({ type: "ROOM_STATE", room: publicRoomWithInvite(undefined, room, viewerIdFor(target)) }));
+    broadcastRoom(room.id, (target) => ({ type: "ROOM_STATE", room: publicRoomWithInvite(undefined, room, viewerIdFor(target), true) }));
   };
 
   const closeRoomClients = (roomId: string, code: string, message: string): void => {
@@ -214,6 +215,7 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
         roomId,
         events: serializeEventsForViewer(result.events, viewerIdFor(target), result.state.playerOrder, result.state.phase.type === "GAME_OVER"),
         snapshot: snapshotFor(roomId, result.state, target),
+        timer: manager.roomForRef(roomId)?.timer,
       }));
     },
     onAutomationRejected: (roomId, result) => {
@@ -252,13 +254,19 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
   }, presenceSweepIntervalMs);
   presenceSweepTimer.unref?.();
 
-  const sweepTransientState = (): void => {
+  const sweepTransientState = async (): Promise<void> => {
     wsTickets.sweep();
     rateLimitBuckets.sweep();
     socketRegistry.sweepEmptyRooms();
+    await manager.sweepExpiredSessions();
   };
 
-  const transientSweepTimer = setInterval(sweepTransientState, Math.max(30_000, Math.min(wsTicketTtlMs, 60_000)));
+  const transientSweepTimer = setInterval(() => {
+    void sweepTransientState().catch((error) => {
+      metrics.recordDbFailure("session_sweep");
+      logger.error("session.sweep_failed", { message: error instanceof Error ? error.message : String(error) });
+    });
+  }, Math.max(30_000, Math.min(wsTicketTtlMs, 60_000)));
   transientSweepTimer.unref?.();
 
   app.addHook("onRequest", (request, _reply, done) => {
@@ -348,8 +356,6 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
     }
     const client: SocketClient = { socket, session };
     const socketId = `sock_${nanoid(10)}`;
-    const commandTimes: number[] = [];
-    const chatTimes: number[] = [];
     let transitionTail = Promise.resolve();
     const enqueueConnectionTransition = (operation: () => void | Promise<void>): void => {
       transitionTail = transitionTail.then(operation).catch((error) => {
@@ -436,8 +442,6 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
         presence,
         metrics,
         logger,
-        commandTimes,
-        chatTimes,
         withinNamedLimit,
         attachClientToRoom: (roomId) => attachClientToRoom(client, roomId),
         detachClientFromRoom: (roomId) => detachClientFromRoom(client, roomId),
@@ -448,6 +452,7 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
             roomId,
             events: serializeEventsForViewer(result.events, viewerIdFor(target), result.state.playerOrder, result.state.phase.type === "GAME_OVER"),
             snapshot: snapshotFor(roomId, result.state, target),
+            timer: manager.roomForRef(roomId)?.timer,
           }));
         },
         broadcastChat: (roomId, chat) => broadcastRoom(roomId, () => ({ type: "CHAT", roomId, chat })),
