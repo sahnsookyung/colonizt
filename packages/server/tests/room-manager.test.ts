@@ -655,6 +655,26 @@ describe("RoomManager", () => {
     expect(room.seats.filter((seat) => seat.userId === host.userId)).toHaveLength(1);
   });
 
+  it("orders opposite two-room switches consistently without deadlocking", async () => {
+    const manager = new RoomManager();
+    const firstHost = await manager.createSession("First Host");
+    const secondHost = await manager.createSession("Second Host");
+    const firstRoom = await manager.createRoom(firstHost, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
+    const secondRoom = await manager.createRoom(secondHost, { mode: "CLASSIC", botFill: false, ranked: false, minPlayers: 2 });
+
+    const [firstSwitch, secondSwitch] = await Promise.all([
+      manager.switchRoom(firstRoom.id, secondRoom.id, firstHost),
+      manager.switchRoom(secondRoom.id, firstRoom.id, secondHost),
+    ]);
+
+    expect(firstSwitch).toMatchObject({ ok: true, room: { id: secondRoom.id }, previousRoom: { id: firstRoom.id } });
+    expect(secondSwitch).toMatchObject({ ok: true, room: { id: firstRoom.id }, previousRoom: { id: secondRoom.id } });
+    expect(firstRoom.seats.some((seat) => seat.userId === secondHost.userId)).toBe(true);
+    expect(firstRoom.seats.some((seat) => seat.userId === firstHost.userId)).toBe(false);
+    expect(secondRoom.seats.some((seat) => seat.userId === firstHost.userId)).toBe(true);
+    expect(secondRoom.seats.some((seat) => seat.userId === secondHost.userId)).toBe(false);
+  });
+
   it("does not let an explicit socket leave bypass the retained active-game seat guard", async () => {
     const manager = new RoomManager();
     const player = await manager.createSession("Active Player");

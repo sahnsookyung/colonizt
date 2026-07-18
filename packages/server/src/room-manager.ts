@@ -1489,7 +1489,7 @@ export class RoomManager {
   }
 
   private async enqueueRooms<T>(roomIds: readonly string[], task: () => Promise<T>): Promise<T> {
-    const sortedRoomIds = [...new Set(roomIds)].sort();
+    const sortedRoomIds = [...new Set(roomIds)].sort((left, right) => left.localeCompare(right, "en"));
     const acquire = (index: number): Promise<T> => index >= sortedRoomIds.length
       ? task()
       : this.enqueueRoom(sortedRoomIds[index]!, () => acquire(index + 1));
