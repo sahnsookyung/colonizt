@@ -17,11 +17,11 @@
     "@colonizt/db": "0.1.0",
     "@colonizt/game-core": "0.1.0",
     "@colonizt/protocol": "0.1.0",
-    "fastify": "^5.6.2",
-    "@fastify/cors": "^11.1.0",
-    "@fastify/websocket": "^11.2.0",
-    "nanoid": "^5.1.6",
-    "redis": "^5.12.1",
+    "fastify": "^5.10.0",
+    "@fastify/cors": "^11.3.0",
+    "@fastify/websocket": "^11.3.0",
+    "nanoid": "^6.0.0",
+    "redis": "^6.1.0",
     "zod": "^4.2.0"
   }
 }
