@@ -15,11 +15,11 @@
     "@colonizt/demo-state": "0.1.0",
     "@colonizt/game-core": "0.1.0",
     "@colonizt/protocol": "0.1.0",
-    "react": "^19.2.1",
-    "react-dom": "^19.2.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
     "zod": "^4.2.0"
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "^5.1.1"
+    "@vitejs/plugin-react": "^6.0.4"
   }
 }
