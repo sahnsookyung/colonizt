@@ -63,6 +63,53 @@ describe("websocket sliding-window limiter", () => {
 });
 
 describe("websocket message delivery boundaries", () => {
+  it.each([
+    { type: "LEAVE_ROOM", method: "leaveRoom", fields: {} },
+    { type: "READY", method: "setReady", fields: { ready: true } },
+    { type: "START_ROOM", method: "startRoomByHost", fields: {} },
+    { type: "ADD_BOT", method: "addLobbyBot", fields: {} },
+    { type: "REMOVE_BOT", method: "removeLobbyBot", fields: { seatIndex: 1 } },
+    { type: "UPDATE_ROOM_SETTINGS", method: "updateRoomSettings", fields: { settings: { maxPlayers: 4 } } },
+    { type: "UPDATE_DISPLAY_NAME", method: "updateDisplayName", fields: { displayName: "New Name" } },
+    { type: "RESYNC", method: "resync", fields: { lastSeq: 0 } },
+  ] as const)("rejects $type before room logic when the shared control budget is exhausted", async ({ type, method, fields }) => {
+    const manager = new RoomManager();
+    const session = await manager.createSession("Limited Player");
+    const operation = vi.spyOn(manager, method);
+    const { client, send } = socketClient(session);
+    client.roomId = "room-a";
+    const withinNamedLimit = vi.fn(() => false);
+    const context = messageContext(manager, client, [], { withinNamedLimit });
+
+    await handleWebSocketMessage(
+      { toString: () => JSON.stringify({ type, roomId: "room-a", ...fields }) },
+      context,
+      1_234,
+    );
+
+    expect(withinNamedLimit).toHaveBeenCalledWith(`session:${session.userId}:room-control`, 60, 10_000, 1_234);
+    expect(send).toHaveBeenCalledExactlyOnceWith(JSON.stringify({ type: "ERROR", code: "RATE_LIMITED", message: "Too many room actions" }));
+    expect(operation).not.toHaveBeenCalled();
+    expect(context.broadcastRoomState).not.toHaveBeenCalled();
+    expect(client.roomId).toBe("room-a");
+  });
+
+  it("closes oversized UTF-8 frames before parsing or executing room actions", async () => {
+    const manager = new RoomManager();
+    const session = await manager.createSession("Player");
+    const { client, send } = socketClient(session);
+    const context = messageContext(manager, client, []);
+    const rawText = JSON.stringify({ type: "UPDATE_DISPLAY_NAME", displayName: "🙂".repeat(8_000) });
+    expect(rawText.length).toBeLessThan(32_000);
+    expect(Buffer.byteLength(rawText)).toBeGreaterThan(32_000);
+
+    await handleWebSocketMessage({ toString: () => rawText }, context);
+
+    expect(client.socket.close).toHaveBeenCalledExactlyOnceWith(1009, "Message too large");
+    expect(send).not.toHaveBeenCalled();
+    expect(session.displayName).toBe("Player");
+  });
+
   it("uses message receipt time when applying a deferred join limit", async () => {
     const manager = new RoomManager();
     const session = await manager.createSession("Limited Player");

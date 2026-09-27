@@ -30,7 +30,7 @@ This project is a portfolio and interview-preparation codebase. It does not copy
 
 Prerequisites:
 
-- Node.js 22+
+- Node.js 22.22.2 or newer in the Node 22 LTS line (matching CI)
 - npm 11+
 - Docker, if you want PostgreSQL/Redis locally
 
