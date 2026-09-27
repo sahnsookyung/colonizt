@@ -17,7 +17,6 @@ import {
   loadReplayLog,
   loadReplayLogByRoomId,
   markMatchFinished,
-  maxRoomChatMessages as persistedRoomChatLimit,
   persistedRoomCodeExists,
   saveMatchSnapshot,
   upsertCommandResult,
@@ -34,7 +33,7 @@ import { hashSessionToken } from "./security.js";
 import { validateStoredCommandResult, validateStoredRoomRecord } from "./store-validation.js";
 
 const snapshotIntervalEvents = 25;
-export const maxRoomChatMessages = persistedRoomChatLimit;
+export { maxRoomChatMessages } from "@colonizt/db";
 const shouldSnapshot = (state: GameState, events: readonly GameEvent[] = []): boolean =>
   state.eventSeq > 0 && (state.phase.type === "GAME_OVER" || events.some((event) => event.seq % snapshotIntervalEvents === 0));
 

@@ -92,6 +92,23 @@ const harness = () => {
   };
   return { controller, client, callbacks, connections, start, open };
 };
+
+it.each([
+  { sample: 0, delay: 750 },
+  { sample: 0xffff_ffff, delay: 999 },
+])("keeps reconnect jitter within the backoff window for random sample $sample", async ({ sample, delay }) => {
+  vi.spyOn(crypto, "getRandomValues").mockReturnValue(new Uint32Array([sample]));
+  const h = harness();
+  h.start();
+  h.open().handlers.onClose?.();
+
+  expect(h.controller.getSnapshot()).toMatchObject({ state: "retrying", retryAt: 100_000 + delay });
+  await vi.advanceTimersByTimeAsync(delay - 1);
+  expect(h.client.connect).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(h.client.connect).toHaveBeenCalledTimes(2);
+});
+
 describe("authoritative stream reconciliation", () => {
   it("deduplicates overlaps and rejects holes anywhere in a batch", () => {
     expect(
@@ -376,7 +393,7 @@ describe("session recovery", () => {
     expect(h.client.sendCommand).toHaveBeenCalledTimes(1);
   });
   it("backs off to a bounded pause and supports an explicit retry", async () => {
-    vi.spyOn(Math, "random").mockReturnValue(0);
+    vi.spyOn(crypto, "getRandomValues").mockReturnValue(new Uint32Array([0]));
     const h = harness();
     h.start();
     for (let attempt = 0; attempt < 8; attempt++) {

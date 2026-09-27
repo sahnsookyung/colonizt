@@ -188,12 +188,11 @@ export const runConcurrentBotRooms = async (): Promise<ConcurrentBotRoomSummary>
 };
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  runConcurrentBotRooms()
-    .then((summary) => {
-      console.log(JSON.stringify(summary, null, 2));
-    })
-    .catch((error) => {
-      console.error(error);
-      process.exitCode = 1;
-    });
+  try {
+    const summary = await runConcurrentBotRooms();
+    console.log(JSON.stringify(summary, null, 2));
+  } catch (error) {
+    console.error(error);
+    process.exitCode = 1;
+  }
 }

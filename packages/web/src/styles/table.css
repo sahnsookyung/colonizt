@@ -54,6 +54,7 @@
   gap: 9px;
   grid-column: 2;
   min-width: 0;
+  min-height: 20px;
 }
 .stat-chip {
   display: inline-flex;
@@ -182,6 +183,9 @@
   align-items: center;
 }
 .board-viewport {
+  /* Camera controls have their own strip so they cannot cover coastal targets. */
+  display: flex;
+  flex-direction: column;
   grid-area: board;
   position: relative;
   align-self: stretch;
@@ -193,8 +197,10 @@
 }
 .board {
   display: block;
+  flex: 1 1 0;
   width: 100%;
-  height: 100%;
+  height: 0;
+  min-height: 0;
   touch-action: none;
   user-select: none;
   -webkit-user-select: none;
@@ -370,7 +376,11 @@
   fill: #e9c572;
 }
 .board-camera-controls {
-  position: absolute;
+  position: static;
+  flex: 0 0 44px;
+  align-self: flex-end;
+  margin: 6px 12px;
+  justify-content: flex-end;
   right: 12px;
   bottom: 12px;
   display: flex;
@@ -537,6 +547,7 @@
   font-family: Georgia, serif;
   font-size: 22px;
   font-weight: 700;
+  animation: resource-arrival 180ms ease-out;
 }
 .resource-name {
   grid-column: 1/-1;
@@ -613,6 +624,7 @@
   display: flex;
   gap: 6px;
   align-items: stretch;
+  background: var(--water);
 }
 .board-action {
   position: relative;
@@ -642,7 +654,9 @@
   font-size: 9px;
 }
 .board-action .action-cost-icons {
-  display: none;
+  display: flex;
+  gap: 2px;
+  min-height: 12px;
 }
 .board-action:not(:disabled).selected {
   background: #e7c57f;
@@ -915,6 +929,7 @@
   }
   .resource-hand {
     gap: 6px;
+    margin-inline: auto;
   }
   .resource-count {
     font-size: 20px;
@@ -928,9 +943,6 @@
     gap: 10px;
     max-width: 100%;
     padding: 0 2px;
-  }
-  .resource-hand {
-    margin-inline: auto;
   }
   .board-action-bar {
     gap: 4px;
@@ -1130,25 +1142,9 @@
   overflow: hidden;
   white-space: nowrap;
 }
-.game-log-panel li {
-  align-items: flex-start;
-  overflow-wrap: anywhere;
-}
-
-.board-action-bar {
-  background: var(--water);
-}
-.board-action .action-cost-icons {
-  display: flex;
-  gap: 2px;
-  min-height: 12px;
-}
 .action-cost-icons .resource-icon {
   width: 12px;
   height: 12px;
-}
-.player-stats {
-  min-height: 20px;
 }
 @media (max-width: 1000px) {
   .board-stage {
@@ -1210,9 +1206,6 @@
   }
 }
 
-.resource-count {
-  animation: resource-arrival 180ms ease-out;
-}
 @keyframes resource-arrival {
   from {
     transform: translateY(-3px);
@@ -1229,8 +1222,4 @@
   color: var(--ink);
 }
 
-/* Camera controls have their own strip so they cannot cover coastal targets. */
-.board-viewport { display:flex; flex-direction:column }
-.board { flex:1 1 0; height:0; min-height:0 }
-.board-camera-controls { position:static; flex:0 0 44px; align-self:flex-end; margin:6px 12px; justify-content:flex-end }
 .dice-panel:disabled { opacity:1; background:#d8e3d6; color:var(--ink) }

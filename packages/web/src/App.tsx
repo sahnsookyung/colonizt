@@ -137,8 +137,6 @@ export const App = () => {
   const [events, setEvents] = useState<GameEvent[]>([]);
   const [serverViewer, setServerViewer] = useState<ViewerState | null>(null);
   const [appScreen, setAppScreen] = useState<AppScreen>("setup");
-  const [, setSelectedEdge] = useState<EdgeId | null>(null);
-  const [, setSelectedVertex] = useState<VertexId | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [joinCode, setJoinCode] = useState("");
   const [shareOpen, setShareOpen] = useState(false);
@@ -375,13 +373,9 @@ export const App = () => {
   useEffect(() => {
     if (state.phase.type !== "ACTION_PHASE") return;
     if (buildMode === "city" && !canUpgradeCity) {
-      setSelectedVertex(null);
       setBuildMode(canBuildRoadAction ? "road" : canBuildSettlement ? "settlement" : "road");
     } else if (buildMode === "settlement" && !canBuildSettlement) {
-      setSelectedVertex(null);
       setBuildMode(canBuildRoadAction ? "road" : canUpgradeCity ? "city" : "road");
-    } else if (buildMode === "road" && !canBuildRoadAction) {
-      setSelectedEdge(null);
     }
   }, [buildMode, canBuildRoadAction, canBuildSettlement, canUpgradeCity, state.phase.type]);
 
@@ -526,8 +520,6 @@ export const App = () => {
 
   const cancelPendingSetupPlacement = () => {
     setPendingSetupVertex(null);
-    setSelectedVertex(null);
-    setSelectedEdge(null);
   };
 
   const handleBoardClick = () => {
@@ -536,8 +528,6 @@ export const App = () => {
   };
 
   const handleVertex = (vertexId: VertexId) => {
-    setSelectedVertex(vertexId);
-    setSelectedEdge(null);
     const started = performance.now();
     if (state.phase.type === "SETUP_PLACEMENT" && activePlayer === humanPlayerId) {
       if (pendingSetupVertex) {
@@ -548,7 +538,6 @@ export const App = () => {
       if (setupVertices.has(vertexId)) {
         playSound("select");
         setPendingSetupVertex(vertexId);
-        setSelectedEdge(null);
         setBuildMode("road");
       }
     } else if (state.phase.type === "ACTION_PHASE" && buildMode === "settlement" && legalSettlements.has(vertexId)) {
@@ -562,7 +551,6 @@ export const App = () => {
   };
 
   const handleEdge = (edgeId: EdgeId) => {
-    setSelectedEdge(edgeId);
     if (activeRoadBuildingCardId && (legalRoads.has(edgeId) || roadBuildingSelectedEdges.includes(edgeId))) {
       selectRoadBuildingEdge(activeRoadBuildingCardId, edgeId);
     } else if (state.phase.type === "SETUP_PLACEMENT" && pendingSetupVertex && legalRoads.has(edgeId)) {
@@ -629,8 +617,6 @@ export const App = () => {
     setServerViewer(null);
     setEvents([]);
     setPendingSetupVertex(null);
-    setSelectedEdge(null);
-    setSelectedVertex(null);
     setBuildMode("road");
     setTradeOffer(emptyResources());
     setTradeRequest(emptyResources());
@@ -759,8 +745,8 @@ export const App = () => {
         : { config: liveState.config, board: liveState.board, events };
       replayController.start(log);
       setNetworkStatus("Replay");
-    } catch (input) {
-      setError(networkErrorMessage(input));
+    } catch (error_) {
+      setError(networkErrorMessage(error_));
     }
   };
 
@@ -789,7 +775,6 @@ export const App = () => {
     setRobberTargetHexId(null);
     setBuildMode("road");
     setTradeOpen(false);
-    setSelectedEdge(null);
   };
   const playRoadBuildingWithEdges = (cardId: string, selected: EdgeId[]) => {
     if (selected.length !== roadBuildingRequiredCount || !selected[0]) return;
@@ -923,8 +908,6 @@ export const App = () => {
     setRobberTargetHexId(null);
     setBuildMode(mode);
     setTradeOpen(false);
-    if (mode !== "road") setSelectedEdge(null);
-    if (mode !== "settlement" && mode !== "city") setSelectedVertex(null);
   };
   const isDevelopmentCardPlayable = (card: DevelopmentCard): boolean => {
     if (card.type === "VICTORY_POINT") return false;

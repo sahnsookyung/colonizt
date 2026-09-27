@@ -20,6 +20,7 @@ const terrainCell = {
   desert: [2, 1],
 } as const;
 const crests = ["◆", "●", "▲", "✦", "■", "✚", "◇", "○"];
+type BoardSelectionKind = "edge" | "vertex" | "hex";
 export const playerCrest = (
   state: Pick<GameState, "playerOrder">,
   id: PlayerId,
@@ -65,7 +66,7 @@ export const GameBoard = ({
     state.config.matchId,
   );
   const [selection, setSelection] = useState<{
-    kind: "edge" | "vertex" | "hex";
+    kind: BoardSelectionKind;
     id: string;
   } | null>(null);
   useEffect(() => setSelection(null), [state.eventSeq, state.config.matchId]);
@@ -87,10 +88,10 @@ export const GameBoard = ({
         : legalThiefHexes.has(selection.id))
       ? selection
       : null;
-  const select = (kind: "edge" | "vertex" | "hex", id: string) => {
+  const select = (kind: BoardSelectionKind, id: string) => {
     if (!disabled) setSelection({ kind, id });
   };
-  const selectFromPointer = (event: MouseEvent<SVGGElement>, kind: "edge" | "vertex" | "hex", fallback: string) => {
+  const selectFromPointer = (event: MouseEvent<SVGGElement>, kind: BoardSelectionKind, fallback: string) => {
     event.stopPropagation();
     const transform = event.currentTarget.getScreenCTM?.();
     if (!event.detail || !transform) { select(kind, fallback); return; }
@@ -119,7 +120,7 @@ export const GameBoard = ({
   };
   const activate = (
     event: KeyboardEvent<SVGGElement>,
-    kind: "edge" | "vertex" | "hex",
+    kind: BoardSelectionKind,
     id: string,
   ) => {
     if (event.key === "Enter" || event.key === " ") {
@@ -149,6 +150,8 @@ export const GameBoard = ({
   return (
     <div
       className="board-viewport"
+      role="group"
+      aria-label="Game board controls"
       onKeyDown={(event) => {
         if (event.key === "Escape") cancel();
       }}

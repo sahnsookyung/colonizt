@@ -533,12 +533,12 @@ export class RoomManager {
   async joinRoom(roomId: string, session: Session, asSpectator = false): Promise<{ ok: true; room: Room } | { ok: false; code: string; message: string }> {
     const targetRoom = await this.ensureRoomLoadedByRef(roomId);
     if (!targetRoom) return { ok: false, code: "ROOM_NOT_FOUND", message: "Room not found" };
-    const retainedActiveRoom = [...this.rooms.values()].find((room) =>
+    const hasRetainedActiveRoom = [...this.rooms.values()].some((room) =>
       room.id !== targetRoom.id
       && room.status === "IN_GAME"
       && room.seats.some((seat) => seat.userId === session.userId),
     );
-    if (retainedActiveRoom) {
+    if (hasRetainedActiveRoom) {
       return { ok: false, code: "ROOM_SWITCH_ACTIVE_GAME", message: "You cannot join another room while seated in an active game" };
     }
     return this.enqueueRoom(targetRoom.id, () => this.joinRoomNow(targetRoom, session, asSpectator));
@@ -613,8 +613,8 @@ export class RoomManager {
       if (previousRoom.archivedAt || previousRoom.status === "EXPIRED" || previousRoom.status === "ABANDONED") {
         return { ok: false, code: "ROOM_SWITCH_FAILED", message: "Previous room is closed" };
       }
-      const retainedSeat = previousRoom.seats.find((seat) => seat.userId === session.userId);
-      if (retainedSeat && previousRoom.status !== "LOBBY") {
+      const hasRetainedSeat = previousRoom.seats.some((seat) => seat.userId === session.userId);
+      if (hasRetainedSeat && previousRoom.status !== "LOBBY") {
         return { ok: false, code: "ROOM_SWITCH_ACTIVE_GAME", message: "You cannot join another room while seated in an active game" };
       }
       if (!await this.claimRoom(previousRoom) || !await this.claimRoom(destinationRoom)) {

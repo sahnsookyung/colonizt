@@ -136,8 +136,11 @@ describe("bounded transport recovery", () => {
     vi.stubGlobal("WebSocket", Socket);
     const client = createNetworkClient("https://version.example");
     const handlers = { onEvents: vi.fn(), onRoom: vi.fn(), onError: vi.fn() };
-    await expect(client.connect("session", handlers)).rejects.toMatchObject({
+    const incompatibleConnection = client.connect("session", handlers);
+    await expect(incompatibleConnection).rejects.toBeInstanceOf(Error);
+    await expect(incompatibleConnection).rejects.toMatchObject({
       code: "PROTOCOL_MISMATCH",
+      message: "The game server needs an update. Please try again shortly.",
     });
     version = 4;
     const socket = await client.connect("session", handlers);
