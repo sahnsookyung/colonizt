@@ -228,6 +228,15 @@ test("discard selection is reachable inside its dialog", async ({
   await expect(
     page.getByRole("button", { name: "Discard", exact: true }),
   ).toBeEnabled();
+  const timberCard = page.getByRole("button", { name: "Select Timber to discard" });
+  await expect(timberCard).toBeDisabled();
+  await timberCard.focus();
+  await page.keyboard.press("Tab");
+  await page.keyboard.press("Shift+Tab");
+  await expect(timberCard).toBeFocused();
+  await page.keyboard.press("Enter");
+  await page.keyboard.press("Space");
+  await expect(timberCard.locator(".resource-selected-count")).toHaveText("x4");
   await record(page, info, "discard");
   await accessible(page);
 });

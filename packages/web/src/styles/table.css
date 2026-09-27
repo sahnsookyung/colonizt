@@ -574,6 +574,10 @@
   background: #fff1c8;
   color: var(--ink);
 }
+.resource-card-button[aria-disabled="true"] {
+  opacity: 0.48;
+  cursor: default;
+}
 .resource-selected-count,
 .dev-card-count,
 .trade-selected {

@@ -40,10 +40,10 @@ button {
   cursor: pointer;
   transition: transform 120ms;
 }
-button:hover:not(:disabled) {
+button:hover:not(:disabled):not([aria-disabled="true"]) {
   background: #ede5d0;
 }
-button:active:not(:disabled) {
+button:active:not(:disabled):not([aria-disabled="true"]) {
   transform: translateY(1px);
 }
 button:disabled {
@@ -59,7 +59,7 @@ button[aria-pressed="true"],
   border-color: var(--forest);
   color: #fffaf0;
 }
-button.selected:hover:not(:disabled),
+button.selected:hover:not(:disabled):not([aria-disabled="true"]),
 .primary-button:hover:not(:disabled),
 .primary-wide:hover:not(:disabled) {
   background: #254836;
