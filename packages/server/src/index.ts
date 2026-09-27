@@ -15,7 +15,7 @@ import { handleWebSocketMessage, type SocketClient } from "./websocket-transport
 import { RateLimitBuckets } from "./rate-limits.js";
 import { SocketRegistry } from "./socket-registry.js";
 import { WebSocketTicketStore } from "./websocket-tickets.js";
-import { configuredSecret, externalBaseUrl, isDatabaseError, nonNegativeInt, positiveInt } from "./server-runtime.js";
+import { configuredSecret, externalBaseUrl, isDatabaseError, positiveInt } from "./server-runtime.js";
 import { registerHttpRoutes } from "./http-routes.js";
 import { installGracefulShutdown } from "./process-lifecycle.js";
 
@@ -48,7 +48,7 @@ export interface BuildServerOptions {
   nodeId?: string;
   instanceMode?: "single";
   allowTestRules?: boolean;
-  trustedProxyHops?: number;
+  trustedProxyAddresses?: string[];
   rateLimits?: Partial<{
     sessionsPerMinutePerIp: number;
     wsTicketsPerMinutePerIp: number;
@@ -130,8 +130,9 @@ export const buildServer = async (options: BuildServerOptions = {}): Promise<Fas
   const allowedOrigins = options.allowedOrigins ?? defaultAllowedOrigins;
   const allowLegacySessionToken = options.allowLegacySessionToken ?? false;
   const wsTicketTtlMs = options.wsTicketTtlMs ?? defaultWebSocketTicketTtlMs;
-  const trustedProxyHops = options.trustedProxyHops ?? nonNegativeInt(process.env.TRUSTED_PROXY_HOPS, 0);
-  const app = Fastify({ logger: false, bodyLimit: 32_000, ...(trustedProxyHops > 0 ? { trustProxy: trustedProxyHops } : {}) });
+  const trustedProxyAddresses = options.trustedProxyAddresses
+    ?? (process.env.TRUSTED_PROXY_ADDRESSES ?? "").split(",").map((address) => address.trim()).filter(Boolean);
+  const app = Fastify({ logger: false, bodyLimit: 32_000, trustProxy: trustedProxyAddresses.length > 0 ? trustedProxyAddresses : false });
   const socketRegistry = new SocketRegistry();
   const wsTickets = new WebSocketTicketStore(wsTicketTtlMs);
   const requestStartedAt = new WeakMap<object, number>();

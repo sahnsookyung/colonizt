@@ -374,6 +374,56 @@ describe("REST routes", () => {
     expect([first.statusCode, second.statusCode, limited.statusCode]).toEqual([200, 200, 429]);
   });
 
+  it.each([
+    ["192.0.2.10", [200, 200, 429]],
+    ["::ffff:192.0.2.10", [200, 200, 429]],
+    ["192.0.2.11", [200, 429, 429]],
+  ])("validates proxy peer %s before using forwarded client IPs", async (remoteAddress, expectedStatuses) => {
+    const app = await buildServer({
+      manager: new RoomManager(),
+      trustedProxyAddresses: ["192.0.2.10"],
+      rateLimits: { sessionsPerMinutePerIp: 1 },
+    });
+    try {
+      const statuses = [];
+      for (const clientIp of ["203.0.113.1", "203.0.113.2", "203.0.113.1"]) {
+        const response = await app.inject({
+          method: "POST",
+          url: "/sessions",
+          remoteAddress,
+          headers: { "x-forwarded-for": clientIp },
+          payload: { displayName: "Proxy test" },
+        });
+        statuses.push(response.statusCode);
+      }
+      expect(statuses).toEqual(expectedStatuses);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("reads an explicit proxy allowlist from deployment configuration", async () => {
+    vi.stubEnv("TRUSTED_PROXY_ADDRESSES", " 192.0.2.10, ");
+    const app = await buildServer({ manager: new RoomManager(), rateLimits: { sessionsPerMinutePerIp: 1 } });
+    try {
+      const statuses = [];
+      for (const clientIp of ["203.0.113.1", "203.0.113.2"]) {
+        const response = await app.inject({
+          method: "POST",
+          url: "/sessions",
+          remoteAddress: "192.0.2.10",
+          headers: { "x-forwarded-for": clientIp },
+          payload: { displayName: "Proxy test" },
+        });
+        statuses.push(response.statusCode);
+      }
+      expect(statuses).toEqual([200, 200]);
+    } finally {
+      await app.close();
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("returns short room codes and resolves rooms by code", async () => {
     const manager = new RoomManager();
     const session = await manager.createSession("Host");

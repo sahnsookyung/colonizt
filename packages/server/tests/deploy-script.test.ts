@@ -24,6 +24,10 @@ const temporaryDeployEnvironment = () => {
 set -euo pipefail
 printf '%s\n' "$*" >> "$FAKE_SSH_LOG"
 command="\${!#}"
+if [[ "$command" == *"docker inspect --format"*"jobscout-cloud-caddy"* ]]; then
+  printf '%s\n' "\${FAKE_CADDY_IP-172.20.0.2}"
+  exit 0
+fi
 if [[ "$command" == *"docker compose"*"up -d --remove-orphans"* && ! -e "$FAKE_FAILED_ONCE" ]]; then
   : > "$FAKE_FAILED_ONCE"
   exit 1
@@ -68,7 +72,35 @@ describe("OCI deploy rollback", () => {
     expect(sshLog.match(/up -d --remove-orphans/g)).toHaveLength(2);
     expect(sshLog).toContain("StrictHostKeyChecking=yes");
     expect(sshLog).toContain(`UserKnownHostsFile=${fixture.knownHosts}`);
+    expect(sshLog).toContain("docker inspect --format");
+    expect(sshLog).toContain("TRUSTED_PROXY_ADDRESSES=172.20.0.2");
   });
+
+  it.each(["", "not-an-ip", "172.20.0.2/16", "0.0.0.0"])(
+    "fails before changing application config for invalid Caddy address %j",
+    (caddyIp) => {
+      const fixture = temporaryDeployEnvironment();
+      const result = spawnSync("bash", [deployScript, "203.0.113.20", "c".repeat(40)], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${fixture.bin}:${process.env.PATH ?? ""}`,
+          COLONIZT_ENV_FILE: fixture.envFile,
+          COLONIZT_SSH_KNOWN_HOSTS_FILE: fixture.knownHosts,
+          FAKE_SSH_LOG: fixture.log,
+          FAKE_FAILED_ONCE: fixture.failedOnce,
+          FAKE_CADDY_IP: caddyIp,
+        },
+      });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("JobScout Caddy has no valid IPv4 address");
+      const sshLog = readFileSync(fixture.log, "utf8");
+      expect(sshLog).toContain("docker inspect --format");
+      expect(sshLog).not.toContain("sudo mkdir -p /srv/colonizt");
+    },
+  );
 
   it("fails before any network action when no pinned host key is configured", () => {
     const fixture = temporaryDeployEnvironment();

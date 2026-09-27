@@ -120,6 +120,13 @@ remote "command -v docker >/dev/null"
 remote "sudo docker ps --format '{{.Names}}' | grep -qx jobscout-cloud-caddy"
 remote "sudo test -f ${JOBSCOUT_ROOT}/ops/caddy/Caddyfile"
 remote "sudo docker exec jobscout-cloud-caddy test -d /etc/caddy/sites" || fail "JobScout Caddy is missing /etc/caddy/sites. Deploy the JobScout shared-sites mount first."
+echo "==> Discovering JobScout Caddy proxy address"
+if ! CADDY_PROXY_IP="$(remote "sudo docker inspect --format '{{with index .NetworkSettings.Networks \"jobscout-cloud\"}}{{.IPAddress}}{{end}}' jobscout-cloud-caddy")"; then
+  fail "Could not inspect JobScout Caddy on the jobscout-cloud network"
+fi
+if ! node -e 'const { isIP } = require("node:net"); const ip = process.argv[1]; process.exit(isIP(ip) === 4 && ip !== "0.0.0.0" ? 0 : 1);' "$CADDY_PROXY_IP"; then
+  fail "JobScout Caddy has no valid IPv4 address on the jobscout-cloud network"
+fi
 if remote "id jobscout >/dev/null 2>&1"; then
   CADDY_SITE_INSTALL="install -o jobscout -g jobscout -m 0644"
 fi
@@ -146,6 +153,8 @@ remote "if [ ! -f ${CADDY_SITES_DIR}/00-placeholder.Caddyfile ]; then printf '%s
 remote "sudo grep -q '^IMAGE_TAG=' ${REMOTE_ROOT}/deploy/compose/.env && sudo sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=${IMAGE_TAG}/' ${REMOTE_ROOT}/deploy/compose/.env || echo IMAGE_TAG=${IMAGE_TAG} | sudo tee -a ${REMOTE_ROOT}/deploy/compose/.env >/dev/null"
 remote "sudo grep -q '^COMPOSE_PROJECT_NAME=' ${REMOTE_ROOT}/deploy/compose/.env || echo COMPOSE_PROJECT_NAME=colonizt | sudo tee -a ${REMOTE_ROOT}/deploy/compose/.env >/dev/null"
 remote "sudo grep -q '^COLONIZT_DATA_ROOT=' ${REMOTE_ROOT}/deploy/compose/.env || echo COLONIZT_DATA_ROOT=${REMOTE_ROOT}/data | sudo tee -a ${REMOTE_ROOT}/deploy/compose/.env >/dev/null"
+remote "sudo sed -i '/^TRUSTED_PROXY_ADDRESSES=/d' ${REMOTE_ROOT}/deploy/compose/.env"
+remote "printf '\\n%s\\n' 'TRUSTED_PROXY_ADDRESSES=${CADDY_PROXY_IP}' | sudo tee -a ${REMOTE_ROOT}/deploy/compose/.env >/dev/null"
 
 if [[ -n "$GHCR_PAT" ]]; then
   echo "==> Refreshing remote GHCR credentials"

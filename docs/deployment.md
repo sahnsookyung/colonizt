@@ -17,7 +17,7 @@ This starts PostgreSQL, the Fastify server on `http://127.0.0.1:8787`, and the s
 - `NODE_ID`: optional identifier included in health, config, logs, and metrics.
 - `SERVER_HOST`: bind host, usually `0.0.0.0` in containers.
 - `SERVER_PORT`: server port, default `8787`.
-- `TRUSTED_PROXY_HOPS`: number of reverse-proxy hops Fastify may trust when resolving client IPs, default `0`. The OCI Caddy deployment uses exactly `1`; do not enable it for a directly exposed server.
+- `TRUSTED_PROXY_ADDRESSES`: comma-separated proxy IP addresses or CIDR ranges trusted when resolving client IPs. Unset or empty trusts no proxies. The OCI deploy script sets this to the exact JobScout Caddy IPv4 address on the `jobscout-cloud` network; redeploy if that address changes. Avoid broad private-network ranges. The former `TRUSTED_PROXY_HOPS` setting is ignored by the updated server, but production Compose still passes it so a manual rollback to an older server image retains its proxy configuration.
 - `WEB_ORIGIN`: allowed browser origin for CORS.
 - `ADMIN_TOKEN`: optional bearer or `x-admin-token` secret required for `/metrics` and `/leaderboard` when set.
 - `VITE_API_BASE_URL`: optional legacy web build-time API fallback for local or custom builds. Leave unset for portable production images; browsers should discover the public API through `GET /config`.
@@ -95,6 +95,12 @@ file before promotion. Any later pull, migration, startup, Caddy, or origin-smok
 failure restores those files and restarts the prior image set; Caddy is restored
 independently. Database migrations must remain backward compatible because a
 container rollback does not reverse an applied schema migration.
+
+Before changing application configuration, the script reads JobScout Caddy's
+IPv4 address from Docker's `jobscout-cloud` network and rejects an absent or
+invalid address. After the rollback snapshot, it replaces any saved
+`TRUSTED_PROXY_ADDRESSES` value in the deployed `.env` with that exact address.
+The production `.env` secret can leave this variable empty; deploy fills it.
 
 ```bash
 ./ops/scripts/deploy-oci.sh <jobscout-oci-ip> <full-40-character-git-sha-image-tag>

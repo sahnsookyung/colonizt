@@ -39,8 +39,8 @@ Browser lifecycle handling follows [Chrome's lifecycle guidance](https://develop
 | Check | Result |
 | --- | --- |
 | ESLint, TypeScript, production build, whitespace check | Passed |
-| Unit/property/integration/UI coverage suite | 655 passed, including PostgreSQL persistence and WebSocket tests, after installing the patched dependency lockfile |
-| Coverage | 95.07% statements, 85.55% branches, 97.83% functions, 97.99% lines; existing gates passed |
+| Unit/property/integration/UI coverage suite | 663 passed, including PostgreSQL persistence, WebSocket recovery, trusted-proxy validation, and deployment preflight tests, after installing the patched dependency lockfile |
+| Coverage | 95.07% statements, 85.56% branches, 97.83% functions, 97.99% lines; existing gates passed |
 | Dependency audit | Zero vulnerabilities after compatible updates; no forced major upgrades |
 | Bot simulations | 247 games and five concurrent rooms passed with no invalid commands, unfinished games, or crashes |
 | Browser suite | 45 passed across desktop Chromium, Pixel Chromium, iPhone WebKit, and iPad WebKit; 27 project/environment exclusions skipped |
