@@ -87,7 +87,7 @@ export const handleWebSocketMessage = (
     return false;
   };
   if (message.type === "PING") {
-    send({ type: "PONG", nonce: message.nonce });
+    send({ type: "PONG", nonce: message.nonce, serverTime: Date.now() });
     return presence.refresh(session, socketId, client.roomId).catch((error) => {
       metrics.recordDbFailure("presence_refresh");
       logger.warn("presence.refresh_failed", {
@@ -221,17 +221,20 @@ export const handleWebSocketMessage = (
       send({ type: "COMMAND_REJECTED", code: "RATE_LIMITED", message: "Too many commands", clientSeq: message.clientSeq });
       return;
     }
-    return manager.submitCommand(joinedRoomId, session, message.clientSeq, message.command as GameCommand).then((result) => {
+    return manager.submitCommand(joinedRoomId, session, message.clientSeq, message.command as GameCommand, message.expectedEventSeq).then((result) => {
       if (!result.ok) {
         metrics.recordCommand("rejected", message.command.type, Date.now() - commandStartedAt);
         logger.warn("command.rejected", { code: result.code, userId: session.userId, roomId: joinedRoomId, command: message.command.type });
         send({ type: "COMMAND_REJECTED", code: result.code, message: result.message, clientSeq: message.clientSeq });
         return;
       }
+      const acknowledge = () => send({ type: "COMMAND_ACK", roomId: joinedRoomId, clientSeq: message.clientSeq,
+        seqStart: result.seqStart ?? result.events[0]?.seq,
+        seqEnd: result.seqEnd ?? result.events.at(-1)?.seq });
       if (result.replayed) {
+        acknowledge();
         metrics.recordCommand("replayed", message.command.type, Date.now() - commandStartedAt);
         logger.info("command.replayed", { userId: session.userId, roomId: joinedRoomId, command: message.command.type, clientSeq: message.clientSeq });
-        send({ type: "COMMAND_ACK", roomId: joinedRoomId, clientSeq: message.clientSeq, seqStart: result.seqStart, seqEnd: result.seqEnd });
         return;
       }
       metrics.recordCommand("accepted", message.command.type, Date.now() - commandStartedAt);
@@ -247,6 +250,7 @@ export const handleWebSocketMessage = (
           message: error instanceof Error ? error.message : String(error),
         });
       }
+      acknowledge();
     }).catch((error) => {
       metrics.recordCommand("rejected", message.command.type, Date.now() - commandStartedAt);
       metrics.recordDbFailure("command");

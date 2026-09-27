@@ -24,6 +24,10 @@ export const networkErrorMessage = (input: unknown): string => {
       return "Room abandoned";
     case "ROOM_CLOSED":
       return "Room closed";
+    case "ROOM_ALREADY_STARTED":
+      return "This match has already started. Ask your friend to open a new table.";
+    case "STALE_STATE":
+      return "The table changed. Review the board and try your action again.";
     case "ROOM_FULL":
       return "Room is full";
     case "ROOM_SWITCH_ACTIVE_GAME":

@@ -63,7 +63,7 @@ describe("REST routes", () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({
       schemaVersion: 3,
-      protocolVersion: 3,
+      protocolVersion: 4,
       apiBaseUrl: "https://api.play.example",
       wsBaseUrl: "wss://api.play.example",
       webOrigin: "https://play.example",

@@ -19,7 +19,7 @@ export default defineConfig({
       timeout: 30_000,
     },
     {
-      command: "VITE_API_BASE_URL=http://127.0.0.1:8787 npm --workspace @colonizt/web run dev -- --host 127.0.0.1",
+      command: "npm --workspace @colonizt/web run dev -- --host 127.0.0.1",
       url: "http://127.0.0.1:5173",
       reuseExistingServer: !process.env.CI,
       timeout: 30_000,

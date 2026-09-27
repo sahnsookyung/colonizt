@@ -4,7 +4,7 @@ Colonizt is an original browser-first, real-time resource trading and route buil
 
 This project is a portfolio and interview-preparation codebase. It does not copy Colonist/CATAN branding, art, proprietary UI, wording, or assets; related product research notes stay outside the published app.
 
-![Colonizt gameplay screenshot](docs/assets/colonizt-gameplay.jpg)
+![Colonizt illustrated tabletop gameplay](docs/assets/colonizt-illustrated.png)
 
 ## What It Does
 

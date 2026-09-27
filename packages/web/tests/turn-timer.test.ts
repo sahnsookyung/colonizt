@@ -63,4 +63,13 @@ describe("turn deadline identity", () => {
     await waitFor(() => expect(setupHook.result.current.turnDeadline).toMatchObject({ mode: "setup", durationMs: 240_000 }));
     setupHook.unmount();
   });
+  it("corrects displayed deadlines when the device clock is two minutes behind", () => {
+    const state = completeSetup(createDemoGame("clock-skew")).state;
+    state.phase = { type: "ACTION_PHASE", activePlayerId: "p1" };
+    const expiresAt = Date.now() + 180_000;
+    const hook = renderHook(() => useTurnTimer({ state, activePlayer: "p1", paused: false, networkRoomId: "room_timer", serverClockOffsetMs: 120_000, serverTimer: { activePlayerId: "p1", expiresAt }, rollDeadlineMs: 60_000, actionDeadlineMs: 240_000, onLocalTimeout: () => undefined }));
+    expect(hook.result.current.turnDeadline?.dueAt).toBe(expiresAt - 120_000);
+    hook.unmount();
+  });
+
 });

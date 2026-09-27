@@ -14,7 +14,7 @@ describe("network client", () => {
       requests.push(url);
       if (url === "/config") {
         return new Response(JSON.stringify({
-          apiBaseUrl: "https://same-origin-api.example",
+          protocolVersion: 4, apiBaseUrl: "https://same-origin-api.example",
           wsBaseUrl: "wss://same-origin-socket.example",
         }), { status: 200 });
       }
@@ -35,7 +35,7 @@ describe("network client", () => {
       requests.push(url);
       if (url === "https://bootstrap.example/config") {
         return new Response(JSON.stringify({
-          apiBaseUrl: "https://api.example",
+          protocolVersion: 4, apiBaseUrl: "https://api.example",
           wsBaseUrl: "wss://socket.example",
         }), { status: 200 });
       }
@@ -64,7 +64,7 @@ describe("network client", () => {
       const url = String(input);
       if (url === "https://room-bootstrap.example/config") {
         return new Response(JSON.stringify({
-          apiBaseUrl: "https://room-api.example",
+          protocolVersion: 4, apiBaseUrl: "https://room-api.example",
           wsBaseUrl: "wss://room-socket.example",
         }), { status: 200 });
       }
@@ -98,7 +98,7 @@ describe("network client", () => {
       const url = String(input);
       if (url === "https://replay-bootstrap.example/config") {
         return new Response(JSON.stringify({
-          apiBaseUrl: "https://replay-api.example",
+          protocolVersion: 4, apiBaseUrl: "https://replay-api.example",
           wsBaseUrl: "wss://replay-socket.example",
         }), { status: 200 });
       }
@@ -131,6 +131,10 @@ describe("network client", () => {
         this.listeners.set(event, [...(this.listeners.get(event) ?? []), listener]);
       }
 
+      removeEventListener(event: string, listener: () => void): void {
+        this.listeners.set(event, (this.listeners.get(event) ?? []).filter((candidate) => candidate !== listener));
+      }
+
       send(): void {
         return;
       }
@@ -148,7 +152,7 @@ describe("network client", () => {
       const url = String(input);
       if (url === "https://bootstrap-ws.example/config") {
         return new Response(JSON.stringify({
-          apiBaseUrl: "https://api-ws.example",
+          protocolVersion: 4, apiBaseUrl: "https://api-ws.example",
           wsBaseUrl: "wss://socket-ws.example",
         }), { status: 200 });
       }
@@ -169,6 +173,116 @@ describe("network client", () => {
     socket.close();
   });
 
+  it("does not open a websocket after a pending ticket request is cancelled", async () => {
+    let resolveTicket: ((response: Response) => void) | undefined;
+    const ticketResponse = new Promise<Response>((resolve) => {
+      resolveTicket = resolve;
+    });
+    const websocketConstructor = vi.fn();
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      constructor() {
+        websocketConstructor();
+      }
+      addEventListener(): void {
+        return;
+      }
+      removeEventListener(): void {}
+      close(): void {
+        return;
+      }
+      send(): void {
+        return;
+      }
+    }
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://cancel-bootstrap.example/config") {
+        return new Response(JSON.stringify({
+          protocolVersion: 4, apiBaseUrl: "https://cancel-api.example",
+          wsBaseUrl: "wss://cancel-socket.example",
+        }), { status: 200 });
+      }
+      if (url === "https://cancel-api.example/ws-tickets") return ticketResponse;
+      return new Response("not found", { status: 404 });
+    }));
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const controller = new AbortController();
+    const connecting = createNetworkClient("https://cancel-bootstrap.example").connect("token", {
+      onEvents: () => undefined,
+      onRoom: () => undefined,
+      onError: () => undefined,
+    }, controller.signal);
+    await vi.waitFor(() => expect(resolveTicket).toBeTypeOf("function"));
+
+    controller.abort();
+    resolveTicket?.(new Response(JSON.stringify({
+      ticket: "cancelled_ticket",
+      expiresAt: "2026-06-17T00:00:00.000Z",
+      ttlMs: 30_000,
+    }), { status: 201 }));
+
+    await expect(connecting).rejects.toMatchObject({ name: "AbortError" });
+    expect(websocketConstructor).not.toHaveBeenCalled();
+  });
+
+  it("closes an opened websocket when its connection signal is cancelled", async () => {
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      readonly readyState = FakeWebSocket.OPEN;
+      readonly close = vi.fn((code?: number, reason?: string) => {
+        void code;
+        void reason;
+        this.emit("close");
+      });
+      private readonly listeners = new Map<string, Array<() => void>>();
+
+      addEventListener(event: string, listener: () => void): void {
+        this.listeners.set(event, [...(this.listeners.get(event) ?? []), listener]);
+      }
+
+      removeEventListener(event: string, listener: () => void): void {
+        this.listeners.set(event, (this.listeners.get(event) ?? []).filter((candidate) => candidate !== listener));
+      }
+
+      send(): void {
+        return;
+      }
+
+      private emit(event: string): void {
+        for (const listener of this.listeners.get(event) ?? []) listener();
+      }
+    }
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://cancel-open-bootstrap.example/config") {
+        return new Response(JSON.stringify({
+          protocolVersion: 4, apiBaseUrl: "https://cancel-open-api.example",
+          wsBaseUrl: "wss://cancel-open-socket.example",
+        }), { status: 200 });
+      }
+      if (url === "https://cancel-open-api.example/ws-tickets") {
+        return new Response(JSON.stringify({
+          ticket: "open_ticket",
+          expiresAt: "2026-06-17T00:00:00.000Z",
+          ttlMs: 30_000,
+        }), { status: 201 });
+      }
+      return new Response("not found", { status: 404 });
+    }));
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const controller = new AbortController();
+    const socket = await createNetworkClient("https://cancel-open-bootstrap.example").connect("token", {
+      onEvents: () => undefined,
+      onRoom: () => undefined,
+      onError: () => undefined,
+    }, controller.signal) as unknown as FakeWebSocket;
+
+    controller.abort();
+
+    expect(socket.close).toHaveBeenCalledWith(4000, "Connection cancelled");
+  });
+
   it("sends heartbeats only while a websocket remains open", async () => {
     vi.useFakeTimers();
     class FakeWebSocket {
@@ -183,6 +297,10 @@ describe("network client", () => {
 
       addEventListener(event: string, listener: () => void): void {
         this.listeners.set(event, [...(this.listeners.get(event) ?? []), listener]);
+      }
+
+      removeEventListener(event: string, listener: () => void): void {
+        this.listeners.set(event, (this.listeners.get(event) ?? []).filter((candidate) => candidate !== listener));
       }
 
       send(payload: string): void {
@@ -203,7 +321,7 @@ describe("network client", () => {
       const url = String(input);
       if (url === "https://heartbeat-bootstrap.example/config") {
         return new Response(JSON.stringify({
-          apiBaseUrl: "https://heartbeat-api.example",
+          protocolVersion: 4, apiBaseUrl: "https://heartbeat-api.example",
           wsBaseUrl: "wss://heartbeat-socket.example",
         }), { status: 200 });
       }
@@ -234,7 +352,7 @@ describe("network client", () => {
       const url = String(input);
       if (url === "https://lookup-bootstrap.example/config") {
         return new Response(JSON.stringify({
-          apiBaseUrl: "https://lookup-api.example",
+          protocolVersion: 4, apiBaseUrl: "https://lookup-api.example",
           wsBaseUrl: "wss://lookup-socket.example",
         }), { status: 200 });
       }
@@ -267,6 +385,9 @@ describe("network client", () => {
       addEventListener(event: string, listener: (event?: { data?: unknown }) => void): void {
         this.listeners.set(event, [...(this.listeners.get(event) ?? []), listener]);
       }
+      removeEventListener(event: string, listener: (event?: { data?: unknown }) => void): void {
+        this.listeners.set(event, (this.listeners.get(event) ?? []).filter((candidate) => candidate !== listener));
+      }
 
       send(): void {
         return;
@@ -283,7 +404,7 @@ describe("network client", () => {
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url === "https://frames-bootstrap.example/config") {
-        return new Response(JSON.stringify({ apiBaseUrl: "https://frames-api.example", wsBaseUrl: "wss://frames-socket.example" }), { status: 200 });
+        return new Response(JSON.stringify({ protocolVersion: 4, apiBaseUrl: "https://frames-api.example", wsBaseUrl: "wss://frames-socket.example" }), { status: 200 });
       }
       if (url === "https://frames-api.example/ws-tickets") {
         return new Response(JSON.stringify({ ticket: "frames_ticket", expiresAt: "2026-06-17T00:00:00.000Z", ttlMs: 30_000 }), { status: 201 });
@@ -333,6 +454,7 @@ describe("network client", () => {
       addEventListener(): void {
         return;
       }
+      removeEventListener(): void {}
       send(): void {
         return;
       }
@@ -340,7 +462,7 @@ describe("network client", () => {
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url === "https://hanging-bootstrap.example/config") {
-        return new Response(JSON.stringify({ apiBaseUrl: "https://hanging-api.example", wsBaseUrl: "wss://hanging-socket.example" }), { status: 200 });
+        return new Response(JSON.stringify({ protocolVersion: 4, apiBaseUrl: "https://hanging-api.example", wsBaseUrl: "wss://hanging-socket.example" }), { status: 200 });
       }
       if (url === "https://hanging-api.example/ws-tickets") {
         return new Response(JSON.stringify({ ticket: "hanging_ticket", expiresAt: "2026-06-17T00:00:00.000Z", ttlMs: 30_000 }), { status: 201 });
@@ -368,7 +490,7 @@ describe("network client", () => {
       const url = String(input);
       sent.push({ url, init });
       if (url === "https://operations-bootstrap.example/config") {
-        return new Response(JSON.stringify({ apiBaseUrl: "https://operations-api.example", wsBaseUrl: "wss://operations-socket.example" }), { status: 200 });
+        return new Response(JSON.stringify({ protocolVersion: 4, apiBaseUrl: "https://operations-api.example", wsBaseUrl: "wss://operations-socket.example" }), { status: 200 });
       }
       if (url === "https://operations-api.example/sessions") {
         return new Response(JSON.stringify({ token: "token_1", userId: "p1", displayName: "Ada" }), { status: 201 });

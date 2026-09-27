@@ -139,9 +139,9 @@ jobs:
         if: steps.target.outputs.deploy == 'true'
         run: npm ci
 
-      - name: Install Playwright browser
+      - name: Install Playwright browsers
         if: steps.target.outputs.deploy == 'true'
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install --with-deps chromium webkit
 
       - name: Prepare production deploy credentials
         if: steps.target.outputs.deploy == 'true'
@@ -163,6 +163,20 @@ jobs:
 
           printf '%s' "$COLONIZT_PRODUCTION_ENV_B64" | base64 --decode > "$RUNNER_TEMP/colonizt.env"
           chmod 600 "$RUNNER_TEMP/colonizt.env"
+
+      - name: Recheck current main before automatic promotion
+        if: steps.target.outputs.deploy == 'true' && github.event_name == 'workflow_run'
+        env:
+          IMAGE_TAG: ${{ steps.target.outputs.image_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main
+          current_main="$(git rev-parse origin/main)"
+          if [[ "$IMAGE_TAG" != "$current_main" ]]; then
+            echo "::error::Skipping stale automatic deployment for $IMAGE_TAG; current main is $current_main."
+            exit 1
+          fi
 
       - name: Deploy to OCI
         if: steps.target.outputs.deploy == 'true'

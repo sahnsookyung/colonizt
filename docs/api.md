@@ -34,6 +34,7 @@ Server messages:
 
 - `ROOM_STATE`
 - `EVENTS`
+- `COMMAND_ACK` for every accepted command (including an idempotent retry)
 - `COMMAND_REJECTED`
 - `EVENTS` with viewer-safe event payloads and a viewer-safe snapshot
 - `RESYNC` with either viewer-safe contiguous events or a viewer-safe snapshot fallback
@@ -45,3 +46,21 @@ Joining a different room atomically removes lobby or spectator membership from t
 ## Operations Metrics
 
 `GET /metrics` is intended for operators and reverse-proxy-controlled access. It includes active rooms, connected sockets, command outcomes and latency, replay load outcomes, room cleanup counts with reasons, scheduler actions, WebSocket lifecycle events, and DB failure counters. Deployment config should expose it only to trusted monitoring paths or set `ADMIN_TOKEN`.
+
+## Recovery contract (protocol 4)
+
+`GET /config` advertises `protocolVersion: 4`; new browsers require this contract before connecting. The server still accepts prior command shapes. Rules/schema version and replay format are unchanged.
+
+A command may include `expectedEventSeq`, the authoritative event cursor at the time the action was chosen:
+
+```json
+{"type":"COMMAND","roomId":"room_example","clientSeq":7,"expectedEventSeq":24,"command":{"type":"ROLL_DICE","playerId":"player_example"}}
+```
+
+Stored results keyed by room, player, and `clientSeq` are checked **before** the precondition. A previously accepted command returns its original acknowledgement even if the board has advanced. A new identity with an outdated cursor is durably rejected with `STALE_STATE`. Reusing an identity with another command payload still returns `CLIENT_SEQ_CONFLICT`.
+
+`COMMAND_ACK` includes `roomId`, `clientSeq`, and the accepted `seqStart`/`seqEnd` when events were emitted. Normal broadcasts precede ACK to avoid an unnecessary resync on every action; ACK is still sent if broadcasting fails. Clients keep the exact command until a matching ACK and authoritative state covering `seqEnd` are both available. Unrelated events/ACKs do not confirm it.
+
+`PONG` echoes the PING nonce and includes `serverTime` (Unix milliseconds). The browser estimates clock offset with half the monotonic round-trip duration. HTTP headers/body, socket opening, joining, heartbeat replies, resync, and command confirmation have bounded waits. A fresh connection restores the room snapshot before retrying a persisted outstanding command.
+
+A snapshot replaces its covered event prefix. Clients ignore stale snapshots, deduplicate overlapping events, and request one resync when the uncovered tail has a sequence gap. Resume storage retains the existing key/fields with optional `pendingCommand`; old saved sessions remain readable.

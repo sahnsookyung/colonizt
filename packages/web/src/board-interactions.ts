@@ -32,6 +32,6 @@ export const boardBounds = (state: Pick<GameState, "board">): { minX: number; mi
   const minX = Math.min(...xs) - 1.1;
   const maxX = Math.max(...xs) + 1.1;
   const minY = Math.min(...ys) - 1.1;
-  const maxY = Math.max(...ys) + 3.0;
+  const maxY = Math.max(...ys) + 1.1;
   return { minX, minY, width: maxX - minX, height: maxY - minY };
 };

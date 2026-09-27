@@ -1,7 +1,7 @@
 import { z } from "zod";
-import type { BoardGraph, BotDifficulty, GameConfig, GameEvent, PlayerId, ViewerState } from "@colonizt/game-core";
+import type { GameCommand, BoardGraph, BotDifficulty, GameConfig, GameEvent, PlayerId, ViewerState } from "@colonizt/game-core";
 
-export const protocolVersion = 3;
+export const protocolVersion = 4;
 export const websocketAuthMode = "ticket";
 export const defaultWebSocketTicketTtlMs = 30_000;
 
@@ -80,7 +80,7 @@ export const wsClientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("REMOVE_BOT"), roomId: z.string(), seatIndex: z.number().int().min(0).max(3) }),
   z.object({ type: z.literal("UPDATE_ROOM_SETTINGS"), roomId: z.string(), settings: lobbySettingsUpdateSchema }),
   z.object({ type: z.literal("UPDATE_DISPLAY_NAME"), displayName: z.string().trim().min(1).max(40) }),
-  z.object({ type: z.literal("COMMAND"), roomId: z.string(), clientSeq: z.number().int().nonnegative(), command: gameCommandSchema }),
+  z.object({ type: z.literal("COMMAND"), roomId: z.string(), clientSeq: z.number().int().nonnegative(), expectedEventSeq: z.number().int().nonnegative().optional(), command: gameCommandSchema }),
   z.object({ type: z.literal("CHAT"), roomId: z.string(), message: z.string().min(1).max(300) }),
   z.object({ type: z.literal("RESYNC"), roomId: z.string(), lastSeq: z.number().int().nonnegative() }),
   z.object({ type: z.literal("PING"), nonce: z.string().optional() }),
@@ -234,3 +234,18 @@ export type CreateRoomSettings = z.output<typeof createRoomSchema>;
 export type LobbySettingsUpdate = z.output<typeof lobbySettingsUpdateSchema>;
 export type AnalyticsEventInput = z.input<typeof analyticsEventSchema>;
 export type WsClientMessage = z.infer<typeof wsClientMessageSchema>;
+
+/** Acknowledges the durable result, independently of room broadcasts. */
+export interface CommandAck {
+  type: "COMMAND_ACK";
+  roomId: string;
+  clientSeq: number;
+  seqStart?: number;
+  seqEnd?: number;
+}
+
+export interface PendingGameCommand {
+  clientSeq: number;
+  expectedEventSeq: number;
+  command: GameCommand;
+}

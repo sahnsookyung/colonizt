@@ -180,7 +180,7 @@ export const LobbyScreen = ({
                   {lobbyPending.start ? "Starting..." : "Go"}
                 </button>
               ) : null}
-              <button type="button" onClick={onRetryNow} disabled={!reconnectRetryAt}>Retry</button>
+              <button type="button" onClick={onRetryNow} disabled={networkSocketOpen}>Retry</button>
               <button type="button" onClick={onReturnToSetup}>Leave</button>
             </div>
           </div>

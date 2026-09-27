@@ -17,7 +17,7 @@ describe("board interaction policy", () => {
     expect(bounds.minX).toBeCloseTo(Math.min(...vertices.map((vertex) => vertex.x)) - 1.1);
     expect(bounds.minY).toBeCloseTo(Math.min(...vertices.map((vertex) => vertex.y)) - 1.1);
     expect(bounds.minX + bounds.width).toBeCloseTo(Math.max(...vertices.map((vertex) => vertex.x)) + 1.1);
-    expect(bounds.minY + bounds.height).toBeCloseTo(Math.max(...vertices.map((vertex) => vertex.y)) + 3);
+    expect(bounds.minY + bounds.height).toBeCloseTo(Math.max(...vertices.map((vertex) => vertex.y)) + 1.1);
   });
 
   it("chooses the highest-pressure robber victim with stable turn-order ties", () => {

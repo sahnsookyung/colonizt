@@ -95,7 +95,7 @@ describe("websocket message delivery boundaries", () => {
       messageContext(manager, client, logs, { presence, metrics }),
     );
 
-    expect(send).toHaveBeenCalledWith(JSON.stringify({ type: "PONG", nonce: "heartbeat" }));
+    expect(JSON.parse(send.mock.calls[0]![0])).toMatchObject({ type: "PONG", nonce: "heartbeat", serverTime: expect.any(Number) });
     await vi.waitFor(() => expect(logs).toContainEqual(expect.objectContaining({
       event: "presence.refresh_failed",
       roomId: "room-a",

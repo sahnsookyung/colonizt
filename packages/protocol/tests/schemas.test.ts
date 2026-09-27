@@ -3,7 +3,7 @@ import { createRoomSchema, lobbyReadiness, protocolVersion, wsClientMessageSchem
 
 describe("protocol schemas", () => {
   it("keeps protocol constants explicit", () => {
-    expect(protocolVersion).toBe(3);
+    expect(protocolVersion).toBe(4);
     expect(websocketAuthMode).toBe("ticket");
   });
 

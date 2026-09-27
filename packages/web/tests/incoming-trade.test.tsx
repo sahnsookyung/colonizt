@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DemoState from "@colonizt/demo-state";
 import type * as GameCore from "@colonizt/game-core";
+import { createMemoryStorage } from "./memory-storage.js";
 
 vi.mock("@colonizt/demo-state", async () => {
   const actual = await vi.importActual<typeof DemoState>("@colonizt/demo-state");
@@ -36,9 +37,14 @@ vi.mock("@colonizt/demo-state", async () => {
   };
 });
 
+beforeEach(() => {
+  vi.stubGlobal("localStorage", createMemoryStorage());
+});
+
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  vi.unstubAllGlobals();
 });
 
 describe("incoming bot trades", () => {

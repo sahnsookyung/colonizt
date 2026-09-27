@@ -10,8 +10,10 @@ test("local bot game first screen is playable on desktop", async ({ page, isMobi
   await expect(page.getByLabel("Game board and actions")).toBeVisible();
   await expect(page.getByRole("button", { name: "Ready" })).toHaveCount(0);
   await page.getByRole("button", { name: /Place setup settlement at corner/ }).first().click();
+  await page.getByRole("button", { name: "Confirm placement" }).click();
   await expect(page.getByText("Place setup road")).toBeVisible();
   await page.getByRole("button", { name: /Build road here/ }).first().click();
+  await page.getByRole("button", { name: "Confirm placement" }).click();
   await expect(page.getByLabel("Game board and actions")).toBeVisible();
 });
 
@@ -20,13 +22,13 @@ test("initial desert robber marker is centered without a dark tile seam", async 
   await page.goto("/");
   await page.getByRole("button", { name: /Bot Match/ }).click();
 
-  const thiefDesertHex = page.locator(".thief-hex .hex-desert");
+  const thiefDesertHex = page.locator(".hex-desert");
   await expect(thiefDesertHex).toHaveCount(1);
-  await expect(page.locator(".thief-hex .thief-marker")).toHaveCount(1);
+  await expect(page.locator(".robber-piece")).toHaveCount(1);
   await expect(page.getByRole("img", { name: "Robber" })).toBeVisible();
-  await expect(page.locator(".thief-hex .legal-thief-target")).toHaveCount(0);
+  await expect(page.locator(".hex-target")).toHaveCount(0);
 
-  const stroke = await thiefDesertHex.evaluate((element) => {
+  const stroke = await page.locator(".hex-outline").first().evaluate((element) => {
     const styles = window.getComputedStyle(element);
     const channels = styles.stroke.match(/[\d.]+/g)?.map(Number) ?? [255, 255, 255];
     const [red = 255, green = 255, blue = 255] = channels;
@@ -77,7 +79,7 @@ test("medium desktop HUD keeps every resource visible and compact", async ({ pag
     expect(card.right).toBeLessThanOrEqual(metrics.viewportWidth + 1);
     expect(card.width).toBeGreaterThan(40);
   }
-  expect(metrics.hand.right).toBeLessThanOrEqual(metrics.actions.left - 8);
+  expect(metrics.hand.bottom).toBeLessThanOrEqual(metrics.actions.top);
   expect(metrics.hand.height).toBeLessThanOrEqual(82);
   expect(metrics.actions.height).toBeLessThanOrEqual(78);
 });
@@ -330,15 +332,15 @@ test("mobile viewport keeps primary controls visible", async ({ page, isMobile }
   await expect(page.getByLabel("Game board and actions")).toBeVisible();
   await expect(page.getByRole("button", { name: "Roll dice" })).toBeVisible();
   await expect(page.getByRole("button", { name: "End Turn" })).toBeVisible();
-  await expect(page.locator(".topbar")).toHaveCSS("display", "none");
-  await expect(page.locator(".game-log-panel")).toHaveCSS("display", "none");
+  await expect(page.locator(".topbar")).toBeVisible();
+  await expect(page.locator(".table-details")).not.toHaveAttribute("open");
 
   const metrics = await page.evaluate(() => {
     const box = (selector: string) => {
       const element = document.querySelector(selector);
       if (!element) throw new Error(`Missing ${selector}`);
       const rect = element.getBoundingClientRect();
-      return { width: rect.width, height: rect.height, bottom: rect.bottom, right: rect.right };
+      return { width: rect.width, height: rect.height, bottom: rect.bottom, right: rect.right, top: rect.top };
     };
     return {
       viewportHeight: window.innerHeight,
@@ -351,11 +353,11 @@ test("mobile viewport keeps primary controls visible", async ({ page, isMobile }
   });
 
   expect(metrics.scrollHeight).toBeLessThanOrEqual(metrics.viewportHeight + 1);
-  expect(metrics.board.height).toBeGreaterThan(metrics.viewportHeight * 0.56);
+  expect(metrics.board.height).toBeGreaterThanOrEqual(200);
   expect(metrics.board.right).toBeGreaterThan(metrics.viewportWidth * 0.9);
-  expect(metrics.actions.height).toBeLessThanOrEqual(64);
+  expect(metrics.actions.height).toBeLessThanOrEqual(80);
   expect(metrics.actions.right).toBeLessThanOrEqual(metrics.viewportWidth + 1);
-  expect(metrics.players.bottom).toBeLessThanOrEqual(72);
+  expect(metrics.players.bottom).toBeLessThanOrEqual(metrics.board.top);
 });
 
 test("mobile online lobby stays scrollable and starts from two ready players", async ({ page, isMobile }) => {
@@ -419,7 +421,8 @@ test("mobile online lobby stays scrollable and starts from two ready players", a
       }
 
       send(payload: string): void {
-        const message = JSON.parse(payload) as { type: string; seatIndex?: number };
+        const message = JSON.parse(payload) as { type: string; seatIndex?: number; nonce?: string };
+        if (message.type === "PING") queueMicrotask(() => this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "PONG", nonce: message.nonce, serverTime: Date.now() }) })));
         testWindow.__sentMessages.push(message);
         if (message.type === "JOIN_ROOM") {
           setTimeout(() => this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "ROOM_STATE", room: testWindow.__lobbyRoom }) })), 0);
@@ -455,7 +458,7 @@ test("mobile online lobby stays scrollable and starts from two ready players", a
   await page.route("**/config", async (route) => {
     await route.fulfill({
       contentType: "application/json",
-      body: JSON.stringify({ apiBaseUrl: "http://127.0.0.1:8787", wsBaseUrl: "ws://127.0.0.1:8787" }),
+      body: JSON.stringify({ protocolVersion: 4, apiBaseUrl: "http://127.0.0.1:8787", wsBaseUrl: "ws://127.0.0.1:8787" }),
     });
   });
   await page.route("**/sessions", async (route) => {

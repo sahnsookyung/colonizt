@@ -69,17 +69,17 @@ export const selectActionHint = (input: ActionHintInput): { title: string; detai
   if (!input.isHumanActive) return { title: "Waiting", detail: `${input.activeName ?? "Opponent"} is taking a turn.` };
   if (input.activeKnight) return { title: "Play Knight", detail: "Choose a robber destination, then choose who to steal from if available." };
   if (input.activeRoadBuilding) {
-    return { title: "Road Building", detail: `Choose ${input.roadsRemaining} free road${input.roadsRemaining === 1 ? "" : "s"} on glowing edges.` };
+    return { title: "Road Building", detail: `Choose ${input.roadsRemaining} free road${input.roadsRemaining === 1 ? "" : "s"} on marked edges.` };
   }
   if (input.activeMonopoly) return { title: "Monopoly", detail: "Choose one resource type to collect from every opponent." };
   if (input.activeYearOfPlenty) return { title: "Year of Plenty", detail: "Choose two resources from the bank." };
   if (input.stagedTradeRole === "offerer") return { title: "Choose trade partner", detail: "Pick a player who wants to accept, or cancel the offer." };
   if (input.stagedTradeRole === "recipient") return { title: "Answer trade", detail: "Mark whether you want to accept before the offer expires." };
   if (state.phase.type === "SETUP_PLACEMENT" && input.pendingSetup) {
-    return { title: "Place setup road", detail: "Pick a glowing brown edge attached to the new settlement." };
+    return { title: "Place setup road", detail: "Choose a marked edge, then confirm your road." };
   }
-  if (state.phase.type === "SETUP_PLACEMENT") return { title: "Place setup settlement", detail: "Pick a glowing corner, then choose its road edge." };
+  if (state.phase.type === "SETUP_PLACEMENT") return { title: "Place setup settlement", detail: "Choose a marked corner and confirm your village." };
   if (state.phase.type === "WAITING_FOR_ROLL") return { title: "Roll dice", detail: "Roll for matching numbered tiles." };
-  if (input.canBuild) return { title: "Build or trade", detail: "Choose a build mode, use glowing spots, trade, or end." };
+  if (input.canBuild) return { title: "Build or trade", detail: "Choose a build mode, use marked spots, trade, or end." };
   return { title: "Trade or end", detail: "Trade if eligible, or end the turn." };
 };

@@ -1066,10 +1066,10 @@ export class RoomManager {
     else delete room.timer;
   }
 
-  async submitCommand(roomId: string, session: Session, clientSeq: number, command: GameCommand): Promise<CommandResult> {
+  async submitCommand(roomId: string, session: Session, clientSeq: number, command: GameCommand, expectedEventSeq?: number): Promise<CommandResult> {
     const targetRoom = await this.ensureRoomLoadedByRef(roomId);
     const canonicalRoomId = targetRoom?.id ?? roomId;
-    return this.enqueueRoom(canonicalRoomId, () => this.submitCommandNow(targetRoom, canonicalRoomId, session, clientSeq, command));
+    return this.enqueueRoom(canonicalRoomId, () => this.submitCommandNow(targetRoom, canonicalRoomId, session, clientSeq, command, expectedEventSeq));
   }
 
   async expireTurn(roomId: string, now = Date.now()): Promise<CommandResult | undefined> {
@@ -1125,7 +1125,7 @@ export class RoomManager {
     return { ok: true, events, state: room.game };
   }
 
-  private async submitCommandNow(targetRoom: Room | undefined, roomId: string, session: Session, clientSeq: number, command: GameCommand): Promise<CommandResult> {
+  private async submitCommandNow(targetRoom: Room | undefined, roomId: string, session: Session, clientSeq: number, command: GameCommand, expectedEventSeq?: number): Promise<CommandResult> {
     const room = this.roomForRef(roomId) ?? targetRoom;
     if (!room?.game) return { ok: false, code: "ROOM_NOT_IN_GAME", message: "Room is not in game" };
     if (!await this.claimRoom(room)) return { ok: false, code: "ROOM_NOT_OWNED", message: "Room is owned by another server" };
@@ -1143,7 +1143,11 @@ export class RoomManager {
     }
 
     const previousState = room.game;
-    const result = applyCommand(previousState, command);
+    // Duplicate results are resolved above before checking the original state.
+    // An unprocessed command must never execute later in another turn after a retry.
+    const result = expectedEventSeq !== undefined && expectedEventSeq !== previousState.eventSeq
+      ? { ok: false as const, error: { code: "STALE_STATE", message: "The table changed. Review the board and try your action again." } }
+      : applyCommand(previousState, command);
     if (!result.ok) {
       const rejected = rejectedStoredCommandResult({
         roomId: room.id,

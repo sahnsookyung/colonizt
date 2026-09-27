@@ -34,8 +34,6 @@ import { createDemoGame } from "@colonizt/demo-state";
 import type { PublicRoomPayload } from "@colonizt/protocol";
 import { platform, track } from "./analytics.js";
 import {
-  BoardHousePiece,
-  BoardIcon,
   BotSymbol,
   DicePanel,
   EndTurnSymbol,
@@ -53,6 +51,9 @@ import {
   resourceLabels,
   terrainLabels,
 } from "./components/game-ui.js";
+import { GameBoard } from "./components/game-board.js";
+import { SetupScreen } from "./components/setup-screen.js";
+import { InviteShare } from "./components/invite-share.js";
 import { HandRack, type DevelopmentCardGroupView } from "./components/hand-rack.js";
 import { LobbyScreen, type LobbySettingsInput } from "./components/lobby-screen.js";
 import { PlayerStatsList } from "./components/player-stats-list.js";
@@ -75,8 +76,8 @@ import {
   visiblePlayerResourceCount as selectVisiblePlayerResourceCount,
   visibleStealTargets as selectVisibleStealTargets,
 } from "./game-view-model.js";
-import { boardBounds, firstStealTarget, roadBuildingCandidateEdgesFor } from "./board-interactions.js";
-import { defaultMatchOptions, mapPresetLabels, onlineRoomCapacityText, toPlayerCount, type MatchOptions } from "./match-options.js";
+import { firstStealTarget, roadBuildingCandidateEdgesFor } from "./board-interactions.js";
+import { defaultMatchOptions, toPlayerCount, type MatchOptions } from "./match-options.js";
 import { createNetworkClient } from "./network.js";
 import { isTerminalOnlineError, networkErrorMessage } from "./network-errors.js";
 import { canSubmitDiscardDraft, incrementDiscardDraft } from "./discard-policy.js";
@@ -136,14 +137,18 @@ export const App = () => {
   const [events, setEvents] = useState<GameEvent[]>([]);
   const [serverViewer, setServerViewer] = useState<ViewerState | null>(null);
   const [appScreen, setAppScreen] = useState<AppScreen>("setup");
-  const [selectedEdge, setSelectedEdge] = useState<EdgeId | null>(null);
-  const [selectedVertex, setSelectedVertex] = useState<VertexId | null>(null);
+  const [, setSelectedEdge] = useState<EdgeId | null>(null);
+  const [, setSelectedVertex] = useState<VertexId | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [joinCode, setJoinCode] = useState("");
+  const [shareOpen, setShareOpen] = useState(false);
   const [playerDisplayName, setPlayerDisplayName] = useState("Player");
+  const displayNameDraftRef = useRef<string | null>(null);
+  const restoredCommandRef = useRef<GameCommand | undefined>(undefined);
+  const commandErrorRef = useRef<string | null>(null);
   const [networkRoom, setNetworkRoom] = useState<PublicRoomPayload | null>(null);
   const [lobbyPending, setLobbyPending] = useState({ ready: false, settings: false, start: false, name: false });
-  const [networkSocketOpen, setNetworkSocketOpen] = useState(false);
+
   const [showMatchDetails, setShowMatchDetails] = useState(false);
   const { tradeOffer, setTradeOffer, tradeRequest, setTradeRequest, tradeOpen, setTradeOpen, setTradeDraft, clearTradeDraft } = useTradeDraft();
   const [selectedTradeResponder, setSelectedTradeResponder] = useState<PlayerId | null>(null);
@@ -170,15 +175,11 @@ export const App = () => {
     reconnectRetryAt,
     pendingCommandCount,
     socketRef,
-    shouldReconnectRef,
     clientSeqRef,
     lastServerSeqRef,
-    resetReconnectState,
-    scheduleReconnect,
-    retryReconnectNow,
-    markCommandPending,
-    clearPendingCommands,
+    controller, connectionState, serverClockOffsetMs,
   } = useNetworkRoom();
+  const networkSocketOpen = connectionState === "connected";
   const replayController = useReplayController();
   const matchMenuOpen = appScreen === "setup";
   const isPlayableScreen = appScreen === "localGame" || appScreen === "onlineGame";
@@ -190,7 +191,6 @@ export const App = () => {
   const networkRoomInfoRef = useSyncedRef(networkRoomInfo);
   const initialOnlineConnectRef = useRef(false);
   const networkGenerationRef = useRef(0);
-  const networkJoinTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hydratedFinishedReplayRef = useRef<string | null>(null);
   const soundCursorRef = useRef<{ matchId: string; seq: number; initialized: boolean }>({ matchId: liveState.config.matchId, seq: 0, initialized: false });
 
@@ -215,7 +215,6 @@ export const App = () => {
     ? (state.board.adjacency.vertexToEdges[pendingSetupVertex] ?? []).filter((edgeId) => canBuildRoad(state, humanPlayerId, edgeId, pendingSetupVertex))
     : [];
   const actionRoadEdges = legal.find((action) => action.type === "BUILD_ROAD")?.edges ?? [];
-  const bounds = useMemo(() => boardBounds(state), [state.board]);
   const activePlayer = "activePlayerId" in state.phase ? state.phase.activePlayerId : undefined;
   const activeName = activePlayer ? state.players[activePlayer]?.name ?? activePlayer : undefined;
   const humanPlayer = state.players[humanPlayerId];
@@ -317,7 +316,9 @@ export const App = () => {
     .filter((trade) => trade.fromPlayerId === humanPlayerId || trade.recipients === "ANY" || trade.recipients.includes(humanPlayerId));
   const activeStagedTrade = stagedTrades[0];
   const stagedTradeDeadline = activeStagedTrade
-    ? (viewer.tradeResponseDeadlines?.[activeStagedTrade.id] ?? localTradeDeadlines[activeStagedTrade.id])
+    ? (viewer.tradeResponseDeadlines?.[activeStagedTrade.id] !== undefined
+      ? viewer.tradeResponseDeadlines[activeStagedTrade.id]! - serverClockOffsetMs
+      : localTradeDeadlines[activeStagedTrade.id])
     : undefined;
   const stagedRecipientIds = activeStagedTrade
     ? state.playerOrder.filter((playerId) =>
@@ -427,7 +428,7 @@ export const App = () => {
     setEvents(nextEvents);
     setError(null);
     if (command.type === "DISCARD_RESOURCES") setDiscardDraft(emptyResources());
-    if (command.type === "PLAY_ROAD_BUILDING" || command.type === "PLAY_KNIGHT" || command.type === "MOVE_THIEF") {
+    if (command.type === "PLAY_MONOPOLY" || command.type === "PLAY_YEAR_OF_PLENTY" || command.type === "PLAY_ROAD_BUILDING" || command.type === "PLAY_KNIGHT" || command.type === "MOVE_THIEF") {
       setSpecialBoardMode(null);
       setRoadBuildingDraft({ cardId: "", edgeIds: [] });
       setRobberTargetHexId(null);
@@ -462,27 +463,13 @@ export const App = () => {
       setError("Exit replay before taking game actions");
       return;
     }
-    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN && networkRoomId) {
-      createNetworkClient().sendCommand(socketRef.current, networkRoomId, clientSeqRef.current, command);
-      markCommandPending();
-      clientSeqRef.current += 1;
-      if (networkSession) writeNetworkResume(networkSession, networkRoomId, networkRoomInfo?.code);
-      if (command.type === "DISCARD_RESOURCES") setDiscardDraft(emptyResources());
-      if (command.type === "PLAY_ROAD_BUILDING" || command.type === "PLAY_KNIGHT" || command.type === "MOVE_THIEF") {
-        setSpecialBoardMode(null);
-        setRoadBuildingDraft({ cardId: "", edgeIds: [] });
-        setRobberTargetHexId(null);
-      }
-      if (command.type === "MARITIME_TRADE" || command.type === "OFFER_TRADE") {
-        clearTradeDraft();
-        setTradeOpen(false);
-      }
-      track("network_command_sent", { mode: "network", platform: platform(), command: command.type, latencyMs: performance.now() - started });
-      return;
-    }
     if (networkRoomId) {
-      setNetworkStatus("Waiting for online connection");
-      setError("Online connection is unavailable. Reconnect before taking game actions.");
+      if (!controller.send(command)) {
+        setError(pendingCommandCount ? "Waiting for your previous action to be confirmed." : "Reconnecting to your table. Your action has not been sent.");
+      } else {
+        commandErrorRef.current = null;
+        setError(null);
+      }
       return;
     }
     const result = applyLocalCommand(command);
@@ -495,6 +482,7 @@ export const App = () => {
     activePlayer,
     paused: !isPlayableScreen || isReplaying,
     networkRoomId,
+    serverClockOffsetMs,
     serverTimer: networkRoom?.timer ?? networkRoomInfo?.timer ?? null,
     rollDeadlineMs,
     actionDeadlineMs,
@@ -580,7 +568,7 @@ export const App = () => {
     } else if (state.phase.type === "SETUP_PLACEMENT" && pendingSetupVertex && legalRoads.has(edgeId)) {
       playSound("select");
       commit({ type: "PLACE_SETUP", playerId: humanPlayerId, vertexId: pendingSetupVertex, edgeId });
-      setPendingSetupVertex(null);
+      if (!networkRoomId) setPendingSetupVertex(null);
     } else if (state.phase.type === "ACTION_PHASE" && buildMode === "road" && legalRoads.has(edgeId)) {
       playSound("select");
       commit({ type: "BUILD_ROAD", playerId: humanPlayerId, edgeId });
@@ -609,6 +597,7 @@ export const App = () => {
       ...(roomCode ? { roomCode } : {}),
       clientSeq: clientSeqRef.current,
       lastSeq: lastServerSeqRef.current,
+      ...(controller.pendingCommand ? { pendingCommand: controller.pendingCommand } : {}),
     });
   };
 
@@ -619,31 +608,23 @@ export const App = () => {
     }
   };
 
-  const clearNetworkJoinTimeout = () => {
-    if (networkJoinTimeoutRef.current) clearTimeout(networkJoinTimeoutRef.current);
-    networkJoinTimeoutRef.current = null;
-  };
-
   const resetNetworkSession = () => {
     networkGenerationRef.current += 1;
-    shouldReconnectRef.current = false;
-    resetReconnectState();
-    clearPendingCommands();
-    clearNetworkJoinTimeout();
-    socketRef.current?.close();
-    socketRef.current = null;
+    displayNameDraftRef.current = null;
+    restoredCommandRef.current = undefined;
+    controller.stop();
     setNetworkSession(null);
     setNetworkRoomId(null);
     setNetworkRoomInfo(null);
     setNetworkRoom(null);
     setLobbyPending({ ready: false, settings: false, start: false, name: false });
-    setNetworkSocketOpen(false);
     clientSeqRef.current = 1;
     lastServerSeqRef.current = 0;
     clearResumeState();
   };
 
   const resetPlayUi = () => {
+    commandErrorRef.current = null;
     replayController.exit();
     setServerViewer(null);
     setEvents([]);
@@ -764,6 +745,7 @@ export const App = () => {
       return;
     }
     setPlayerDisplayName(nextName);
+    displayNameDraftRef.current = nextName;
     setLobbyPending((current) => ({ ...current, name: true }));
     socketRef.current.send(JSON.stringify({ type: "UPDATE_DISPLAY_NAME", displayName: nextName }));
     setNetworkStatus("Name saved");
@@ -818,8 +800,10 @@ export const App = () => {
     const edgeIds = selected[1] ? [selected[0], selected[1]] as [EdgeId, EdgeId] : [selected[0]] as [EdgeId];
     playSound("select");
     commit({ type: "PLAY_ROAD_BUILDING", playerId: humanPlayerId, cardId, edgeIds });
-    setRoadBuildingDraft({ cardId: "", edgeIds: [] });
-    setSpecialBoardMode(null);
+    if (appScreen !== "onlineGame") {
+      setRoadBuildingDraft({ cardId: "", edgeIds: [] });
+      setSpecialBoardMode(null);
+    } else setRoadBuildingDraft({ cardId, edgeIds: selected });
   };
   const selectRoadBuildingEdge = (cardId: string, edgeId: EdgeId) => {
     playSound("select");
@@ -865,12 +849,12 @@ export const App = () => {
   };
   const moveThief = (hexId: HexId, stealFromPlayerId?: PlayerId) => {
     playSound("select");
-    setRobberTargetHexId(null);
+    if (appScreen !== "onlineGame") setRobberTargetHexId(null);
     commit({ type: "MOVE_THIEF", playerId: humanPlayerId, hexId, ...(stealFromPlayerId ? { stealFromPlayerId } : {}) });
   };
   const playKnight = (cardId: string, hexId: HexId, stealFromPlayerId?: PlayerId) => {
     playSound("select");
-    setRobberTargetHexId(null);
+    if (appScreen !== "onlineGame") setRobberTargetHexId(null);
     commit({ type: "PLAY_KNIGHT", playerId: humanPlayerId, cardId, hexId, ...(stealFromPlayerId ? { stealFromPlayerId } : {}) });
   };
   const startKnightTargeting = (cardId: string) => {
@@ -896,12 +880,12 @@ export const App = () => {
   const playMonopoly = (cardId: string, resource: Resource) => {
     playSound("select");
     commit({ type: "PLAY_MONOPOLY", playerId: humanPlayerId, cardId, resource });
-    setSpecialBoardMode(null);
+    if (appScreen !== "onlineGame") setSpecialBoardMode(null);
   };
   const playYearOfPlenty = (cardId: string, picked: [Resource, Resource]) => {
     playSound("select");
     commit({ type: "PLAY_YEAR_OF_PLENTY", playerId: humanPlayerId, cardId, resources: picked });
-    setSpecialBoardMode(null);
+    if (!networkRoomId) setSpecialBoardMode(null);
   };
   const setYearOfPlentyResource = (index: 0 | 1, resource: Resource) => {
     setYearOfPlentyDraft((current) => index === 0 ? [resource, current[1]] : [current[0], resource]);
@@ -1013,16 +997,16 @@ export const App = () => {
       mode: "road",
       label: "Road",
       ariaLabel: "Build road",
-      tooltip: canBuildRoadAction || setupRoadActive ? `Road: build on a glowing edge connected to your network. Cost: ${formatCost(roadCost())}.` : actionBuildReason("road") ?? `Road cost: ${formatCost(roadCost())}.`,
+      tooltip: canBuildRoadAction || setupRoadActive ? `Road: build on a marked edge connected to your network. Cost: ${formatCost(roadCost())}.` : actionBuildReason("road") ?? `Road cost: ${formatCost(roadCost())}.`,
       selected: state.phase.type === "SETUP_PLACEMENT" ? setupRoadActive : state.phase.type === "ACTION_PHASE" && buildMode === "road" && canBuildRoadAction,
       disabled: state.phase.type === "SETUP_PLACEMENT" ? !setupRoadActive : state.phase.type !== "ACTION_PHASE" || !canBuildRoadAction,
       icon: <RoadSymbol />,
     },
     {
       mode: "settlement",
-      label: "Settlement",
+      label: "Settle",
       ariaLabel: "Build settlement",
-      tooltip: canBuildSettlement || setupSettlementActive ? `Settlement: build a house on a glowing corner at least two edges away from other houses. Cost: ${formatCost(settlementCost())}.` : actionBuildReason("settlement") ?? `Settlement cost: ${formatCost(settlementCost())}.`,
+      tooltip: canBuildSettlement || setupSettlementActive ? `Settlement: build a house on a marked corner at least two edges away from other houses. Cost: ${formatCost(settlementCost())}.` : actionBuildReason("settlement") ?? `Settlement cost: ${formatCost(settlementCost())}.`,
       selected: state.phase.type === "SETUP_PLACEMENT" ? setupSettlementActive : state.phase.type === "ACTION_PHASE" && buildMode === "settlement" && canBuildSettlement,
       disabled: state.phase.type === "SETUP_PLACEMENT" ? !setupSettlementActive : state.phase.type !== "ACTION_PHASE" || !canBuildSettlement,
       icon: <HouseSymbol />,
@@ -1104,24 +1088,19 @@ export const App = () => {
   const finalizeTrade = (tradeId: string, toPlayerId: PlayerId) => {
     playSound("select");
     commit({ type: "FINALIZE_TRADE", playerId: humanPlayerId, tradeId, toPlayerId });
-    setSelectedTradeResponder(null);
+    if (!networkRoomId) setSelectedTradeResponder(null);
     track("trade_finalized", { mode: socketRef.current ? "network" : "local", platform: platform(), tradeId, toPlayerId });
   };
   const cancelTrade = (tradeId: string) => {
     playSound("select");
     commit({ type: "CANCEL_TRADE", playerId: humanPlayerId, tradeId });
-    setSelectedTradeResponder(null);
+    if (!networkRoomId) setSelectedTradeResponder(null);
     track("trade_cancelled", { mode: socketRef.current ? "network" : "local", platform: platform(), tradeId });
   };
-  const copyInvite = () => {
-    if (!networkRoomInfo) return;
-    const inviteUrl = networkRoomInfo.inviteUrl ?? `${window.location.origin}/?room=${encodeURIComponent(networkRoomInfo.code ?? networkRoomInfo.id)}`;
-    void navigator.clipboard?.writeText(inviteUrl).then(() => {
-      setNetworkStatus(`Copied invite ${networkRoomInfo.code ?? networkRoomInfo.id}`);
-    }).catch(() => {
-      setNetworkStatus(inviteUrl);
-    });
-  };
+  const copyInvite = () => setShareOpen(true);
+  const inviteShare = networkRoomInfo && shareOpen ? <InviteShare code={networkRoomInfo.code ?? networkRoomInfo.id}
+    url={networkRoomInfo.inviteUrl ?? `${window.location.origin}/?room=${encodeURIComponent(networkRoomInfo.code ?? networkRoomInfo.id)}`}
+    onClose={() => setShareOpen(false)}/> : null;
 
   const hydrateFinishedReplayEvents = async (
     roomRef: string | undefined,
@@ -1140,72 +1119,78 @@ export const App = () => {
     }
   };
 
+  const confirmedOnlineCommand = (command: GameCommand) => {
+    commandErrorRef.current = null;
+    setError(null);
+    if (command.type === "PLACE_SETUP") setPendingSetupVertex(null);
+    if (command.type === "DISCARD_RESOURCES") setDiscardDraft(emptyResources());
+    if (command.type === "PLAY_MONOPOLY" || command.type === "PLAY_YEAR_OF_PLENTY" || command.type === "PLAY_ROAD_BUILDING" || command.type === "PLAY_KNIGHT" || command.type === "MOVE_THIEF") {
+      setSpecialBoardMode(null); setRoadBuildingDraft({ cardId: "", edgeIds: [] }); setRobberTargetHexId(null);
+    }
+    if (command.type === "MARITIME_TRADE" || command.type === "OFFER_TRADE") { clearTradeDraft(); setTradeOpen(false); }
+    if (command.type === "FINALIZE_TRADE" || command.type === "CANCEL_TRADE") setSelectedTradeResponder(null);
+  };
+
+  const restoreCommandDraft = (command: GameCommand, authoritativeState: GameState) => {
+    switch (command.type) {
+      case "FINALIZE_TRADE": setSelectedTradeResponder(command.toPlayerId); break;
+      case "OFFER_TRADE":
+        setTradeDraft({ offer: command.offered, request: command.requested });
+        setTradeOpen(true);
+        break;
+      case "MARITIME_TRADE":
+        setTradeDraft({ offer: { ...emptyResources(), [command.offered]: maritimeTradeRatio(authoritativeState, command.playerId, command.offered) }, request: { ...emptyResources(), [command.requested]: 1 } });
+        setTradeOpen(true);
+        break;
+      case "DISCARD_RESOURCES": setDiscardDraft(command.resources); break;
+      case "PLACE_SETUP": setPendingSetupVertex(command.vertexId); break;
+      case "PLAY_ROAD_BUILDING":
+        setSpecialBoardMode({ type: "roadBuilding", cardId: command.cardId });
+        setRoadBuildingDraft({ cardId: command.cardId, edgeIds: command.edgeIds });
+        setBuildMode("road");
+        break;
+      case "PLAY_YEAR_OF_PLENTY":
+        setSpecialBoardMode({ type: "yearOfPlenty", cardId: command.cardId });
+        setYearOfPlentyDraft(command.resources);
+        break;
+      case "PLAY_MONOPOLY": setSpecialBoardMode({ type: "monopoly", cardId: command.cardId }); break;
+      case "PLAY_KNIGHT":
+        setSpecialBoardMode({ type: "knight", cardId: command.cardId });
+        setRobberTargetHexId(command.hexId);
+        break;
+      case "MOVE_THIEF": setRobberTargetHexId(command.hexId); break;
+    }
+  };
+
   const connectOnlineSession = (session: { token: string; userId: PlayerId }, roomId: string, ready: boolean, generation = networkGenerationRef.current) => {
     if (!isNetworkGeneration(generation)) return;
-    setNetworkSocketOpen(false);
-    shouldReconnectRef.current = true;
-    const client = createNetworkClient();
-    void client.connect(session.token, {
-      onOpen: (openSocket) => {
-        if (!isNetworkGeneration(generation)) {
-          openSocket.close();
-          return;
-        }
-        socketRef.current = openSocket;
-        setNetworkSocketOpen(true);
-        clearNetworkJoinTimeout();
-        networkJoinTimeoutRef.current = setTimeout(() => {
-          if (!isNetworkGeneration(generation)) return;
-          setNetworkStatus("Online join timed out");
-          setError("The server did not confirm the room join. Reconnecting...");
-          openSocket.close(4001, "Room join timeout");
-        }, 10_000);
-        openSocket.send(JSON.stringify({ type: "JOIN_ROOM", roomId }));
-        if (ready) openSocket.send(JSON.stringify({ type: "READY", roomId, ready: true }));
-      },
+    controller.start(session, roomId, ready, {
+      onConfirmed: confirmedOnlineCommand,
       onEvents: (incomingEvents, snapshot, timer) => {
         if (!isNetworkGeneration(generation)) return;
-        clearNetworkJoinTimeout();
-        resetReconnectState();
-        clearPendingCommands();
-        const roomInfo = networkRoomInfoRef.current;
-        const canonicalRoomId = roomInfo?.id ?? roomId;
-        if (incomingEvents.length > 0) {
-          const expectedSeq = lastServerSeqRef.current + 1;
-          if (incomingEvents[0]!.seq !== expectedSeq && socketRef.current?.readyState === WebSocket.OPEN) {
-            socketRef.current.send(JSON.stringify({ type: "RESYNC", roomId, lastSeq: lastServerSeqRef.current }));
-            return;
-          }
-          lastServerSeqRef.current = Math.max(lastServerSeqRef.current, ...incomingEvents.map((event) => event.seq));
-          setEvents((current) => [...current, ...incomingEvents]);
-          if (!snapshot) {
-            setServerViewer((current) => current ? applyEventsToViewerProjection(current, incomingEvents, canonicalRoomId, current.viewerId, currentConfigOptions()) : null);
-            setLiveState((current) => applyEvents(current, incomingEvents));
-          }
-          if (incomingEvents.some((event) => event.type === "GAME_OVER")) {
-            void hydrateFinishedReplayEvents(canonicalRoomId, session, generation);
-          }
-        }
+        const canonicalRoomId = networkRoomInfoRef.current?.id ?? roomId;
+        const tail = snapshot ? incomingEvents.filter((event) => event.seq > snapshot.eventSeq) : incomingEvents;
         if (snapshot) {
           const projectedState = projectViewerToGameState(snapshot, canonicalRoomId, currentConfigOptions());
-          setLiveState(projectedState);
-          setServerViewer(snapshot);
-          lastServerSeqRef.current = Math.max(lastServerSeqRef.current, snapshot.eventSeq);
-          if (incomingEvents.length === 0) setEvents([]);
+          setLiveState(tail.length ? applyEvents(projectedState, tail) : projectedState);
+          setServerViewer(tail.length ? applyEventsToViewerProjection(snapshot, tail, canonicalRoomId, snapshot.viewerId, currentConfigOptions()) : snapshot);
           setAppScreen("onlineGame");
           if (projectedState.phase.type === "GAME_OVER") void hydrateFinishedReplayEvents(canonicalRoomId, session, generation);
+        } else if (tail.length) {
+          setServerViewer((current) => current ? applyEventsToViewerProjection(current, tail, canonicalRoomId, current.viewerId, currentConfigOptions()) : null);
+          setLiveState((current) => applyEvents(current, tail));
+        }
+        if (incomingEvents.length) {
+          setEvents((current) => [...new Map([...current, ...incomingEvents].map((event) => [event.seq, event])).values()].sort((a, b) => a.seq - b.seq));
+          if (incomingEvents.some((event) => event.type === "GAME_OVER")) void hydrateFinishedReplayEvents(canonicalRoomId, session, generation);
         }
         if (timer) {
           setNetworkRoom((current) => current ? { ...current, timer } : current);
           setNetworkRoomInfo((current) => current ? { ...current, timer } : current);
         }
-        writeNetworkResume(session, canonicalRoomId, roomInfo?.code ?? (roomId.startsWith("room_") ? undefined : roomId));
-        setNetworkStatus(`Online ${roomInfo?.code ?? roomId}`);
       },
       onRoom: (incomingRoom) => {
         if (!isNetworkGeneration(generation)) return;
-        clearNetworkJoinTimeout();
-        resetReconnectState();
         const publicRoom = incomingRoom as PublicRoomPayload;
         setLobbyPending({ ready: false, settings: false, start: false, name: false });
         setNetworkRoom(publicRoom);
@@ -1225,7 +1210,10 @@ export const App = () => {
           }));
         }
         const ownPayloadSeat = publicRoom.seats?.find((seat) => seat.userId === session.userId);
-        if (ownPayloadSeat?.displayName) setPlayerDisplayName(ownPayloadSeat.displayName);
+        if (ownPayloadSeat?.displayName && (displayNameDraftRef.current === null || ownPayloadSeat.displayName === displayNameDraftRef.current)) {
+          setPlayerDisplayName(ownPayloadSeat.displayName);
+          displayNameDraftRef.current = null;
+        }
         setEvents(publicRoom.events ?? []);
         const roomConfigOptions: Partial<Pick<GameConfig, "botDifficulty" | "rules">> = {
           botDifficulty: publicRoom.settings?.botDifficulty ?? currentConfigOptions().botDifficulty,
@@ -1236,6 +1224,10 @@ export const App = () => {
         };
         if (publicRoom.game) {
           const projectedState = projectViewerToGameState(publicRoom.game, publicRoom.id, roomConfigOptions);
+          if (restoredCommandRef.current) {
+            restoreCommandDraft(restoredCommandRef.current, projectedState);
+            restoredCommandRef.current = undefined;
+          }
           setLiveState(projectedState);
           setServerViewer(publicRoom.game);
           lastServerSeqRef.current = Math.max(lastServerSeqRef.current, publicRoom.game.eventSeq, ...(publicRoom.events ?? []).map((event) => event.seq));
@@ -1255,61 +1247,25 @@ export const App = () => {
         });
         writeNetworkResume(session, publicRoom.id, publicRoom.code);
         setNetworkStatus(`Online ${publicRoom.code ?? publicRoom.id} · ${publicRoom.status}`);
+
+        setError(commandErrorRef.current);
       },
       onError: (incomingError) => {
         if (!isNetworkGeneration(generation)) return;
-        clearPendingCommands();
         setLobbyPending({ ready: false, settings: false, start: false, name: false });
         if (isTerminalOnlineError(incomingError)) {
           const message = networkErrorMessage(incomingError);
-          resetNetworkSession();
-          setAppScreen("setup");
-          setNetworkStatus(message);
-          setError(message);
+          resetNetworkSession(); setAppScreen("setup"); setNetworkStatus(message); setError(message);
           return;
         }
-        setError(networkErrorMessage(incomingError));
-      },
-      onAck: () => {
-        if (isNetworkGeneration(generation)) clearPendingCommands();
-      },
-      onClose: () => {
-        if (!isNetworkGeneration(generation)) return;
-        clearNetworkJoinTimeout();
-        setNetworkSocketOpen(false);
-        if (!shouldReconnectRef.current) return;
-        setNetworkStatus("Online connection closed");
-        scheduleReconnect(() => connectOnlineSession(session, roomId, false, generation));
-      },
-    }).then((socket) => {
-      if (!isNetworkGeneration(generation)) {
-        socket.close();
-        return;
-      }
-      socketRef.current = socket;
-    }).catch((connectError) => {
-      if (!isNetworkGeneration(generation)) return;
-      clearNetworkJoinTimeout();
-      if (isTerminalOnlineError(connectError)) {
-        const message = networkErrorMessage(connectError);
-        resetNetworkSession();
-        setAppScreen("setup");
-        setNetworkStatus(message);
+        const message = networkErrorMessage(incomingError);
+        if (incomingError && typeof incomingError === "object" && "type" in incomingError && incomingError.type === "COMMAND_REJECTED") commandErrorRef.current = message;
         setError(message);
-        return;
-      }
-      setNetworkStatus("Online unavailable");
-      setError(networkErrorMessage(connectError));
-      if (shouldReconnectRef.current) {
-        scheduleReconnect(() => connectOnlineSession(session, roomId, false, generation));
-      }
+      },
     });
   };
 
-  const retryOnlineNow = () => {
-    if (!networkSession || !networkRoomId) return;
-    retryReconnectNow(() => connectOnlineSession(networkSession, networkRoomId, false));
-  };
+  const retryOnlineNow = () => controller.retry();
 
   const startOnlineRoom = async () => {
     clearAutomationTimers();
@@ -1349,6 +1305,7 @@ export const App = () => {
   const joinOnlineRoom = async (roomId: string) => {
     const roomRef = roomId.trim().toUpperCase();
     if (!roomRef) return;
+    setJoinCode(roomRef);
     clearAutomationTimers();
     resetNetworkSession();
     const generation = networkGenerationRef.current;
@@ -1387,11 +1344,7 @@ export const App = () => {
 
   const cleanupOnlineSession = () => {
     networkGenerationRef.current += 1;
-    shouldReconnectRef.current = false;
-    resetReconnectState();
-    clearNetworkJoinTimeout();
-    socketRef.current?.close();
-    setNetworkSocketOpen(false);
+    controller.stop(false);
   };
 
   useEffect(() => {
@@ -1415,6 +1368,8 @@ export const App = () => {
     const generation = networkGenerationRef.current;
     setAppScreen("onlineLobby");
     clientSeqRef.current = resumable.clientSeq;
+    controller.pendingCommand = resumable.pendingCommand;
+    restoredCommandRef.current = resumable.pendingCommand?.command;
     lastServerSeqRef.current = resumable.lastSeq;
     setNetworkSession({ token: resumable.token, userId: resumable.userId });
     setNetworkRoomId(resumable.roomId);
@@ -1503,138 +1458,12 @@ export const App = () => {
     }
   }, [activePlayer, humanPlayerId, state.phase.type]);
 
-  if (matchMenuOpen) {
-    return (
-      <main className="app-shell start-app">
-        <section className="start-screen" aria-label="Match setup">
-          <div className="start-panel">
-            <div className="start-brand">
-              <h1>Colonizt</h1>
-              <span>Match setup</span>
-            </div>
-            <div className="match-menu" role="group" aria-label="Choose match type">
-              <button type="button" className="match-choice" onClick={startBotMatch}>
-                <span className="match-art" aria-hidden="true">
-                  <HouseSymbol />
-                  <RoadSymbol />
-                </span>
-                <strong>Bot Match</strong>
-                <span>Local table</span>
-                <span className="match-cta">Start</span>
-              </button>
-              <button type="button" className="match-choice" onClick={startPlayerMatch}>
-                <span className="match-art" aria-hidden="true">
-                  <HouseSymbol city />
-                  <RoadSymbol />
-                </span>
-                <strong>Player Match</strong>
-                <span>{onlineRoomCapacityText(matchOptions.playerCount)}</span>
-                <span className="match-cta">Host</span>
-              </button>
-            </div>
-            <form
-              className="room-code-join"
-              aria-label="Join by room code"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void joinOnlineRoom(joinCode);
-              }}
-            >
-              <label htmlFor="room-code-input">Room code</label>
-              <input
-                id="room-code-input"
-                value={joinCode}
-                onChange={(event) => setJoinCode(event.currentTarget.value.toUpperCase())}
-                inputMode="text"
-                autoComplete="off"
-                maxLength={12}
-                placeholder="ABC123"
-              />
-              <button type="submit" disabled={joinCode.trim().length === 0}>Join</button>
-            </form>
-            <div className="match-options" aria-label="Game options">
-              <div className="option-row">
-                <span>Bot difficulty</span>
-                <div className="difficulty-options" role="group" aria-label="Bot difficulty">
-                  {(["easy", "medium", "hard"] as const).map((difficulty) => (
-                    <button
-                      key={difficulty}
-                      type="button"
-                      className={matchOptions.botDifficulty === difficulty ? "selected" : ""}
-                      aria-pressed={matchOptions.botDifficulty === difficulty}
-                      onClick={() => setBotDifficulty(difficulty)}
-                    >
-                      {difficulty}
-                    </button>
-                  ))}
-                </div>
-              </div>
-              <label className="rule-toggle">
-                <input
-                  type="checkbox"
-                  checked={matchOptions.rules.diceDoubles}
-                  onChange={(event) => setRuleEnabled("diceDoubles", event.currentTarget.checked)}
-                />
-                <span>Dice doubles x2</span>
-              </label>
-              <label className="rule-toggle">
-                <input
-                  type="checkbox"
-                  checked={matchOptions.rules.specialCardCostRandomized}
-                  onChange={(event) => setRuleEnabled("specialCardCostRandomized", event.currentTarget.checked)}
-                />
-                <span>Random special card cost</span>
-              </label>
-              <label className="rule-toggle">
-                <input
-                  type="checkbox"
-                  checked={matchOptions.rules.plight}
-                  onChange={(event) => setRuleEnabled("plight", event.currentTarget.checked)}
-                />
-                <span>Plight on turn 20</span>
-              </label>
-              <div className="option-row">
-                <span>Players</span>
-                <div className="difficulty-options" role="group" aria-label="Players">
-                  {([2, 3, 4] as const).map((playerCount) => (
-                    <button
-                      key={playerCount}
-                      type="button"
-                      className={matchOptions.playerCount === playerCount ? "selected" : ""}
-                      aria-pressed={matchOptions.playerCount === playerCount}
-                      onClick={() => setPlayerCount(playerCount)}
-                    >
-                      {playerCount}
-                    </button>
-                  ))}
-                </div>
-              </div>
-              <div className="option-row">
-                <span>Map</span>
-                <div className="difficulty-options" role="group" aria-label="Map">
-                  {(["standard", "islands", "continent"] as const).map((mapPreset) => (
-                    <button
-                      key={mapPreset}
-                      type="button"
-                      className={matchOptions.rules.mapPreset === mapPreset ? "selected" : ""}
-                      aria-pressed={matchOptions.rules.mapPreset === mapPreset}
-                      onClick={() => setMapPreset(mapPreset)}
-                    >
-                      {mapPresetLabels[mapPreset]}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </div>
-            {error ? <p className="start-error">{error}</p> : null}
-          </div>
-        </section>
-      </main>
-    );
-  }
+  if (matchMenuOpen) return <SetupScreen matchOptions={matchOptions} error={error} joinCode={joinCode}
+    startBotMatch={startBotMatch} startPlayerMatch={startPlayerMatch} joinOnlineRoom={joinOnlineRoom} setJoinCode={setJoinCode}
+    setBotDifficulty={setBotDifficulty} setRuleEnabled={setRuleEnabled} setPlayerCount={setPlayerCount} setMapPreset={setMapPreset}/>;
 
   if (appScreen === "onlineLobby") {
-    return (
+    return (<>
       <LobbyScreen
         networkRoom={networkRoom}
         roomCodeFallback={networkRoomInfo?.code ?? networkRoomInfo?.id}
@@ -1649,7 +1478,7 @@ export const App = () => {
         networkSocketOpen={networkSocketOpen}
         lobbyPending={lobbyPending}
         playerDisplayName={playerDisplayName}
-        onPlayerDisplayNameChange={setPlayerDisplayName}
+        onPlayerDisplayNameChange={(name) => { displayNameDraftRef.current = name; setPlayerDisplayName(name); }}
         onSaveDisplayName={saveLobbyDisplayName}
         onReturnToSetup={returnToSetup}
         onCopyInvite={copyInvite}
@@ -1663,12 +1492,13 @@ export const App = () => {
         onSetRuleEnabled={setRuleEnabled}
         onAddBot={sendLobbyAddBot}
         onRemoveBot={sendLobbyRemoveBot}
-      />
+      />{inviteShare}</>
     );
   }
 
   return (
     <main className="app-shell">
+      {inviteShare}
       <section className="game-surface" aria-label="Game board and actions">
         <header className="topbar">
           <div className="brand-block">
@@ -1682,7 +1512,7 @@ export const App = () => {
               <div className="room-topbar-actions" aria-label="Room controls">
                 <span>{networkRoomInfo.code ?? networkRoomInfo.id}</span>
                 <button type="button" onClick={copyInvite}>Copy Invite</button>
-                {reconnectRetryAt ? <button type="button" onClick={retryOnlineNow}>Retry</button> : null}
+                {(!networkSocketOpen && networkRoomId) ? <button type="button" onClick={retryOnlineNow}>Retry</button> : null}
                 <button type="button" onClick={returnToSetup}>Leave</button>
               </div>
             ) : null}
@@ -1701,328 +1531,31 @@ export const App = () => {
         </header>
 
         <div className="board-layout">
+            <PlayerStatsList
+              players={displayPlayers}
+              botPlayerIds={botPlayerIds}
+              victoryPointText={victoryPointText}
+              victoryPointAria={victoryPointAria}
+              {...(activePlayer ? { activePlayerId: activePlayer } : {})}
+            />
           <div className="board-stage">
+            {networkRoomId && (!networkSocketOpen || pendingCommandCount > 0) ? <div className="connection-banner" role="status">
+              <span>{pendingCommandCount ? "Confirming your action…" : networkStatus}</span>
+              {!networkSocketOpen ? <button onClick={retryOnlineNow}>Retry</button> : null}
+            </div> : null}
             {networkRoomInfo ? (
               <div className="room-hud-actions" aria-label="Room controls">
                 <span>{networkRoomInfo.code ?? networkRoomInfo.id}</span>
                 <button type="button" onClick={copyInvite}>Copy</button>
-                {reconnectRetryAt ? <button type="button" onClick={retryOnlineNow}>Retry</button> : null}
+                {(!networkSocketOpen && networkRoomId) ? <button type="button" onClick={retryOnlineNow}>Retry</button> : null}
                 <button type="button" onClick={returnToSetup}>Leave</button>
               </div>
             ) : null}
-            <svg className="board" viewBox={`${bounds.minX} ${bounds.minY} ${bounds.width} ${bounds.height}`} role="group" aria-label="Resource board" onClick={handleBoardClick}>
-              <defs>
-                <radialGradient id="oceanGlow" cx="50%" cy="44%" r="72%">
-                  <stop offset="0%" stopColor="#59b6ca" />
-                  <stop offset="58%" stopColor="#267fa1" />
-                  <stop offset="100%" stopColor="#154f77" />
-                </radialGradient>
-                <linearGradient id="terrainTimber" x1="0" x2="1" y1="0" y2="1">
-                  <stop offset="0%" stopColor="#73be5a" />
-                  <stop offset="58%" stopColor="#3d984e" />
-                  <stop offset="100%" stopColor="#26743a" />
-                </linearGradient>
-                <linearGradient id="terrainBrick" x1="0" x2="1" y1="0" y2="1">
-                  <stop offset="0%" stopColor="#dc815f" />
-                  <stop offset="62%" stopColor="#c95f49" />
-                  <stop offset="100%" stopColor="#a84336" />
-                </linearGradient>
-                <linearGradient id="terrainGrain" x1="0" x2="1" y1="0" y2="1">
-                  <stop offset="0%" stopColor="#f4d96c" />
-                  <stop offset="60%" stopColor="#e8bd40" />
-                  <stop offset="100%" stopColor="#c69223" />
-                </linearGradient>
-                <linearGradient id="terrainFiber" x1="0" x2="1" y1="0" y2="1">
-                  <stop offset="0%" stopColor="#bddf6a" />
-                  <stop offset="60%" stopColor="#88bd45" />
-                  <stop offset="100%" stopColor="#679c38" />
-                </linearGradient>
-                <linearGradient id="terrainOre" x1="0" x2="1" y1="0" y2="1">
-                  <stop offset="0%" stopColor="#d6e1dc" />
-                  <stop offset="58%" stopColor="#a7bbb7" />
-                  <stop offset="100%" stopColor="#7e9694" />
-                </linearGradient>
-                <linearGradient id="terrainDesert" x1="0" x2="1" y1="0" y2="1">
-                  <stop offset="0%" stopColor="#ead899" />
-                  <stop offset="62%" stopColor="#d3bc79" />
-                  <stop offset="100%" stopColor="#b99c5e" />
-                </linearGradient>
-                <pattern id="textureTimber" width="0.32" height="0.32" patternUnits="userSpaceOnUse" patternTransform="rotate(28)">
-                  <path d="M0 0.08h0.32M0 0.24h0.32" stroke="#1e6b37" strokeWidth="0.018" />
-                </pattern>
-                <pattern id="textureBrick" width="0.46" height="0.22" patternUnits="userSpaceOnUse">
-                  <path d="M0 0.02h0.46M0 0.12h0.46M0.12 0.02v0.1M0.34 0.12v0.1" stroke="#8e372f" strokeWidth="0.018" />
-                </pattern>
-                <pattern id="textureGrain" width="0.26" height="0.38" patternUnits="userSpaceOnUse">
-                  <path d="M0.13 0.04v0.3M0.13 0.15c-0.08 0.02-0.1 0.08-0.06 0.14M0.13 0.12c0.08 0.02 0.1 0.08 0.06 0.14" stroke="#9d731f" strokeWidth="0.018" fill="none" strokeLinecap="round" />
-                </pattern>
-                <pattern id="textureFiber" width="0.34" height="0.3" patternUnits="userSpaceOnUse">
-                  <circle cx="0.08" cy="0.08" r="0.025" fill="#f6f1e4" />
-                  <circle cx="0.24" cy="0.18" r="0.022" fill="#e9e1cf" />
-                </pattern>
-                <pattern id="textureOre" width="0.34" height="0.34" patternUnits="userSpaceOnUse">
-                  <path d="M0.02 0.22 0.12 0.1 0.26 0.14 0.31 0.27 0.18 0.31Z" fill="#eef4f1" opacity="0.72" />
-                  <path d="M0.12 0.1 0.19 0.21 0.31 0.27" stroke="#647476" strokeWidth="0.014" fill="none" />
-                </pattern>
-                <pattern id="textureDesert" width="0.42" height="0.22" patternUnits="userSpaceOnUse">
-                  <path d="M0 0.16c0.1-0.08 0.19-0.08 0.31 0 0.04 0.03 0.07 0.03 0.11 0" stroke="#9a7c48" strokeWidth="0.014" fill="none" strokeLinecap="round" />
-                </pattern>
-                <filter id="softShadow" x="-30%" y="-30%" width="160%" height="160%">
-                  <feDropShadow dx="0" dy="0.06" stdDeviation="0.05" floodColor="#0f2f3e" floodOpacity="0.32" />
-                </filter>
-              </defs>
-              <rect className="ocean" x={bounds.minX} y={bounds.minY} width={bounds.width} height={bounds.height} />
-              {Object.values(state.board.edges).filter((edge) => edge.adjacentHexes.length === 1).map((edge) => {
-                const a = state.board.vertices[edge.vertices[0]]!;
-                const b = state.board.vertices[edge.vertices[1]]!;
-                return (
-                  <g key={`shore-${edge.id}`} className="shore">
-                    <line className="shore-shelf" x1={a.x} y1={a.y} x2={b.x} y2={b.y} />
-                    <line className="shore-foam" x1={a.x} y1={a.y} x2={b.x} y2={b.y} />
-                    <line className="shore-edge" x1={a.x} y1={a.y} x2={b.x} y2={b.y} />
-                  </g>
-                );
-              })}
-              {Object.values(state.board.hexes).map((hex) => {
-                const points = state.board.adjacency.hexToVertices[hex.id]!.map((vertexId) => {
-                  const vertex = state.board.vertices[vertexId]!;
-                  return `${vertex.x},${vertex.y}`;
-                }).join(" ");
-                const center = state.board.adjacency.hexToVertices[hex.id]!.reduce((acc, vertexId) => {
-                  const vertex = state.board.vertices[vertexId]!;
-                  return { x: acc.x + vertex.x / 6, y: acc.y + vertex.y / 6 };
-                }, { x: 0, y: 0 });
-                const thiefHere = state.thiefHexId === hex.id;
-                const legalThiefDestination = legalThiefHexes.has(hex.id);
-                const stealTargets = legalThiefDestination ? visibleStealTargets(hex.id) : [];
-                const canSelectThiefDestination = legalThiefDestination && !thiefHere;
-                const robberSelected = robberTargetHexId === hex.id;
-                return (
-                  <g
-                    key={hex.id}
-                    className={`${thiefHere ? "thief-hex" : ""} ${legalThiefDestination ? "legal-thief-hex" : ""} ${robberSelected ? "selected-thief-hex" : ""} ${stealTargets.length > 0 ? "has-steal-targets" : ""}`}
-                    filter="url(#softShadow)"
-                    role={canSelectThiefDestination ? "button" : undefined}
-                    tabIndex={canSelectThiefDestination ? 0 : undefined}
-                    aria-label={canSelectThiefDestination ? stealTargets.length > 0 ? `Select robber destination on ${terrainLabels[hex.resource]} hex with steal targets` : `Move robber to ${terrainLabels[hex.resource]} hex without stealing` : undefined}
-                    onClick={(event) => {
-                      if (!canSelectThiefDestination) return;
-                      event.stopPropagation();
-                      handleHex(hex.id);
-                    }}
-                    onKeyDown={(event) => {
-                      if (!canSelectThiefDestination || (event.key !== "Enter" && event.key !== " ")) return;
-                      event.preventDefault();
-                      event.stopPropagation();
-                      handleHex(hex.id);
-                    }}
-                  >
-                    <polygon className="hex-bed" points={points} />
-                    <polygon className={`hex hex-${hex.resource}`} points={points}>
-                      <title>{terrainLabels[hex.resource]}</title>
-                    </polygon>
-                    <polygon className={`hex-texture texture-${hex.resource}`} points={points} />
-                    <polygon className="hex-inner-shine" points={points} />
-                    <BoardIcon terrain={hex.resource} x={center.x} y={center.y - (hex.token ? 0.14 : 0)} size={0.48} />
-                    {legalThiefDestination ? (
-                      <g className="legal-thief-target" transform={`translate(${center.x} ${center.y - 0.02})`} aria-hidden="true">
-                        <circle r="0.25" />
-                        <circle r="0.12" />
-                        <path d="M-0.32 0h0.14M0.18 0h0.14M0 -0.32v0.14M0 0.18v0.14" />
-                      </g>
-                    ) : null}
-                    {stealTargets.length > 0 ? (
-                      <g className="robber-victim-count-badge" transform={`translate(${center.x} ${center.y - 0.54})`} aria-hidden="true">
-                        <circle r="0.18" />
-                        <text y="0.055">{stealTargets.length}</text>
-                      </g>
-                    ) : null}
-                    {hex.token ? (
-                      <g className={`token token-${hex.token}`} transform={`translate(${center.x} ${center.y + 0.36})`}>
-                        <circle r="0.2" />
-                        <text y="0.07">{hex.token}</text>
-                      </g>
-                    ) : (
-                      <text className="dead-tile-label" x={center.x} y={center.y + 0.36}>No yield</text>
-                    )}
-                    {thiefHere ? (
-                      <g className="thief-marker" transform={`translate(${center.x} ${center.y - 0.02})`} role="img" aria-label="Robber">
-                        <circle className="robber-badge" r="0.28" />
-                        <path className="robber-shoulders" d="M-0.23 0.27c0.04-0.16 0.13-0.24 0.23-0.24s0.19 0.08 0.23 0.24z" />
-                        <circle className="robber-hood" r="0.2" />
-                        <path className="robber-face-opening" d="M-0.12 -0.05c0.02-0.07 0.07-0.11 0.12-0.11s0.1 0.04 0.12 0.11c-0.02 0.08-0.07 0.12-0.12 0.12s-0.1-0.04-0.12-0.12z" />
-                        <circle className="robber-eye" cx="-0.055" cy="-0.05" r="0.018" />
-                        <circle className="robber-eye" cx="0.055" cy="-0.05" r="0.018" />
-                        <path className="robber-mouth" d="M-0.05 0.09c0.03 0.02 0.07 0.02 0.1 0" />
-                        <path className="robber-scarf" d="M-0.15 0.15h0.3" />
-                      </g>
-                    ) : null}
-                    {canSelectThiefDestination ? <polygon className="thief-tile-hit-target" points={points} aria-hidden="true" /> : null}
-                  </g>
-                );
-              })}
-              {Object.values(state.board.ports ?? {}).map((port) => {
-                const a = state.board.vertices[port.vertexIds[0]]!;
-                const b = state.board.vertices[port.vertexIds[1]]!;
-                const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-                const length = Math.hypot(mid.x, mid.y) || 1;
-                const out = { x: mid.x / length, y: mid.y / length };
-                const dock = { x: mid.x + out.x * 0.42, y: mid.y + out.y * 0.42 };
-                const badge = { x: mid.x + out.x * 0.78, y: mid.y + out.y * 0.78 };
-                const pierA = { x: a.x + out.x * 0.08, y: a.y + out.y * 0.08 };
-                const pierB = { x: b.x + out.x * 0.08, y: b.y + out.y * 0.08 };
-                const label = `${port.resource ? terrainLabels[port.resource] : "Generic"} ${port.ratio}:1 harbor. Build a settlement or city on either marked corner for this trade bonus.`;
-                const owned = port.vertexIds.some((vertexId) => state.settlements[vertexId] === humanPlayerId);
-                return (
-                  <g key={port.id} className={`port ${owned ? "owned" : ""}`} role="img" aria-label={label}>
-                    <circle className="port-vertex-marker" cx={a.x} cy={a.y} r="0.13" />
-                    <circle className="port-vertex-marker" cx={b.x} cy={b.y} r="0.13" />
-                    <path className="port-pier" d={`M ${pierA.x} ${pierA.y} L ${dock.x} ${dock.y} L ${pierB.x} ${pierB.y}`} />
-                    <line className="port-badge-tether" x1={dock.x} y1={dock.y} x2={badge.x} y2={badge.y} />
-                    <g className="port-badge" transform={`translate(${badge.x} ${badge.y})`}>
-                      <circle r="0.24" />
-                      {port.resource ? <BoardIcon terrain={port.resource} x={-0.03} y={-0.05} size={0.22} /> : <text className="port-anchor" y="-0.01">?</text>}
-                      <text className="port-ratio" y="0.18">{port.ratio}:1</text>
-                    </g>
-                  </g>
-                );
-              })}
-              {Object.values(state.board.edges).map((edge) => {
-                const a = state.board.vertices[edge.vertices[0]]!;
-                const b = state.board.vertices[edge.vertices[1]]!;
-                const owner = state.roads[edge.id];
-                const roadBuildingPreview = activeRoadBuildingCardId && roadBuildingSelectedEdges.includes(edge.id);
-                const displayedOwner = owner ?? (roadBuildingPreview ? humanPlayerId : undefined);
-                const isLegalRoad = legalRoads.has(edge.id);
-                const isSelectableRoad = isLegalRoad || Boolean(roadBuildingPreview);
-                const dx = b.x - a.x;
-                const dy = b.y - a.y;
-                const edgeLength = Math.hypot(dx, dy);
-                const edgeAngle = Math.atan2(dy, dx) * (180 / Math.PI);
-                const edgeMidX = (a.x + b.x) / 2;
-                const edgeMidY = (a.y + b.y) / 2;
-                return (
-                  <g key={edge.id} className="edge-target">
-                    <line
-                      className={`edge ${selectedEdge === edge.id ? "selected" : ""}`}
-                      x1={a.x}
-                      y1={a.y}
-                      x2={b.x}
-                      y2={b.y}
-                      aria-hidden="true"
-                    />
-                    {displayedOwner ? (
-                      <g
-                        className={`road-piece ${selectedEdge === edge.id ? "selected" : ""} ${roadBuildingPreview ? "preview" : ""}`}
-                        style={{ color: state.players[displayedOwner]?.color ?? "#172033" }}
-                        transform={`translate(${edgeMidX} ${edgeMidY}) rotate(${edgeAngle})`}
-                        aria-hidden="true"
-                      >
-                        <rect x={-edgeLength * 0.38} y="-0.08" width={edgeLength * 0.76} height="0.16" rx="0.07" />
-                        <path d={`M${-edgeLength * 0.26} -0.02 H${edgeLength * 0.26}`} />
-                      </g>
-                    ) : null}
-                    {isSelectableRoad && !owner ? (
-                      <g
-                        className="edge-build-control"
-                        role="button"
-                        aria-label="Build road here"
-                        tabIndex={0}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          handleEdge(edge.id);
-                        }}
-                        onKeyDown={(event) => {
-                          if (event.key !== "Enter" && event.key !== " ") return;
-                          event.preventDefault();
-                          event.stopPropagation();
-                          handleEdge(edge.id);
-                        }}
-                      >
-                        <rect
-                          className={`edge-build-target ${selectedEdge === edge.id ? "selected" : ""}`}
-                          x={-edgeLength * 0.42}
-                          y="-0.075"
-                          width={edgeLength * 0.84}
-                          height="0.15"
-                          rx="0.07"
-                          transform={`translate(${edgeMidX} ${edgeMidY}) rotate(${edgeAngle})`}
-                          aria-hidden="true"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            handleEdge(edge.id);
-                          }}
-                        />
-                      </g>
-                    ) : null}
-                  </g>
-                );
-              })}
-              {Object.values(state.board.vertices).map((vertex) => {
-                const settlementOwner = state.settlements[vertex.id];
-                const building = state.buildings[vertex.id] ?? (settlementOwner ? { owner: settlementOwner, type: "settlement" as const } : undefined);
-                const owner = building?.owner ?? settlementOwner;
-                const isLegalSettlement = legalSettlements.has(vertex.id);
-                const isLegalCity = legalCities.has(vertex.id);
-                const isLegalVertex = isLegalSettlement || isLegalCity;
-                const isPendingSetup = state.phase.type === "SETUP_PLACEMENT" && pendingSetupVertex === vertex.id && !building;
-                const visibleOwner = building?.owner ?? (isPendingSetup ? humanPlayerId : undefined);
-                const visibleType = building?.type ?? "settlement";
-                return (
-                  <g
-                    key={vertex.id}
-                    className={`vertex-target ${isLegalVertex ? "legal-target" : ""}`}
-                    role={isLegalVertex ? "button" : undefined}
-                    aria-label={isLegalVertex ? `${isLegalCity ? "Upgrade city" : state.phase.type === "SETUP_PLACEMENT" ? "Place setup settlement" : "Build settlement"} at corner ${vertex.id}` : undefined}
-                    tabIndex={isLegalVertex ? 0 : undefined}
-                    onClick={(event) => {
-                      if (!isLegalVertex) return;
-                      event.stopPropagation();
-                      handleVertex(vertex.id);
-                    }}
-                    onKeyDown={(event) => {
-                      if (event.key !== "Enter" && event.key !== " ") return;
-                      event.preventDefault();
-                      event.stopPropagation();
-                      handleVertex(vertex.id);
-                    }}
-                  >
-                    <rect
-                      className="vertex-hit"
-                      x={vertex.x - 0.22}
-                      y={vertex.y - 0.22}
-                      width={0.44}
-                      height={0.44}
-                      rx={0.1}
-                      aria-hidden="true"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        handleVertex(vertex.id);
-                      }}
-                    />
-                    {building || isPendingSetup ? (
-                      <g
-                        className={`building house-building ${visibleType === "city" ? "city" : ""} ${isLegalCity ? "legal" : ""} ${isPendingSetup ? "pending" : ""} ${selectedVertex === vertex.id ? "selected" : ""}`}
-                        style={{ color: state.players[visibleOwner!]?.color ?? "#172033" }}
-                        transform={`translate(${vertex.x} ${vertex.y})`}
-                        role={isPendingSetup ? "img" : undefined}
-                        aria-label={isPendingSetup ? `Pending setup settlement at corner ${vertex.id}` : undefined}
-                      >
-                        <BoardHousePiece city={visibleType === "city"} />
-                      </g>
-                    ) : (
-                      <circle
-                        className={`vertex ${owner ? "owned" : ""} ${isLegalSettlement || isLegalCity ? "legal" : ""} ${selectedVertex === vertex.id ? "selected" : ""}`}
-                        style={owner ? { fill: state.players[owner]?.color ?? "#172033" } : undefined}
-                        cx={vertex.x}
-                        cy={vertex.y}
-                        r={owner ? 0.13 : 0.08}
-                      />
-                    )}
-                  </g>
-                );
-              })}
-            </svg>
+            <GameBoard state={state} humanPlayerId={humanPlayerId} legalRoads={legalRoads} legalSettlements={legalSettlements}
+              legalCities={legalCities} legalThiefHexes={legalThiefHexes} pendingSetupVertex={pendingSetupVertex}
+              roadBuildingSelectedEdges={roadBuildingSelectedEdges} disabled={Boolean(networkRoomId && (!networkSocketOpen || pendingCommandCount)) || isReplaying}
+              onVertex={handleVertex} onEdge={handleEdge} onHex={handleHex} onCancel={handleBoardClick} visibleStealTargets={visibleStealTargets}/>
+
 
             <DicePanel
               roll={state.lastRoll}
@@ -2054,7 +1587,7 @@ export const App = () => {
                 data-tooltip={`Special card cost: ${specialCostLabel}`}
               >
                 <SpecialSymbol />
-                <span>Special Card</span>
+                <span>Card</span>
                 <small>{resourceCount(specialCost)}</small>
                 <span className="action-cost-icons" aria-hidden="true">
                   {resources.filter((resource) => specialCost[resource] > 0).map((resource) => (
@@ -2101,14 +1634,10 @@ export const App = () => {
                   <span>{resourceCount(discardDraft)}/{discardAction.count}{turnDeadline?.mode === "discard" && turnSecondsRemaining !== undefined ? ` · ${formatTimer(turnSecondsRemaining)}` : ""}</span>
                 </div>
                 <div className="discard-summary">
-                  <span>Select cards from your hand.</span>
+                  <span>Select cards below.</span>
                   <button type="button" onClick={clearDiscard} disabled={resourceCount(discardDraft) === 0}>Clear</button>
                 </div>
-                <button type="button" className="primary-wide" onClick={submitDiscard} disabled={!canSubmitDiscard}>Discard</button>
-              </AccessibleDialog>
-            ) : null}
-
-            <HandRack
+                <HandRack
               resourceHand={humanPlayer?.resources ?? emptyResources()}
               tradeOffer={tradeOffer}
               discardDraft={discardDraft}
@@ -2118,6 +1647,20 @@ export const App = () => {
               onDevelopmentCard={activateDevelopmentCard}
               {...(discardAction?.type === "DISCARD_RESOURCES" ? { discardCount: discardAction.count } : {})}
             />
+                <button type="button" className="primary-wide" onClick={submitDiscard} disabled={!canSubmitDiscard}>Discard</button>
+              </AccessibleDialog>
+            ) : null}
+
+            {discardAction?.type !== "DISCARD_RESOURCES" ? (<HandRack
+              resourceHand={humanPlayer?.resources ?? emptyResources()}
+              tradeOffer={tradeOffer}
+              discardDraft={discardDraft}
+              developmentCardGroups={groupedDevelopmentCards}
+              onResourceTrade={openTradeFromResource}
+              onDiscardResource={incrementDiscard}
+              onDevelopmentCard={activateDevelopmentCard}
+              {...(discardAction?.type === "DISCARD_RESOURCES" ? { discardCount: discardAction.count } : {})}
+            />) : null}
 
             {selectedRobberHex ? (
               <AccessibleDialog className="robber-choice-overlay" label="Choose player to rob" onClose={() => setRobberTargetHexId(null)}>
@@ -2210,6 +1753,8 @@ export const App = () => {
             />
           </div>
 
+          <details className="table-details">
+            <summary>Table journal <span aria-hidden="true">↗</span></summary>
           <aside className="side-panel" aria-label="Match information and players">
             <div className="phase-card bank-panel" aria-label="Bank holdings">
               <div className="panel-title">
@@ -2260,14 +1805,9 @@ export const App = () => {
               </div>
             </div>
 
-            <PlayerStatsList
-              players={displayPlayers}
-              botPlayerIds={botPlayerIds}
-              victoryPointText={victoryPointText}
-              victoryPointAria={victoryPointAria}
-              {...(activePlayer ? { activePlayerId: activePlayer } : {})}
-            />
+
           </aside>
+          </details>
         </div>
       </section>
     </main>

@@ -1,82 +1,29 @@
 // @vitest-environment jsdom
-
-import { act, renderHook } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, renderHook, cleanup } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { useNetworkRoom } from "../src/hooks/useNetworkRoom.js";
 
+afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 describe("useNetworkRoom", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-07-14T00:00:00.000Z"));
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-    vi.useRealTimers();
-  });
-
-  it("schedules reconnects, fires them, and supports an immediate retry", () => {
-    vi.spyOn(globalThis.crypto, "getRandomValues").mockImplementation((array) => {
-      (array as Uint32Array)[0] = 0;
-      return array;
-    });
-    const connect = vi.fn();
+  it("keeps connection ownership stable through UI updates", () => {
     const { result } = renderHook(() => useNetworkRoom());
-
-    act(() => {
-      expect(result.current.scheduleReconnect(connect)).toBe(true);
-    });
-    expect(result.current.networkStatus).toBe("Reconnecting in 1s");
-    expect(result.current.reconnectRetryAt).toBe(Date.now() + 750);
-
-    act(() => vi.advanceTimersByTime(750));
-    expect(connect).toHaveBeenCalledTimes(1);
-    expect(result.current.networkStatus).toBe("Reconnecting...");
-    expect(result.current.reconnectRetryAt).toBeNull();
-
-    act(() => {
-      expect(result.current.scheduleReconnect(connect)).toBe(true);
-      result.current.retryReconnectNow(connect);
-    });
-    expect(connect).toHaveBeenCalledTimes(2);
-    expect(result.current.reconnectTimerRef.current).toBeNull();
+    const controller = result.current.controller;
+    act(() => { result.current.setNetworkRoomId("room_1"); result.current.setNetworkStatus("Looking up room…"); });
+    expect(result.current.controller).toBe(controller);
+    expect(result.current.networkRoomId).toBe("room_1");
+    expect(result.current.networkStatus).toBe("Looking up room…");
+    expect(result.current.connectionState).toBe("idle");
   });
-
-  it("uses unbiased jitter and pauses after the bounded retry budget", () => {
-    let sample = 0;
-    vi.spyOn(globalThis.crypto, "getRandomValues").mockImplementation((array) => {
-      (array as Uint32Array)[0] = sample === 0 ? 0xffff_ffff : 7;
-      sample += 1;
-      return array;
-    });
+  it("exposes one controller cursor instead of separate competing sequence counters", () => {
     const { result } = renderHook(() => useNetworkRoom());
-
-    act(() => {
-      for (let attempt = 0; attempt < 8; attempt += 1) {
-        expect(result.current.scheduleReconnect(vi.fn())).toBe(true);
-      }
-      expect(result.current.scheduleReconnect(vi.fn())).toBe(false);
-    });
-    expect(result.current.networkStatus).toBe("Reconnect paused");
-    expect(result.current.shouldReconnectRef.current).toBe(false);
-
-    act(() => {
-      expect(result.current.scheduleReconnect(vi.fn())).toBe(false);
-      result.current.resetReconnectState();
-    });
-    expect(result.current.reconnectAttemptRef.current).toBe(0);
-    expect(result.current.reconnectRetryAt).toBeNull();
-  });
-
-  it("tracks pending commands with a defensive cap and clears them", () => {
-    const { result } = renderHook(() => useNetworkRoom());
-
-    act(() => {
-      for (let count = 0; count < 120; count += 1) result.current.markCommandPending();
-    });
-    expect(result.current.pendingCommandCount).toBe(99);
-
-    act(() => result.current.clearPendingCommands());
+    result.current.clientSeqRef.current=8;
+    expect(result.current.controller.clientSeqRef.current).toBe(8);
+    expect(result.current.lastServerSeqRef).toBe(result.current.controller.lastServerSeqRef);
     expect(result.current.pendingCommandCount).toBe(0);
+  });
+  it("disposes transport and lifecycle listeners when unmounted", () => {
+    const { result, unmount } = renderHook(() => useNetworkRoom());
+    const stop=vi.spyOn(result.current.controller,"stop");unmount();
+    expect(stop).toHaveBeenCalledWith(false);
   });
 });

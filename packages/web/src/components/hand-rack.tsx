@@ -36,7 +36,7 @@ export const HandRack = ({
   const isDiscardSelection = discardCount !== undefined;
   const discardedCount = resourceCount(discardDraft);
   return (
-    <div className="hand-rack" aria-label="Your resources">
+    <div className="hand-rack" role="group" tabIndex={0} aria-label="Your resources">
       <div className="resource-hand" aria-label="Resource cards">
         {resources.map((resource) => {
           const discardSelected = discardDraft[resource] ?? 0;

@@ -1,0 +1,576 @@
+/* Shared sheets: readable, keyboard accessible, and reachable on small screens. */
+.accessible-dialog {
+  position: fixed;
+  inset: auto;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  margin: 0;
+  width: min(560px, calc(100vw - 32px));
+  max-height: calc(100dvh - 48px);
+  overflow: auto;
+  z-index: 40;
+  border: 1px solid #baaf95;
+  border-radius: 20px;
+  background: var(--paper);
+  color: var(--ink);
+  padding: 24px;
+  box-shadow:
+    0 0 0 100vmax #19372f55,
+    0 16px 50px #18362e44;
+  font-size: 14px;
+}
+.accessible-dialog h2 {
+  font-size: 28px;
+}
+.accessible-dialog p {
+  line-height: 1.6;
+}
+.accessible-dialog button {
+  font-size: 12px;
+}
+.accessible-dialog .icon-button {
+  padding: 7px;
+  font-size: 20px;
+}
+.invite-dialog {
+  display: grid;
+  gap: 16px;
+}
+.invite-dialog input {
+  width: 100%;
+  font-size: 12px;
+}
+.invite-dialog label {
+  font-size: 12px;
+  font-weight: 650;
+}
+.invite-code {
+  font-family: Georgia, serif;
+  font-size: 42px;
+  letter-spacing: 0.13em;
+}
+.dialog-actions,
+.trade-actions,
+.trade-response-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.trade-overlay {
+  display: grid;
+  gap: 18px;
+}
+.trade-heading,
+.robber-choice-heading,
+.special-choice-heading {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+.trade-heading > div,
+.special-choice-heading > div,
+.robber-choice-heading > div {
+  display: grid;
+  gap: 5px;
+}
+.trade-heading strong,
+.special-choice-heading strong,
+.robber-choice-heading strong {
+  font-family: Georgia, serif;
+  font-size: 24px;
+}
+.trade-heading span,
+.special-choice-heading span,
+.robber-choice-heading span {
+  font-size: 12px;
+  color: var(--muted);
+}
+.trade-picker {
+  display: grid;
+  gap: 8px;
+}
+.trade-picker > span {
+  font-size: 12px;
+  font-weight: 700;
+}
+.trade-card-grid,
+.trade-resource-row,
+.trade-cards,
+.trade-resource-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+.trade-card {
+  position: relative;
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.trade-card-main {
+  padding: 0;
+  border: 0;
+  background: none;
+  min-width: 0;
+}
+.trade-card .resource-card {
+  width: 100%;
+  min-width: 0;
+  min-height: 78px;
+}
+.trade-stepper {
+  width: 100%;
+  padding: 4px;
+}
+.trade-card.selected .resource-card {
+  box-shadow: inset 0 0 0 2px var(--forest);
+}
+.trade-bundle {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.trade-bundle .resource-card {
+  width: 54px;
+}
+.incoming-trade {
+  display: grid;
+  gap: 14px;
+}
+.incoming-trade > div:first-child {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.incoming-trade-bundles {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.incoming-trade-bundles > span {
+  font-size: 12px;
+}
+.trade-responses {
+  display: grid;
+  gap: 8px;
+}
+.trade-response {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 10px;
+  background: #eee9d9;
+}
+.trade-response.selected {
+  box-shadow: inset 0 0 0 2px var(--forest);
+}
+.trade-status,
+.trade-hint,
+.trade-ratio-hint {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+.trade-clear {
+  justify-self: start;
+}
+.discard-board-panel {
+  display: grid;
+  gap: 12px;
+  top: auto;
+  bottom: 160px;
+  transform: translateX(-50%);
+  width: min(440px, calc(100vw - 24px));
+  box-shadow: var(--shadow);
+}
+.discard-summary {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+.discard-summary span {
+  font-size: 12px;
+}
+.discard-board-panel ~ .hand-rack {
+  position: relative;
+  z-index: 41;
+}
+.robber-victim-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 20px;
+}
+.robber-victim-choice {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  text-align: left;
+}
+.robber-victim-choice small {
+  margin-left: auto;
+}
+.robber-large-symbol .stat-symbol {
+  width: 38px;
+  height: 38px;
+}
+.special-choice-heading {
+  margin-bottom: 20px;
+}
+.special-resource-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 7px;
+  margin: 12px 0;
+}
+.special-resource-choice {
+  padding: 8px 3px;
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+.special-resource-choice small {
+  font-size: 10px;
+}
+.special-resource-choice .resource-icon {
+  width: 26px;
+  height: 26px;
+}
+.plenty-pickers {
+  display: grid;
+  gap: 14px;
+}
+.special-card-choice-overlay .primary-wide {
+  margin-top: 16px;
+}
+.game-over-modal {
+  width: min(860px, calc(100vw - 32px));
+  padding: 28px;
+}
+.game-over-title {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+.game-over-title h2 {
+  font-size: 36px;
+}
+.game-over-title span {
+  font-size: 12px;
+}
+.game-over-actions,
+.analysis-tabs {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 16px 0;
+}
+.analysis-panel {
+  display: grid;
+  gap: 16px;
+}
+.victory-grid,
+.analysis-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.victory-player,
+.analysis-card {
+  border: 1px solid var(--line);
+  background: #f2ebd9;
+  border-radius: 12px;
+  padding: 16px;
+  display: grid;
+  gap: 10px;
+}
+.victory-player .stat-symbol {
+  width: 26px;
+  height: 26px;
+}
+.victory-parts,
+.analysis-stats {
+  display: grid;
+  gap: 7px;
+}
+.victory-part {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+.victory-part span {
+  font-size: 12px;
+}
+.analysis-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.analysis-table td,
+.analysis-table th {
+  text-align: left;
+  padding: 10px;
+  border-bottom: 1px solid var(--line);
+}
+.analysis-chart {
+  width: 100%;
+  max-height: 240px;
+}
+.chart-bar {
+  fill: var(--forest);
+}
+.chart-label {
+  fill: var(--muted);
+  font-size: 11px;
+}
+.confetti-layer {
+  display: none;
+}
+.history-panel {
+  display: grid;
+  gap: 10px;
+}
+.history-panel button {
+  text-align: left;
+}
+@media (max-width: 650px) {
+  .accessible-dialog {
+    left: 8px;
+    right: 8px;
+    top: auto;
+    bottom: max(8px, env(safe-area-inset-bottom));
+    transform: none;
+    width: auto;
+    max-height: 80dvh;
+    padding: 20px 14px;
+    border-radius: 20px 20px 12px 12px;
+  }
+  .trade-card-grid,
+  .trade-resource-row,
+  .trade-cards,
+  .trade-resource-grid {
+    gap: 5px;
+  }
+  .trade-card .resource-card {
+    min-height: 76px;
+    padding: 7px;
+  }
+  .trade-card .resource-count {
+    font-size: 19px;
+  }
+  .trade-card .resource-icon {
+    width: 22px;
+    height: 22px;
+  }
+  .trade-card .resource-name {
+    font-size: 10px;
+  }
+  .trade-actions button {
+    flex: 1;
+  }
+  .trade-actions {
+    justify-content: stretch;
+  }
+  .special-resource-grid {
+    gap: 4px;
+  }
+  .special-resource-choice {
+    min-width: 44px;
+  }
+  .discard-board-panel {
+    bottom: 154px;
+    max-height: 40dvh;
+  }
+  .victory-grid,
+  .analysis-summary {
+    grid-template-columns: 1fr;
+  }
+  .game-over-title h2 {
+    font-size: 28px;
+  }
+  .analysis-tabs button {
+    flex: 1;
+  }
+  .analysis-table {
+    font-size: 11px;
+  }
+  .analysis-table td,
+  .analysis-table th {
+    padding: 8px 4px;
+  }
+  .game-over-modal {
+    padding: 20px 14px;
+  }
+}
+
+.trade-response-row span,
+.trade-response-row strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.staged-trade,
+.trade-response-list {
+  display: grid;
+  gap: 12px;
+}
+.trade-response-row {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+}
+.incoming-trade-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.discard-board-panel .hand-rack {
+  padding: 0;
+  border: 0;
+  background: none;
+}
+.discard-board-panel .resource-hand {
+  justify-content: center;
+}
+.discard-board-panel {
+  top: 50%;
+  bottom: auto;
+  transform: translate(-50%, -50%);
+  max-height: 80dvh;
+}
+@media (max-width: 650px) {
+  .discard-board-panel {
+    top: auto;
+    bottom: 8px;
+    transform: none;
+  }
+}
+
+.game-over-overlay {
+  width: min(860px, calc(100vw - 32px));
+}
+.victory-breakdown-list {
+  display: grid;
+  gap: 10px;
+}
+.victory-breakdown-row {
+  display: grid;
+  grid-template-columns: 32px minmax(120px, 1fr) 2fr;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid;
+  border-radius: 12px;
+  padding: 12px;
+}
+.victory-rank {
+  font:
+    28px Georgia,
+    serif;
+}
+.victory-player {
+  padding: 0;
+  border: 0;
+  background: none;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+}
+.victory-player strong {
+  overflow-wrap: anywhere;
+}
+.victory-parts {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.victory-part {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+}
+.victory-part.best {
+  font-weight: 800;
+}
+.victory-part .stat-symbol {
+  width: 20px;
+  height: 20px;
+}
+.chart-bars {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  height: 190px;
+  padding-top: 25px;
+}
+.chart-bar-item {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.chart-bar {
+  display: block;
+  position: relative;
+  width: 100%;
+  height: var(--bar-height);
+  min-height: 6px;
+  background: #7c9b79;
+  border-radius: 5px 5px 0 0;
+}
+.chart-bar strong {
+  position: absolute;
+  top: -22px;
+  width: 100%;
+  text-align: center;
+}
+.chart-bar-item.best .chart-bar {
+  background: var(--forest);
+}
+.chart-bar-item .resource-card {
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  padding: 4px;
+}
+.chart-bar-item small {
+  font-size: 10px;
+  text-align: center;
+}
+.analysis-chart h2 {
+  font-size: 24px;
+}
+.vp-secret {
+  font-weight: 800;
+}
+@media (max-width: 650px) {
+  .victory-breakdown-row {
+    grid-template-columns: 24px 1fr;
+  }
+  .victory-parts {
+    grid-column: 2;
+  }
+  .analysis-tabs {
+    gap: 4px;
+  }
+  .analysis-tabs button {
+    padding: 8px 6px;
+    font-size: 11px;
+  }
+  .game-over-title {
+    flex-wrap: wrap;
+  }
+  .chart-bars {
+    gap: 5px;
+  }
+}

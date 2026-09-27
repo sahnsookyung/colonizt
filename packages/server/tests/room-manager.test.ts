@@ -1203,6 +1203,27 @@ describe("RoomManager", () => {
     expect(room.events.length).toBeGreaterThanOrEqual(1);
   });
 
+  it("checks durable idempotency before the event precondition and rejects new stale identities", async () => {
+    const store = new MemoryEventStore();
+    const { manager, session, room } = await startedRoom(store);
+    const before = room.game!.eventSeq;
+    const vertexId = getLegalActions(room.game!, session.userId).find((action) => action.type === "PLACE_SETUP")!.vertices[0]!;
+    const command: GameCommand = { type: "PLACE_SETUP", playerId: session.userId, vertexId, edgeId: room.game!.board.adjacency.vertexToEdges[vertexId]![0]! };
+    const accepted = await manager.submitCommand(room.id, session, 100, command, before);
+    expect(accepted.ok).toBe(true);
+    const after = room.game!.eventSeq;
+    expect(after).toBeGreaterThan(before);
+    const duplicate = await manager.submitCommand(room.id, session, 100, command, before);
+    expect(duplicate).toMatchObject({ ok: true, replayed: true });
+    expect(room.game!.eventSeq).toBe(after);
+    const rejected = await manager.submitCommand(room.id, session, 101, command, before);
+    expect(rejected).toMatchObject({ ok: false, code: "STALE_STATE" });
+    // A changed precondition cannot turn the same rejected identity into a new action.
+    expect(await manager.submitCommand(room.id, session, 101, command, after)).toMatchObject({ ok: false, code: "STALE_STATE" });
+    expect(await store.loadCommandResult(room.id, session.userId, 101)).toMatchObject({ rejectionCode: "STALE_STATE" });
+    expect(room.game!.eventSeq).toBe(after);
+  });
+
   it("rejects a reused clientSeq with a different command payload", async () => {
     const { manager, session, room } = await startedRoom();
     const vertexId = getLegalActions(room.game!, session.userId).find((action) => action.type === "PLACE_SETUP")!.vertices[0]!;

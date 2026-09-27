@@ -1,0 +1,304 @@
+:root {
+  color-scheme: light;
+  font-family: "Avenir Next", "Segoe UI", system-ui, sans-serif;
+  color: #293d35;
+  background: #f2eddf;
+  --ink: #293d35;
+  --muted: #536157;
+  --paper: #fffaf0;
+  --paper-dark: #eee6d3;
+  --line: #cfc7b2;
+  --forest: #315c46;
+  --water: #426f70;
+  --gold: #d3aa58;
+  --danger: #963f32;
+  --shadow: 0 12px 32px #203c3524;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  min-width: 320px;
+}
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+button {
+  min-height: 44px;
+  min-width: 44px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 9px 14px;
+  background: var(--paper);
+  font-weight: 650;
+  cursor: pointer;
+  transition: transform 120ms;
+}
+button:hover:not(:disabled) {
+  background: #ede5d0;
+}
+button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+button:disabled {
+  opacity: 0.48;
+  cursor: default;
+}
+button.selected,
+button[aria-pressed="true"],
+.primary-button,
+.primary-wide,
+.primary-lobby-action {
+  background: var(--forest);
+  border-color: var(--forest);
+  color: #fffaf0;
+}
+button.selected:hover:not(:disabled),
+.primary-button:hover:not(:disabled),
+.primary-wide:hover:not(:disabled) {
+  background: #254836;
+}
+:focus-visible {
+  outline: 3px solid #d39230;
+  outline-offset: 3px;
+}
+input,
+select {
+  min-height: 44px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #fffdf7;
+}
+input[type="checkbox"] {
+  width: 20px;
+  min-height: 20px;
+  accent-color: var(--forest);
+}
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+h1,
+h2 {
+  font-family: Georgia, "Times New Roman", serif;
+  font-weight: 500;
+  letter-spacing: -0.04em;
+}
+h2 {
+  font-size: 28px;
+}
+small {
+  font-size: 12px;
+}
+[hidden] {
+  display: none !important;
+}
+.eyebrow {
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.panel-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.panel-title > span {
+  font-size: 12px;
+  color: var(--muted);
+}
+.primary-wide {
+  width: 100%;
+}
+.badge {
+  background: #e9dec1;
+  border-radius: 20px;
+  font-size: 11px;
+  padding: 4px 8px;
+}
+.start-error,
+.error {
+  color: var(--danger);
+  background: #fff2e6;
+  padding: 12px;
+  border-radius: 9px;
+}
+.resource-icon,
+.piece-symbol,
+.action-symbol,
+.stat-symbol {
+  width: 28px;
+  height: 28px;
+  display: block;
+  flex-shrink: 0;
+}
+.icon-stroke {
+  stroke: #455443;
+  stroke-width: 4;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.icon-fill {
+  stroke: #394f3633;
+  stroke-width: 2;
+}
+.timber-leaf {
+  fill: #3d6a45;
+}
+.timber-trunk {
+  stroke: #765737;
+  stroke-width: 6;
+}
+.brick-clay {
+  fill: #b5684c;
+}
+.grain-head {
+  fill: #bf9037;
+}
+.grain-stem {
+  stroke: #876926;
+}
+.fiber-body {
+  fill: #fff8e5;
+}
+.fiber-head {
+  fill: #7c8070;
+}
+.fiber-leg {
+  stroke: #555d49;
+}
+.ore-rock {
+  fill: #718584;
+}
+.ore-vein {
+  stroke: #455959;
+}
+.desert-sand {
+  fill: #d3b570;
+}
+.cactus {
+  stroke: #7b8d5c;
+  stroke-width: 8;
+}
+.house-roof {
+  fill: currentColor;
+  stroke: #fff5de;
+  stroke-width: 3;
+  stroke-linejoin: round;
+}
+.house-body,
+.house-tower {
+  fill: currentColor;
+  stroke: #fff5de;
+  stroke-width: 3;
+}
+.house-door {
+  fill: #fff5de;
+}
+.house-piece .house-roof,
+.house-piece .house-body,
+.house-piece .house-tower {
+  stroke-width: 0.022;
+}
+.house-piece .house-door {
+  opacity: 0.8;
+}
+.road-bed,
+.stat-symbol-fill {
+  fill: currentColor;
+}
+.road-shine,
+.symbol-stroke,
+.stat-symbol-stroke {
+  stroke: currentColor;
+  stroke-width: 5;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.road-shine {
+  stroke: #fff5de;
+}
+.symbol-card {
+  fill: #eadfc5;
+  stroke: currentColor;
+  stroke-width: 4;
+}
+.symbol-star,
+.symbol-fill {
+  fill: currentColor;
+}
+.stat-symbol-fill.alt {
+  opacity: 0.72;
+}
+.stat-symbol-eye,
+.stat-symbol-cutout {
+  fill: #fffaf0;
+}
+.development-card-icon {
+  width: 30px;
+  height: 40px;
+  display: block;
+  color: #695887;
+}
+.dev-card-face {
+  fill: #f0e8d7;
+  stroke: #8d7b58;
+  stroke-width: 3;
+}
+.dev-card-mark,
+.dev-card-line,
+.dev-card-crest {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 4;
+  stroke-linecap: round;
+}
+.dev-card-dot,
+.dev-card-shield,
+.dev-card-road,
+.dev-card-column,
+.dev-card-crown,
+.dev-card-basket,
+.dev-card-fruit,
+.dev-card-star,
+.dev-card-ribbon {
+  fill: currentColor;
+}
+.dev-card-line {
+  stroke: #cabb99;
+}
+.dev-card-fruit.alt {
+  fill: #b67b48;
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+button,
+select {
+  hyphens: none;
+  overflow-wrap: normal;
+  word-break: normal;
+}

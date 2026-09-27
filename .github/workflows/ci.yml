@@ -84,10 +84,9 @@ jobs:
       - run: npm run simulate:bots:difficulty
       - run: npm run replay:fixtures
       - run: npm run build
-      - run: npx playwright install --with-deps chromium
+      - run: npx playwright install --with-deps chromium webkit
       - run: npm run test:multiplayer
-      - run: npm run test:e2e -- --project=chromium
-      - run: npm run test:e2e -- --project=mobile
+      - run: npm run test:e2e
       - run: npm --workspace @colonizt/db run migrate
       - run: npm run smoke:local
       - run: npm run smoke:network

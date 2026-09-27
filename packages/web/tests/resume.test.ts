@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { clearResumeState, readResumeState, resumeStorageKey, writeResumeState } from "../src/resume.js";
 
 class MemoryStorage {
@@ -42,5 +42,12 @@ describe("network resume storage", () => {
       { token: "s_1", userId: "u_1", roomId: "room_1", clientSeq: 3, lastSeq: 9 },
       { setItem: () => { throw new Error("storage disabled"); } },
     )).not.toThrow();
+  });
+
+  it("supports set-only storage cleanup and ignores cleanup failures", () => {
+    const setItem = vi.fn();
+    clearResumeState({ setItem });
+    expect(setItem).toHaveBeenCalledWith(resumeStorageKey, "");
+    expect(() => clearResumeState({ setItem: () => { throw new Error("storage disabled"); } })).not.toThrow();
   });
 });

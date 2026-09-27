@@ -123,7 +123,7 @@ export const ResourceCard = ({
   const content = (
     <>
       <ResourceIcon resource={resource} />
-      <span className="resource-count">{count}</span>
+      <span key={count} className="resource-count">{count}</span>
       <small className="resource-name">{resourceLabels[resource]}</small>
       {selectedCount > 0 ? <span className="resource-selected-count">x{selectedCount}</span> : null}
     </>

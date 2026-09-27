@@ -6,6 +6,11 @@ export default defineConfig({
     include: ["packages/**/*.test.ts", "packages/**/*.test.tsx"],
     coverage: {
       provider: "v8",
+      include: ["packages/*/src/**/*.{ts,tsx}"],
+      exclude: [
+        "packages/db/src/migrate.ts",
+        "packages/web/src/main.tsx",
+      ],
       thresholds: {
         statements: 95,
         branches: 85,

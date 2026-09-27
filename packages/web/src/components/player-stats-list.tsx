@@ -26,7 +26,7 @@ export const PlayerStatsList = ({
   activePlayerId,
 }: PlayerStatsListProps) => (
   <div className="players">
-    {players.map((player) => {
+    {players.map((player, index) => {
       const isBot = botPlayerIds.has(player.id);
       return (
         <article key={player.id} className={`player ${player.id === activePlayerId ? "active" : ""} ${isBot ? "bot-player" : "human-player"}`} style={{ borderColor: player.color }}>
@@ -34,7 +34,7 @@ export const PlayerStatsList = ({
             <span className="player-kind" style={{ color: player.color }} role="img" aria-label={isBot ? `${player.name} is a bot` : `${player.name} is a player`}>
               {isBot ? <BotSymbol /> : <HumanSymbol />}
             </span>
-            <strong>{player.name}</strong>
+            <strong><span className="player-crest" aria-hidden="true">{["◆", "●", "▲", "✦", "■", "✚", "◇", "○"][index]}</span>{player.name}</strong>
             <div className="player-stats" aria-label={`${victoryPointAria(player)}, ${player.resourceCount} resource cards, ${player.developmentCardCount} development cards, ${player.playedKnights} knights, longest road length ${player.longestRoadLength}`}>
               <span className={`stat-chip vp-chip ${player.secretVictoryPoints ? "vp-secret" : ""}`} title="Victory points">
                 <VictoryPointStatSymbol />
