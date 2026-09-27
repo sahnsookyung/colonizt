@@ -22,6 +22,40 @@
 - `npm run simulate:ranked` verifies queue grouping, abandonment, match quality, and duplicate-ticket prevention.
 - `npm run simulate:rush` verifies first-valid-wins conflict resolution for simultaneous commands.
 
+## SonarCloud authentication and dependency updates
+
+The SonarCloud workflow runs lint, type checking, coverage, and the build before
+uploading analysis. A scanner HTTP 403 can indicate rejected credentials or missing
+analysis permissions even when all of those local quality gates pass. Check the
+token first; updating npm packages does not repair a missing or rejected token.
+
+Generate a token for an account with **Execute Analysis** access to
+`sahnsookyung_colonizt` in the `sahnsookyung` organization. Store it as `SONAR_TOKEN`
+in **both** repository Settings → Secrets and variables → Actions and Settings →
+Secrets and variables → Dependabot. Dependabot-triggered workflows cannot read
+Actions secrets. Never put the token in source control, workflow arguments, or
+logs. After replacing the secret, rerun the failed SonarCloud workflow.
+
+SonarCloud personal tokens unused for 60 days are automatically removed. If a
+previously working scan starts returning 403 after a long gap, check the token's
+validity and project permissions. The workflow fails early with a setup message
+when the token is absent; it continues to enforce the Sonar quality gate.
+
+See [SonarCloud token management](https://docs.sonarsource.com/sonarqube-cloud/managing-your-account/managing-tokens)
+and [GitHub's Dependabot secret rules](https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-on-actions).
+
+Dependabot groups npm and GitHub Actions version updates into one weekly PR using
+[multi-ecosystem updates](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/secure-your-dependencies/configuring-multi-ecosystem-updates).
+Each combined update must pass a clean `npm ci`, audit, and the existing CI and
+SonarCloud gates before merging. TypeScript major updates are held for a separate
+compatibility review: the proposed TypeScript 7.0.2 cannot satisfy
+`typescript-eslint` 8.70.1's `>=4.8.4 <6.1.0` peer requirement. Do not use
+`--force` or `--legacy-peer-deps` to bypass this conflict.
+
+Use an up-to-date Node 22 release for local validation, matching CI. The updated
+jsdom requires Node 22.22.2 or later within the Node 22 line; Vitest 5 does not
+support Node 25.
+
 ## Multiplayer Release Gates
 
 - PR gate: dependency audit and change review, a CycloneDX production-dependency SBOM, immutable action-reference validation, CodeQL, `npm run docs:diagrams`, `npm run lint`, `npm run typecheck`, coverage-backed unit/property/integration tests with mandatory PostgreSQL coverage, `npm run simulate:bots:gate`, `npm --workspace @colonizt/web run test`, `npm run smoke:network`, the two-browser multiplayer journey, and desktop/mobile Playwright in CI.
