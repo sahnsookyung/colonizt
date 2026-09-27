@@ -144,31 +144,34 @@ describe("WebSocket gateway", () => {
     await app.listen({ host: "127.0.0.1", port: 0 });
     const firstSocket = await openSocket(app, host.token);
     const secondSocket = await openSocket(app, host.token);
+    const joined = [firstSocket, secondSocket].map((socket) =>
+      waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string } }>(socket, "ROOM_STATE", (message) => message.room.id === room.id),
+    );
     firstSocket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.id }));
     secondSocket.send(JSON.stringify({ type: "JOIN_ROOM", roomId: room.id }));
-    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string } }>(firstSocket, "ROOM_STATE", (message) => message.room.id === room.id);
-    await waitForMessageWhere<{ type: "ROOM_STATE"; room: { id: string } }>(secondSocket, "ROOM_STATE", (message) => message.room.id === room.id);
+    await Promise.all(joined);
+    const firstBatchProcessed = waitForMessageWhere<{ type: "COMMAND_REJECTED"; clientSeq: number }>(
+      firstSocket,
+      "COMMAND_REJECTED",
+      (message) => message.clientSeq === 15,
+    );
     const rateLimited = waitForMessageWhere<{ type: "COMMAND_REJECTED"; code: string; clientSeq: number }>(
       secondSocket,
       "COMMAND_REJECTED",
       (message) => message.code === "RATE_LIMITED",
     );
 
-    for (let clientSeq = 1; clientSeq <= 30; clientSeq += 1) {
-      const socket = clientSeq <= 15 ? firstSocket : secondSocket;
-      socket.send(JSON.stringify({
-        type: "COMMAND",
-        roomId: room.id,
-        clientSeq,
-        command: { type: "ROLL_DICE", playerId: host.userId },
-      }));
-    }
-    secondSocket.send(JSON.stringify({
+    const sendCommand = (socket: WebSocket, clientSeq: number) => socket.send(JSON.stringify({
       type: "COMMAND",
       roomId: room.id,
-      clientSeq: 31,
+      clientSeq,
       command: { type: "ROLL_DICE", playerId: host.userId },
     }));
+    for (let clientSeq = 1; clientSeq <= 15; clientSeq += 1) sendCommand(firstSocket, clientSeq);
+    // TCP preserves order per socket, not across sockets. Consume the first half
+    // before asserting which command exhausts the shared session budget.
+    await firstBatchProcessed;
+    for (let clientSeq = 16; clientSeq <= 31; clientSeq += 1) sendCommand(secondSocket, clientSeq);
 
     await expect(rateLimited).resolves.toMatchObject({ code: "RATE_LIMITED", clientSeq: 31 });
     expect(submit).toHaveBeenCalledTimes(30);
