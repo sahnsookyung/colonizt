@@ -1,8 +1,10 @@
 import type { BotDifficulty, MapPreset } from "@colonizt/game-core";
 
+export type PlayerCount = 2 | 3 | 4;
+
 export interface MatchOptions {
   botDifficulty: BotDifficulty;
-  playerCount: 2 | 3 | 4;
+  playerCount: PlayerCount;
   rules: {
     diceDoubles: boolean;
     plight: boolean;
@@ -32,11 +34,11 @@ export const mapPresetLabels: Record<MapPreset, string> = {
   continent: "Continent",
 };
 
-export const toPlayerCount = (value: unknown, fallback: 2 | 3 | 4 = 4): 2 | 3 | 4 =>
+export const toPlayerCount = (value: unknown, fallback: PlayerCount = 4): PlayerCount =>
   value === 2 || value === 3 || value === 4 ? value : fallback;
 
-export const clampPlayerCount = (value: number): 2 | 3 | 4 =>
+export const clampPlayerCount = (value: number): PlayerCount =>
   value <= 2 ? 2 : value >= 4 ? 4 : 3;
 
-export const onlineRoomCapacityText = (playerCount: 2 | 3 | 4): string =>
+export const onlineRoomCapacityText = (playerCount: PlayerCount): string =>
   playerCount === 2 ? "2 player online room" : `2-${playerCount} player online room`;

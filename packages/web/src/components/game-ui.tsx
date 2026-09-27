@@ -130,7 +130,13 @@ export const ResourceCard = ({
   );
   if (onClick) {
     return (
-      <button type="button" className={className} onClick={onClick} disabled={disabled} aria-label={buttonLabel ?? `${resourceLabels[resource]}: ${count}`}>
+      <button
+        type="button"
+        className={className}
+        onClick={() => { if (!disabled) onClick(); }}
+        aria-disabled={disabled}
+        aria-label={buttonLabel ?? `${resourceLabels[resource]}: ${count}`}
+      >
         {content}
       </button>
     );

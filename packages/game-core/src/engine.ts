@@ -382,8 +382,8 @@ const largestArmySummary = (state: GameState): { owner?: PlayerId; knightCount: 
   const currentOwner = state.largestArmyOwner;
   const currentCount = currentOwner ? counts[currentOwner] ?? 0 : 0;
   if (currentOwner && currentCount >= largestArmyMinimum) {
-    const strictChallenger = state.playerOrder.find((playerId) => playerId !== currentOwner && (counts[playerId] ?? 0) > currentCount);
-    if (!strictChallenger) return { owner: currentOwner, knightCount: currentCount };
+    const hasStrictChallenger = state.playerOrder.some((playerId) => playerId !== currentOwner && (counts[playerId] ?? 0) > currentCount);
+    if (!hasStrictChallenger) return { owner: currentOwner, knightCount: currentCount };
   }
   const bestCount = Math.max(0, ...Object.values(counts));
   if (bestCount < largestArmyMinimum) return { knightCount: bestCount };

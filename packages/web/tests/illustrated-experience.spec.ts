@@ -191,6 +191,9 @@ test("trade and development sheets remain usable and accessible", async ({
     await page
       .getByRole("button", { name: `${card}: Ready`, exact: true })
       .click();
+    if (card === "Year of Plenty") {
+      await page.locator(".special-resource-grid .resource-card.selected").first().hover();
+    }
     await record(page, info, card.replaceAll(" ", "-"));
     await accessible(page);
     await page.keyboard.press("Escape");
@@ -228,6 +231,15 @@ test("discard selection is reachable inside its dialog", async ({
   await expect(
     page.getByRole("button", { name: "Discard", exact: true }),
   ).toBeEnabled();
+  const timberCard = page.getByRole("button", { name: "Select Timber to discard" });
+  await expect(timberCard).toBeDisabled();
+  await timberCard.focus();
+  await page.keyboard.press("Tab");
+  await page.keyboard.press("Shift+Tab");
+  await expect(timberCard).toBeFocused();
+  await page.keyboard.press("Enter");
+  await page.keyboard.press("Space");
+  await expect(timberCard.locator(".resource-selected-count")).toHaveText("x4");
   await record(page, info, "discard");
   await accessible(page);
 });
@@ -271,6 +283,9 @@ test("keyboard preview is cancelable and reduced motion disables piece animation
   await expect(
     page.getByRole("button", { name: "Confirm placement" }),
   ).toHaveCount(0);
+  await corner.press("Space");
+  await page.getByRole("button", { name: "Confirm placement" }).press("Escape");
+  await expect(page.getByRole("button", { name: "Confirm placement" })).toHaveCount(0);
   await corner.press("Space");
   await page.getByRole("button", { name: "Confirm placement" }).click();
   await expect(page.locator(".building.pending")).toHaveCSS(

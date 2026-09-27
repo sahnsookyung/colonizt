@@ -171,7 +171,7 @@ if (assertResults) {
       (winsByDifficulty.get("hard") ?? 0) <= 0
       || (winsByDifficulty.get("medium") ?? 0) <= 0
       || (winsByDifficulty.get("easy") ?? 0) <= 0
-      || !(strongRate > easy)
+      || strongRate <= easy
     ) process.exitCode = 1;
   }
 }

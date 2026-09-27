@@ -101,7 +101,7 @@ export class SessionController {
     pending: 0,
     clockOffsetMs: 0,
   };
-  private listeners = new Set<() => void>();
+  private readonly listeners = new Set<() => void>();
   private epoch = 0;
   private attempts = 0;
   private abort: AbortController | undefined;
@@ -123,7 +123,7 @@ export class SessionController {
   private transmitted: { epoch: number; clientSeq: number } | undefined;
   private resyncPending = false;
   private listening = false;
-  constructor(private client: NetworkClient = createNetworkClient()) {}
+  constructor(private readonly client: NetworkClient = createNetworkClient()) {}
   subscribe = (listener: () => void) => {
     this.listeners.add(listener);
     return () => {
@@ -180,18 +180,18 @@ export class SessionController {
     document.addEventListener("freeze", this.suspend);
     document.addEventListener("resume", this.wake);
   }
-  private visibility = () => {
+  private readonly visibility = () => {
     if (document.visibilityState === "visible") this.wake();
     else this.persist();
   };
-  private wake = () => {
+  private readonly wake = () => {
     if (this.config && this.status.state !== "expired") this.retry();
   };
-  private offline = () => {
+  private readonly offline = () => {
     this.disconnect();
     this.update("offline", "Offline · your seat is saved");
   };
-  private suspend = () => {
+  private readonly suspend = () => {
     this.persist();
     this.disconnect();
     this.update("offline", "Your seat is saved");
@@ -246,9 +246,13 @@ export class SessionController {
       this.update("retrying", "Connection paused · tap Retry");
       return;
     }
-    const delay =
-      Math.min(15_000, 750 * 2 ** (this.attempts - 1)) +
-      Math.floor(Math.random() * 250);
+    const randomByte = new Uint8Array(1);
+    let jitter: number;
+    // Reject the six out-of-range byte values to keep every delay equally likely.
+    do {
+      jitter = crypto.getRandomValues(randomByte)[0]!;
+    } while (jitter >= 250);
+    const delay = Math.min(15_000, 750 * 2 ** (this.attempts - 1)) + jitter;
     this.update("retrying", "Reconnecting to your table…", Date.now() + delay);
     this.retryTimer = setTimeout(() => this.attempt(), delay);
     track("network_reconnect", {

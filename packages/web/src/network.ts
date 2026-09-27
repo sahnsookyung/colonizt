@@ -215,7 +215,7 @@ export const createNetworkClient = (baseUrl = configuredBaseUrl): NetworkClient 
     signal?.throwIfAborted();
     if (config.protocolVersion !== protocolVersion) {
       configCache.delete(baseUrl ? trimTrailingSlash(baseUrl) : "__default__");
-      throw { code: "PROTOCOL_MISMATCH", message: "The game server needs an update. Please try again shortly." };
+      throw Object.assign(new Error("The game server needs an update. Please try again shortly."), { code: "PROTOCOL_MISMATCH" });
     }
     const ticket = await this.createWebSocketTicket(token, signal);
     signal?.throwIfAborted();

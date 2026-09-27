@@ -31,7 +31,7 @@ assertContains(deployWorkflowPath, deployWorkflow, 'workflows: ["CD - Build & Pu
 assertContains(deployWorkflowPath, deployWorkflow, "workflow_dispatch:");
 assertContains(deployWorkflowPath, deployWorkflow, "concurrency:");
 assertContains(deployWorkflowPath, deployWorkflow, "group: colonizt-production");
-assertMatches(deployWorkflowPath, deployWorkflow, /environment:\s*\n\s+name: production/, "the production environment");
+assertMatches(deployWorkflowPath, deployWorkflow, /environment:[\t ]*\r?\n[\t ]+name: production/, "the production environment");
 assertContains(deployWorkflowPath, deployWorkflow, "scripts/await-production-gates.mjs");
 assertContains(deployWorkflowPath, deployWorkflow, "CI=ci.yml");
 assertContains(deployWorkflowPath, deployWorkflow, "SonarCloud=sonarcloud.yml");
