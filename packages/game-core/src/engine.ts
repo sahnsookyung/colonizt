@@ -263,8 +263,10 @@ export const roadBuildingPlan = (state: GameState, playerId: PlayerId): RoadBuil
   if (remainingPieces === 1) return { requiredRoadCount: 1, firstEdges, options: firstEdges.map((edgeId) => [edgeId] as [EdgeId]) };
 
   const twoRoadOptions = firstEdges.flatMap((edgeId) => {
-    const preview = cloneState(state);
-    preview.roads[edgeId] = playerId;
+    const preview: GameState = {
+      ...state,
+      roads: { ...state.roads, [edgeId]: playerId },
+    };
     return Object.keys(preview.board.edges)
       .filter((candidate) => candidate !== edgeId && canBuildRoad(preview, playerId, candidate as EdgeId))
       .map((candidate) => [edgeId, candidate as EdgeId] as [EdgeId, EdgeId]);

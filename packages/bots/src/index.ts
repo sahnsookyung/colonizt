@@ -422,13 +422,12 @@ const difficultySearch = (difficulty: BotDifficulty = "medium"): { depth: number
 
 export const roadOpensSettlementAccess = (state: GameState, playerId: PlayerId, edgeId: EdgeId): boolean => {
   if (!canBuildRoad(state, playerId, edgeId)) return false;
-  const before = new Set(
-    Object.keys(state.board.vertices).filter((vertexId) => canPlaceSettlement(state, vertexId as VertexId, playerId)),
-  );
-  const preview = structuredClone(state) as GameState;
-  preview.roads[edgeId] = playerId;
-  return Object.keys(preview.board.vertices).some((vertexId) =>
-    !before.has(vertexId) && canPlaceSettlement(preview, vertexId as VertexId, playerId),
+  const preview: GameState = {
+    ...state,
+    roads: { ...state.roads, [edgeId]: playerId },
+  };
+  return (state.board.adjacency.edgeToVertices[edgeId] ?? []).some((vertexId) =>
+    !canPlaceSettlement(state, vertexId, playerId) && canPlaceSettlement(preview, vertexId, playerId),
   );
 };
 
@@ -559,11 +558,22 @@ const commandNudge = (view: BotView, command: GameCommand): number => {
   return 0;
 };
 
-const commandAfterUtility = (view: BotView, command: GameCommand, depth = 1, cache = new Map<string, number>()): number => {
-  const cacheKey = `${botStateFingerprint(view.state, view.botId)}:${JSON.stringify(command)}:${depth}`;
+const commandAfterUtility = (
+  view: BotView,
+  command: GameCommand,
+  depth = 1,
+  cache = new Map<string, number>(),
+  fingerprints = new WeakMap<GameState, string>(),
+): number => {
+  let fingerprint = fingerprints.get(view.state);
+  if (fingerprint === undefined) {
+    fingerprint = botStateFingerprint(view.state, view.botId);
+    fingerprints.set(view.state, fingerprint);
+  }
+  const cacheKey = `${fingerprint}:${JSON.stringify(command)}:${depth}`;
   const cached = cache.get(cacheKey);
   if (cached !== undefined) return cached;
-  const preview = applyCommand(structuredClone(view.state) as GameState, command);
+  const preview = applyCommand(view.state, command);
   if (!preview.ok) {
     cache.set(cacheKey, Number.NEGATIVE_INFINITY);
     return Number.NEGATIVE_INFINITY;
@@ -575,7 +585,7 @@ const commandAfterUtility = (view: BotView, command: GameCommand, depth = 1, cac
     const future = generateActionCandidates(nextView, view.profile ?? "greedy", defaultIdFactory)
       .filter((candidate) => candidate.type !== "END_TURN")
       .slice(0, difficultySearch(view.difficulty).branchLimit)
-      .map((candidate) => commandAfterUtility(nextView, candidate, depth - 1, cache));
+      .map((candidate) => commandAfterUtility(nextView, candidate, depth - 1, cache, fingerprints));
     if (future.length > 0) score += Math.max(0, Math.max(...future) - immediateScore) * 0.45;
   }
   cache.set(cacheKey, score);
@@ -588,16 +598,17 @@ const rankBotCandidates = (view: BotView, profile: BotProfile, idFactory: BotIdF
   if (commands.length === 0) return { candidates: [] };
   const current = evaluateState(view);
   const cache = new Map<string, number>();
+  const fingerprints = new WeakMap<GameState, string>();
   const candidatePool = search.depth > 1 && commands.length > search.candidateLimit
     ? commands
-      .map((command) => ({ command, score: commandAfterUtility(view, command, 1, cache) - current }))
+      .map((command) => ({ command, score: commandAfterUtility(view, command, 1, cache, fingerprints) - current }))
       .filter((candidate) => Number.isFinite(candidate.score))
       .sort((left, right) => right.score - left.score || commandPriority(right.command) - commandPriority(left.command) || left.command.type.localeCompare(right.command.type))
       .slice(0, search.candidateLimit)
       .map((candidate) => candidate.command)
     : commands;
   const scored = candidatePool
-    .map((command) => ({ command, score: commandAfterUtility(view, command, search.depth, cache) - current }))
+    .map((command) => ({ command, score: commandAfterUtility(view, command, search.depth, cache, fingerprints) - current }))
     .filter((candidate) => Number.isFinite(candidate.score))
     .sort((left, right) => right.score - left.score || left.command.type.localeCompare(right.command.type))
     .slice(0, search.topK);

@@ -17,11 +17,20 @@ describe("property checks", () => {
   });
 
   it("random bot games preserve invariants and replay determinism", () => {
+    const options = {
+      botDifficulty: "easy" as const,
+      botProfiles: {
+        p1: "random" as const,
+        p2: "random" as const,
+        p3: "random" as const,
+        p4: "random" as const,
+      },
+    };
     fc.assert(
       fc.property(fc.string({ minLength: 1, maxLength: 24 }), (seed) => {
-        const played = playBotGame(seed, 160);
+        const played = playBotGame(seed, 160, options);
         expect(assertInvariants(played.state).ok).toBe(true);
-        const replayed = replay({ config: createDemoConfig(seed), board: played.state.board, events: played.events });
+        const replayed = replay({ config: createDemoConfig(seed, options), board: played.state.board, events: played.events });
         expect(replayed).toEqual(played.state);
       }),
       { numRuns: 50 },

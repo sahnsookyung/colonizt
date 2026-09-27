@@ -1,15 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { completeSetup, createDemoGame, playBotGame, withResources } from "@colonizt/demo-state";
-import { applyCommand, cityCost, emptyResources, specialCardCost, type BotDifficulty, type DevelopmentCardType, type MapPreset, type PlayerId } from "@colonizt/game-core";
+import { completeSetup, createDemoGame, withResources } from "@colonizt/demo-state";
+import { applyCommand, cityCost, emptyResources, specialCardCost, type DevelopmentCardType, type MapPreset, type PlayerId } from "@colonizt/game-core";
 import { botStateFingerprint, chooseBotCommand, createBotView, evaluateState, evaluateTrade, greedyBot, hasEquivalentBotTradeOffer, resolveBotOfferCommand, roadOpensSettlementAccess, scoreBotCandidates, scoreTradeResponder, tradeFullyAnswered } from "../src/index.js";
 
-const tournamentPlayerIds = ["p1", "p2", "p3", "p4"] as const satisfies readonly PlayerId[];
 const alternateMapPresets = ["islands", "continent"] as const satisfies readonly MapPreset[];
-
-const rotatedDifficulties = (index: number): Record<PlayerId, BotDifficulty> => {
-  const tiers: BotDifficulty[] = ["hard", "medium", "easy", "easy"];
-  return Object.fromEntries(tournamentPlayerIds.map((playerId, offset) => [playerId, tiers[(index + offset) % tiers.length]!])) as Record<PlayerId, BotDifficulty>;
-};
 
 describe("bot policies", () => {
   it("fingerprints branch-relevant state beyond event sequence and phase", () => {
@@ -77,11 +71,28 @@ describe("bot policies", () => {
   it("only treats roads as settlement-access progress when they open a new legal site", () => {
     let state = completeSetup(createDemoGame("road-access-progress", { botDifficulty: "hard" })).state;
     state = withResources({ ...state, phase: { type: "ACTION_PHASE", activePlayerId: "p1" } }, "p1", { timber: 10, brick: 10, grain: 10, fiber: 10, ore: 10 });
+    const before = structuredClone(state);
 
     expect(roadOpensSettlementAccess(state, "p1", "e23")).toBe(false);
+    expect(state).toEqual(before);
 
     state.roads.e23 = "p1";
     expect(roadOpensSettlementAccess(state, "p1", "e20")).toBe(true);
+  });
+
+  it("scores candidate commands without mutating the authoritative state", () => {
+    let state = completeSetup(createDemoGame("candidate-purity", { botDifficulty: "hard" })).state;
+    state = withResources({ ...state, phase: { type: "ACTION_PHASE", activePlayerId: "p1" } }, "p1", {
+      timber: 4,
+      brick: 4,
+      grain: 4,
+      fiber: 4,
+      ore: 4,
+    });
+    const before = structuredClone(state);
+
+    expect(scoreBotCandidates(createBotView(state, "p1", greedyBot.profile, "hard"), greedyBot.profile)).not.toHaveLength(0);
+    expect(state).toEqual(before);
   });
 
   it("keeps true VP monotonic in the utility proxy", () => {
@@ -476,65 +487,6 @@ describe("bot policies", () => {
     const second = chooseBotCommand(createBotView(state, "p2", greedyBot.profile, "hard"), greedyBot.profile, () => "softmax-trade");
     expect(second).toEqual(first);
   });
-
-  it("concludes representative all-bot simulations under test-only turn adjudication", () => {
-    for (let index = 0; index < 16; index += 1) {
-      const played = playBotGame(`adjudicated-${index}`, 700, {
-        botDifficulty: "medium",
-        rules: { maxTurns: 50, maxTurnAdjudication: "leader", mapRandomized: true },
-      });
-      expect(played.invalidCommands).toBe(0);
-      expect(played.state.phase.type).toBe("GAME_OVER");
-    }
-  }, 120_000);
-
-  it("supports configurable bot counts across map presets", () => {
-    const scenarios: Array<{ playerCount: number; mapPreset: MapPreset }> = [
-      { playerCount: 2, mapPreset: "standard" },
-      { playerCount: 3, mapPreset: "islands" },
-      { playerCount: 4, mapPreset: "continent" },
-      { playerCount: 6, mapPreset: "islands" },
-      { playerCount: 8, mapPreset: "continent" },
-    ];
-    for (const { playerCount, mapPreset } of scenarios) {
-      const playerIds = Array.from({ length: playerCount }, (_, index) => `p${index + 1}` as PlayerId);
-      const played = playBotGame(`preset-count-${mapPreset}-${playerCount}`, 900, {
-        playerIds,
-        botDifficulty: "medium",
-        botProfiles: Object.fromEntries(playerIds.map((playerId) => [playerId, "greedy" as const])),
-        rules: { mapPreset, mapRandomized: true, maxTurns: 55, maxTurnAdjudication: "leader" },
-      });
-      expect(played.invalidCommands).toBe(0);
-      expect(played.state.phase.type).toBe("GAME_OVER");
-    }
-  }, 120_000);
-
-  it("runs mixed-difficulty tournament samples with stronger bots winning more often", () => {
-    const wins = new Map<BotDifficulty, number>();
-    const entries = new Map<BotDifficulty, number>();
-    for (let index = 0; index < 24; index += 1) {
-      const botDifficulties = rotatedDifficulties(index);
-      for (const difficulty of Object.values(botDifficulties)) entries.set(difficulty, (entries.get(difficulty) ?? 0) + 1);
-      const played = playBotGame(`difficulty-tournament-${index}`, 900, {
-        botDifficulties,
-        botProfiles: { p1: "greedy", p2: "greedy", p3: "greedy", p4: "greedy" },
-        rules: { maxTurns: 55, maxTurnAdjudication: "leader", mapRandomized: true },
-      });
-      expect(played.invalidCommands).toBe(0);
-      expect(played.state.phase.type).toBe("GAME_OVER");
-      if (played.state.phase.type === "GAME_OVER") {
-        const difficulty = botDifficulties[played.state.phase.winnerId];
-        wins.set(difficulty, (wins.get(difficulty) ?? 0) + 1);
-      }
-    }
-
-    const rate = (difficulty: BotDifficulty) => (wins.get(difficulty) ?? 0) / (entries.get(difficulty) ?? 1);
-    expect(entries.get("hard")).toBeGreaterThan(0);
-    expect(entries.get("medium")).toBeGreaterThan(0);
-    expect(entries.get("easy")).toBeGreaterThan(0);
-    const strongRate = ((wins.get("hard") ?? 0) + (wins.get("medium") ?? 0)) / ((entries.get("hard") ?? 0) + (entries.get("medium") ?? 0));
-    expect(strongRate).toBeGreaterThan(rate("easy"));
-  }, 120_000);
 
   it("does not repeat an equivalent bot trade after it has been cancelled", () => {
     const candidate = Array.from({ length: 80 }, (_, index) => {

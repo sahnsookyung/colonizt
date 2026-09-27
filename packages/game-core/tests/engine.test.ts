@@ -1261,7 +1261,9 @@ describe("development cards, thief, and adjudication", () => {
     const state = applyOrThrow(completeSetup(createDemoGame("road-building-two")).state, { type: "ROLL_DICE", playerId: "p1" }).state;
     state.players.p1!.developmentCards = [{ id: "road-card", type: "ROAD_BUILDING", ownerId: "p1", boughtTurn: state.turn - 1 }];
     state.players.p1!.specialCards = 1;
+    const roadsBefore = structuredClone(state.roads);
     const action = getLegalActions(state, "p1").find((candidate) => candidate.type === "PLAY_ROAD_BUILDING");
+    expect(state.roads).toEqual(roadsBefore);
     expect(action?.type).toBe("PLAY_ROAD_BUILDING");
     if (action?.type !== "PLAY_ROAD_BUILDING") throw new Error("Expected Road Building to be legal");
     expect(action.requiredRoadCount).toBe(2);
