@@ -50,3 +50,15 @@ it("arbitrates robber destinations and cancels previews with Escape", () => {
   fireEvent.click(screen.getByRole("button", { name: "Confirm placement" }));
   expect(input.onHex).toHaveBeenCalledExactlyOnceWith(hexes[0]!.id);
 });
+
+it.each(["Zoom in", "Zoom out", "Fit board", "Confirm placement", "Cancel"])("cancels a placement with Escape from %s", (control) => {
+  const vertex = Object.values(game.board.vertices)[0]!;
+  const input = { ...props(), legalSettlements: new Set([vertex.id]) };
+  render(<GameBoard {...input} />);
+  fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
+  fireEvent.keyDown(screen.getByRole("button", { name: /Place setup settlement/ }), { key: "Enter" });
+  fireEvent.keyDown(screen.getByRole("button", { name: control }), { key: "Escape" });
+  expect(screen.queryByRole("button", { name: "Confirm placement" })).not.toBeInTheDocument();
+  expect(input.onCancel).toHaveBeenCalledOnce();
+  expect(input.onVertex).not.toHaveBeenCalled();
+});

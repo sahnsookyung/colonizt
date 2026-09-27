@@ -95,9 +95,9 @@ const harness = () => {
 
 it.each([
   { sample: 0, delay: 750 },
-  { sample: 0xffff_ffff, delay: 999 },
+  { sample: 249, delay: 999 },
 ])("keeps reconnect jitter within the backoff window for random sample $sample", async ({ sample, delay }) => {
-  vi.spyOn(crypto, "getRandomValues").mockReturnValue(new Uint32Array([sample]));
+  vi.spyOn(crypto, "getRandomValues").mockReturnValue(new Uint8Array([sample]));
   const h = harness();
   h.start();
   h.open().handlers.onClose?.();
@@ -107,6 +107,18 @@ it.each([
   expect(h.client.connect).toHaveBeenCalledTimes(1);
   await vi.advanceTimersByTimeAsync(1);
   expect(h.client.connect).toHaveBeenCalledTimes(2);
+});
+
+it("rejects random bytes outside the reconnect jitter range", () => {
+  const random = vi.spyOn(crypto, "getRandomValues")
+    .mockReturnValueOnce(new Uint8Array([250]))
+    .mockReturnValueOnce(new Uint8Array([255]))
+    .mockReturnValue(new Uint8Array([249]));
+  const h = harness();
+  h.start();
+  h.open().handlers.onClose?.();
+  expect(random).toHaveBeenCalledTimes(3);
+  expect(h.controller.getSnapshot()).toMatchObject({ state: "retrying", retryAt: 100_999 });
 });
 
 describe("authoritative stream reconciliation", () => {
@@ -393,7 +405,7 @@ describe("session recovery", () => {
     expect(h.client.sendCommand).toHaveBeenCalledTimes(1);
   });
   it("backs off to a bounded pause and supports an explicit retry", async () => {
-    vi.spyOn(crypto, "getRandomValues").mockReturnValue(new Uint32Array([0]));
+    vi.spyOn(crypto, "getRandomValues").mockReturnValue(new Uint8Array([0]));
     const h = harness();
     h.start();
     for (let attempt = 0; attempt < 8; attempt++) {

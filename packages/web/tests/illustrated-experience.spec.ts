@@ -284,6 +284,9 @@ test("keyboard preview is cancelable and reduced motion disables piece animation
     page.getByRole("button", { name: "Confirm placement" }),
   ).toHaveCount(0);
   await corner.press("Space");
+  await page.getByRole("button", { name: "Confirm placement" }).press("Escape");
+  await expect(page.getByRole("button", { name: "Confirm placement" })).toHaveCount(0);
+  await corner.press("Space");
   await page.getByRole("button", { name: "Confirm placement" }).click();
   await expect(page.locator(".building.pending")).toHaveCSS(
     "animation-name",

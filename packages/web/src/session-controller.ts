@@ -246,9 +246,13 @@ export class SessionController {
       this.update("retrying", "Connection paused · tap Retry");
       return;
     }
-    const delay =
-      Math.min(15_000, 750 * 2 ** (this.attempts - 1)) +
-      Math.floor((crypto.getRandomValues(new Uint32Array(1))[0]! / 2 ** 32) * 250);
+    const randomByte = new Uint8Array(1);
+    let jitter: number;
+    // Reject the six out-of-range byte values to keep every delay equally likely.
+    do {
+      jitter = crypto.getRandomValues(randomByte)[0]!;
+    } while (jitter >= 250);
+    const delay = Math.min(15_000, 750 * 2 ** (this.attempts - 1)) + jitter;
     this.update("retrying", "Reconnecting to your table…", Date.now() + delay);
     this.retryTimer = setTimeout(() => this.attempt(), delay);
     track("network_reconnect", {

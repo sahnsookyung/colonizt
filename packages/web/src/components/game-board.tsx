@@ -118,19 +118,23 @@ export const GameBoard = ({
     else onHex(validSelection.id);
     setSelection(null);
   };
+  const cancel = () => {
+    setSelection(null);
+    onCancel();
+  };
+  const cancelOnEscape = (event: KeyboardEvent) => {
+    if (event.key === "Escape") cancel();
+  };
   const activate = (
     event: KeyboardEvent<SVGGElement>,
     kind: BoardSelectionKind,
     id: string,
   ) => {
+    cancelOnEscape(event);
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
       select(kind, id);
     }
-  };
-  const cancel = () => {
-    setSelection(null);
-    onCancel();
   };
   const hexes = useMemo(
     () =>
@@ -152,9 +156,6 @@ export const GameBoard = ({
       className="board-viewport"
       role="group"
       aria-label="Game board controls"
-      onKeyDown={(event) => {
-        if (event.key === "Escape") cancel();
-      }}
     >
       <svg
         ref={camera.svgRef}
@@ -467,6 +468,7 @@ export const GameBoard = ({
       <div className="board-camera-controls" aria-label="Board view">
         <button
           onClick={() => camera.zoom(1.3)}
+          onKeyDown={cancelOnEscape}
           aria-label="Zoom in"
           disabled={camera.camera.scale >= 3}
         >
@@ -474,12 +476,13 @@ export const GameBoard = ({
         </button>
         <button
           onClick={() => camera.zoom(1 / 1.3)}
+          onKeyDown={cancelOnEscape}
           aria-label="Zoom out"
           disabled={camera.camera.scale <= 1}
         >
           −
         </button>
-        <button onClick={camera.fit}>Fit board</button>
+        <button onClick={camera.fit} onKeyDown={cancelOnEscape}>Fit board</button>
       </div>
       {validSelection && !disabled ? (
         <div
@@ -496,10 +499,10 @@ export const GameBoard = ({
                   ? "Upgrade this village?"
                   : "Settle here?"}
           </span>
-          <button className="primary-button" onClick={confirm}>
+          <button className="primary-button" onClick={confirm} onKeyDown={cancelOnEscape}>
             Confirm placement
           </button>
-          <button onClick={cancel}>Cancel</button>
+          <button onClick={cancel} onKeyDown={cancelOnEscape}>Cancel</button>
         </div>
       ) : null}
       <div className="board-caption" aria-hidden="true">
