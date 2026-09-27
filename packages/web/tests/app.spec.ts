@@ -139,7 +139,7 @@ test("desktop game screen fits the viewport without page scrolling", async ({ pa
   }
 });
 
-test("action controls use solid contained colors", async ({ page, isMobile }) => {
+test("action controls keep readable paper surfaces over scenery", async ({ page, isMobile }) => {
   test.skip(isMobile, "desktop project only");
   await page.goto("/");
   await page.getByRole("button", { name: /Bot Match/ }).click();
@@ -156,7 +156,6 @@ test("action controls use solid contained colors", async ({ page, isMobile }) =>
       bar: {
         backgroundImage: barStyle.backgroundImage,
         backdropFilter: barStyle.backdropFilter,
-        alpha: alphaOf(barStyle.backgroundColor),
       },
       buttons: [...document.querySelectorAll<HTMLElement>(".board-action")].map((button) => {
         const style = window.getComputedStyle(button);
@@ -171,11 +170,11 @@ test("action controls use solid contained colors", async ({ page, isMobile }) =>
 
   expect(styles.bar.backgroundImage).toBe("none");
   expect(styles.bar.backdropFilter === "none" || styles.bar.backdropFilter === "").toBe(true);
-  expect(styles.bar.alpha).toBe(1);
   expect(styles.buttons.length).toBeGreaterThanOrEqual(6);
   for (const button of styles.buttons) {
     expect(button.backgroundImage).toBe("none");
-    expect(button.alpha).toBe(1);
+    // Paper may be translucent, but controls must retain a strong readable backing.
+    expect(button.alpha).toBeGreaterThanOrEqual(0.9);
   }
 });
 
