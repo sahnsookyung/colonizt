@@ -10,9 +10,11 @@
   max-height: calc(100dvh - 48px);
   overflow: auto;
   z-index: 40;
-  border: 1px solid #baaf95;
+  border: 1px solid var(--paper-edge);
   border-radius: 20px;
-  background: var(--paper);
+  background: var(--paper-glass);
+  -webkit-backdrop-filter: var(--paper-blur);
+  backdrop-filter: var(--paper-blur);
   color: var(--ink);
   padding: 24px;
   box-shadow:
@@ -165,7 +167,7 @@
   gap: 8px;
   padding: 10px;
   border-radius: 10px;
-  background: #eee9d9;
+  background: var(--paper-inset);
 }
 .trade-response.selected {
   box-shadow: inset 0 0 0 2px var(--forest);
@@ -287,7 +289,7 @@
 .victory-player,
 .analysis-card {
   border: 1px solid var(--line);
-  background: #f2ebd9;
+  background: var(--paper-inset);
   border-radius: 12px;
   padding: 16px;
   display: grid;

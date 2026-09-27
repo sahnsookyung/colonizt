@@ -1,12 +1,15 @@
 /* A welcoming tabletop, before the first turn. */
+.start-app {
+  background: linear-gradient(90deg, #173e3d99, #173e3d12 75%);
+}
 .start-screen {
   min-height: 100svh;
   display: grid;
-  grid-template-columns: minmax(360px, 1fr) minmax(440px, 560px);
+  grid-template-columns: minmax(0, 1fr) minmax(400px, 560px);
   max-width: 1440px;
   margin: auto;
   padding: 48px;
-  gap: 56px;
+  gap: 40px;
   align-items: center;
 }
 .island-intro {
@@ -18,6 +21,11 @@
   align-items: flex-start;
   padding: 36px 20px;
   overflow: hidden;
+  color: #fff6df;
+  text-shadow: 0 2px 18px #163e3bb3;
+}
+.island-intro .eyebrow {
+  color: #f4dfb4;
 }
 .island-intro h2 {
   font-size: clamp(50px, 5.8vw, 88px);
@@ -26,7 +34,7 @@
   z-index: 1;
 }
 .island-intro p {
-  color: var(--muted);
+  color: #fff1d7;
   font-size: 17px;
   line-height: 1.7;
   z-index: 1;
@@ -34,23 +42,41 @@
 .intro-footnote {
   font-size: 12px;
   letter-spacing: 0.06em;
-  color: var(--muted);
+  color: #fff1d7;
 }
 .intro-island {
-  height: 260px;
-  width: 290px;
-  margin: 24px 0 26px 20px;
-  background: url("../assets/terrain-atlas.png") 0 0 / 300% 200%;
-  clip-path: polygon(50% 0, 96% 25%, 96% 75%, 50% 100%, 4% 75%, 4% 25%);
-  transform: rotate(-9deg);
+  min-height: 160px;
+  display: flex;
+  align-items: center;
+  margin: 12px 0;
+}
+.intro-island-stamp {
+  width: 116px;
+  min-height: 116px;
+  display: grid;
+  place-content: center;
+  padding: 20px;
+  border: 1px solid #f4dfb499;
+  outline: 1px solid #f4dfb455;
+  outline-offset: 5px;
+  border-radius: 50%;
+  background: #244e4880;
+  font-family: Georgia, serif;
+  font-style: italic;
+  font-size: 19px;
+  line-height: 1.2;
+  text-align: center;
+  transform: rotate(-12deg);
 }
 .start-panel {
   display: grid;
   gap: 24px;
   padding: 32px;
-  border: 1px solid #fffdf6;
+  border: 1px solid var(--paper-edge);
   border-radius: 24px;
-  background: #fffaf0;
+  background: var(--paper-glass);
+  -webkit-backdrop-filter: var(--paper-blur);
+  backdrop-filter: var(--paper-blur);
   box-shadow: var(--shadow);
 }
 .start-brand {
@@ -76,14 +102,16 @@
   display: grid;
   gap: 9px;
   border-radius: 16px;
-  background: #efe9d8;
+  background: rgb(249 242 222 / 88%);
   min-height: 170px;
 }
 .match-choice:nth-child(2) {
-  background: #e1e8d9;
+  background: rgb(231 237 213 / 88%);
 }
 .match-choice strong {
-  font-size: 19px;
+  font-family: Georgia, serif;
+  font-size: 21px;
+  font-weight: 500;
 }
 .match-choice > span:not(.match-art):not(.match-cta) {
   font-size: 12px;
@@ -94,11 +122,22 @@
   align-items: center;
   gap: 8px;
   color: var(--forest);
-  height: 34px;
+  height: 62px;
+  margin: -12px -12px 2px;
+  padding: 10px;
+  border-radius: 10px 10px 3px 3px;
+  background: url("../assets/terrain-atlas.png") 0 27% / 300% 260%;
+  box-shadow: inset 0 0 0 1px #5c644526;
+}
+.match-choice:nth-child(2) .match-art {
+  background-position: 100% 27%;
 }
 .match-art svg {
   width: 32px;
   height: 32px;
+  padding: 4px;
+  border-radius: 50%;
+  background: #fff8e8e8;
 }
 .match-cta {
   font-size: 12px;
@@ -177,7 +216,10 @@
   gap: 18px;
   padding: 14px 24px;
   border-bottom: 1px solid var(--line);
-  background: var(--paper);
+  background: var(--paper-glass);
+  -webkit-backdrop-filter: var(--paper-blur);
+  backdrop-filter: var(--paper-blur);
+  box-shadow: 0 2px 12px #163e3b1f;
 }
 .brand-block h1 {
   font-size: 28px;
@@ -212,7 +254,7 @@
 }
 .online-lobby {
   min-height: 100svh;
-  background: #e6ebdf;
+  background: #244e4838;
 }
 .lobby-layout {
   display: grid;
@@ -235,14 +277,17 @@
 .lobby-settings {
   padding: 20px;
   border-radius: 16px;
-  background: var(--paper);
-  border: 1px solid var(--line);
+  background: var(--paper-glass);
+  border: 1px solid var(--paper-edge);
+  -webkit-backdrop-filter: var(--paper-blur);
+  backdrop-filter: var(--paper-blur);
+  box-shadow: var(--shadow);
 }
 .lobby-code-card {
   display: grid;
   gap: 14px;
   text-align: center;
-  background: var(--forest);
+  background: rgb(39 75 58 / 90%);
   color: #fffaf0;
 }
 .lobby-code-card > span {
@@ -257,6 +302,7 @@
 }
 .lobby-code-card button {
   justify-self: center;
+  color: var(--ink);
 }
 .lobby-status-card {
   display: grid;
@@ -297,7 +343,9 @@
 .lobby-seat {
   display: grid;
   gap: 6px;
-  background: #eee9d9;
+  background: var(--paper-glass);
+  border: 1px solid var(--paper-edge);
+  box-shadow: var(--raised-shadow);
   border-radius: 10px;
   padding: 14px;
   min-width: 0;
@@ -314,10 +362,12 @@
   box-shadow: inset 0 0 0 2px var(--forest);
 }
 .lobby-seat.ready {
-  background: #e0e9d6;
+  background: rgb(224 233 214 / 94%);
 }
 .lobby-seat.closed {
-  opacity: 0.55;
+  background: var(--paper-inset);
+  border-style: dashed;
+  box-shadow: none;
 }
 .lobby-rules {
   display: flex;
@@ -325,7 +375,7 @@
   gap: 6px;
 }
 .lobby-rules span {
-  background: #ede5d2;
+  background: var(--paper-inset);
   border-radius: 16px;
   padding: 6px 10px;
   font-size: 11px;
@@ -333,6 +383,14 @@
 .lobby-settings {
   display: grid;
   gap: 12px;
+}
+.phase-card .lobby-settings {
+  margin-top: 12px;
+  background: var(--paper-inset);
+  border-color: var(--line);
+  box-shadow: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
 }
 .lobby-bot-controls {
   display: flex;
@@ -348,7 +406,7 @@
   .start-screen {
     padding: 24px;
     gap: 24px;
-    grid-template-columns: 1fr 1.2fr;
+    grid-template-columns: minmax(0, 1fr) minmax(380px, 1.2fr);
   }
   .island-intro {
     padding: 12px 0;
@@ -357,15 +415,42 @@
     font-size: 54px;
   }
   .intro-island {
-    width: 230px;
-    height: 220px;
-    margin-left: 0;
+    min-height: 140px;
   }
   .start-panel {
     padding: 24px;
   }
+  .match-choice strong {
+    font-size: 18px;
+  }
   .lobby-layout {
     padding-top: 24px;
+  }
+}
+@media (min-width: 651px) and (max-width: 760px) {
+  .start-screen {
+    grid-template-columns: 1fr;
+    max-width: 600px;
+  }
+  .island-intro {
+    padding: 12px 8px;
+  }
+  .island-intro h2 {
+    font-size: 50px;
+  }
+  .island-intro p,
+  .intro-footnote {
+    display: none;
+  }
+  .intro-island {
+    position: absolute;
+    right: 20px;
+    bottom: 20px;
+    margin: 0;
+  }
+  .lobby-layout {
+    grid-template-columns: 1fr;
+    max-width: 600px;
   }
 }
 @media (max-width: 650px) {
@@ -378,7 +463,7 @@
     min-height: 180px;
   }
   .island-intro h2 {
-    font-size: 44px;
+    font-size: clamp(30px, 9vw, 38px);
     margin: 12px 0;
   }
   .island-intro p,
@@ -387,17 +472,23 @@
   }
   .intro-island {
     position: absolute;
-    right: -14px;
-    bottom: 10px;
-    width: 160px;
-    height: 160px;
+    right: 0;
+    bottom: 30px;
+    min-height: 104px;
     margin: 0;
-    opacity: 0.75;
     z-index: 0;
   }
-  .island-intro h2,
+  .intro-island-stamp {
+    width: 78px;
+    min-height: 78px;
+    padding: 12px;
+    font-size: 14px;
+  }
+  .island-intro h2 {
+    max-width: 75%;
+  }
   .island-intro .eyebrow {
-    max-width: 65%;
+    font-size: 10px;
   }
   .start-panel {
     padding: 24px 18px;
@@ -474,6 +565,6 @@
     font-size: 36px;
   }
   .rule-toggle {
-    min-height: 34px;
+    min-height: 44px;
   }
 }

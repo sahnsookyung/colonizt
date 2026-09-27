@@ -1,7 +1,7 @@
 /* The table reserves space for controls; nothing floats over a playable edge. */
 .game-surface {
   min-height: 100dvh;
-  background: var(--water);
+  background: rgb(37 74 69 / 68%);
 }
 .board-layout {
   position: relative;
@@ -21,16 +21,19 @@
   min-width: 0;
 }
 .player {
-  border: 1px solid;
+  border: 1px solid var(--paper-edge);
   border-left-width: 5px;
   border-radius: 12px;
-  background: #f7f3e5;
+  background: var(--paper-glass);
+  box-shadow: var(--raised-shadow);
+  -webkit-backdrop-filter: var(--paper-blur);
+  backdrop-filter: var(--paper-blur);
   padding: 9px 12px;
   min-width: 0;
 }
 .player.active {
-  background: #fffaf0;
-  box-shadow: 0 0 0 2px #e6c676;
+  background: var(--paper-solid);
+  box-shadow: 0 0 0 2px #d3aa58, var(--raised-shadow);
 }
 .player-heading {
   display: grid;
@@ -100,7 +103,9 @@
   align-items: center;
   justify-content: center;
   gap: 8px;
-  background: #f3eddd;
+  background: var(--paper-glass);
+  border: 1px solid var(--paper-edge);
+  box-shadow: var(--raised-shadow);
   border-radius: 12px;
   list-style: none;
   cursor: pointer;
@@ -118,7 +123,9 @@
   width: 320px;
   max-height: calc(100dvh - 190px);
   overflow: auto;
-  background: var(--paper);
+  background: var(--paper-glass);
+  -webkit-backdrop-filter: var(--paper-blur);
+  backdrop-filter: var(--paper-blur);
   border: 1px solid var(--line);
   border-radius: 16px;
   box-shadow: var(--shadow);
@@ -129,6 +136,10 @@
 .side-panel .phase-card {
   padding: 12px;
   border-radius: 10px;
+  background: var(--paper-inset);
+  box-shadow: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
 }
 .bank-resource-row {
   display: flex;
@@ -193,7 +204,8 @@
   min-height: 0;
   overflow: hidden;
   border-radius: 16px;
-  background: #497776;
+  background: rgb(64 112 108 / 94%);
+  box-shadow: inset 0 0 0 1px #ecddb632, inset 0 0 64px #193c382e;
 }
 .board {
   display: block;
@@ -464,7 +476,8 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  background: #f8f1dd;
+  background: var(--paper-glass);
+  border-color: var(--paper-edge);
   padding: 6px 12px;
   border-radius: 12px;
   min-height: 52px;
@@ -526,47 +539,76 @@
 .resource-card {
   position: relative;
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 3px;
   width: 64px;
   min-width: 52px;
   min-height: 70px;
-  border: 1px solid #f1e6cc;
+  border: 1px solid #e7dab8;
   border-radius: 10px;
   padding: 8px;
   background: #ecedd8;
   color: var(--ink);
-  box-shadow: 0 3px 0 #203f3b2b;
+  box-shadow: var(--raised-shadow);
+}
+/* Only scenery is painted; symbols, counts and labels stay above it. */
+.resource-card::before {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border-radius: 7px;
+  background: url("../assets/terrain-atlas.png") var(--terrain-position) / 300% 200%;
+  pointer-events: none;
+}
+.resource-card > .resource-icon,
+.resource-count,
+.resource-name {
+  position: relative;
+  background: var(--paper-solid);
+  border-radius: 5px;
 }
 .resource-card .resource-icon {
   width: 26px;
+  max-width: 100%;
   height: 26px;
+  padding: 2px;
 }
 .resource-count {
   font-family: Georgia, serif;
   font-size: 22px;
   font-weight: 700;
+  min-width: 18px;
+  text-align: center;
   animation: resource-arrival 180ms ease-out;
 }
 .resource-name {
   grid-column: 1/-1;
   font-size: 10px;
   text-align: center;
+  padding: 3px 0;
+  margin: 0 -4px -4px;
+  border-radius: 2px 2px 5px 5px;
+  font-weight: 650;
 }
 .resource-card-brick {
+  --terrain-position: 50% 0%;
   background: #edd6c3;
 }
 .resource-card-grain {
+  --terrain-position: 100% 0%;
   background: #f0dfaa;
 }
 .resource-card-fiber {
+  --terrain-position: 0% 100%;
   background: #e1e7ce;
 }
 .resource-card-ore {
+  --terrain-position: 50% 100%;
   background: #d7e2dd;
 }
 .resource-card-timber {
+  --terrain-position: 0% 0%;
   background: #d3dfc2;
 }
 .resource-card.selected {
@@ -613,6 +655,8 @@
   min-width: 60px;
   padding: 5px;
   gap: 4px;
+  background: var(--paper-glass);
+  border-color: var(--paper-edge);
 }
 .dev-hand-card small {
   font-size: 10px;
@@ -628,7 +672,7 @@
   display: flex;
   gap: 6px;
   align-items: stretch;
-  background: var(--water);
+  background: transparent;
 }
 .board-action {
   position: relative;
@@ -640,13 +684,19 @@
   gap: 5px;
   min-height: 70px;
   padding: 7px 3px;
-  background: #eee8d7;
+  background: var(--paper-glass);
   font-size: 10px;
-  border-color: #d7cfb9;
+  border-color: var(--paper-edge);
 }
 .board-action > svg {
   width: 24px;
   height: 24px;
+}
+.board-action:disabled {
+  opacity: 1;
+  background: rgb(220 228 210 / 92%);
+  color: #61705f;
+  box-shadow: var(--pressed-shadow);
 }
 .board-action.end-action {
   width: 80px;

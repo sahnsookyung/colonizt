@@ -48,7 +48,9 @@ export const SetupScreen = ({
           <br />
           Build something together.
         </p>
-        <div className="intro-island" />
+        <div className="intro-island">
+          <span className="intro-island-stamp">A world worth sharing</span>
+        </div>
         <span className="intro-footnote">
           A tabletop adventure for 2–4 friends
         </span>

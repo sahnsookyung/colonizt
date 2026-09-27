@@ -2,17 +2,24 @@
   color-scheme: light;
   font-family: "Avenir Next", "Segoe UI", system-ui, sans-serif;
   color: #293d35;
-  background: #f2eddf;
+  background: #305e5c;
   --ink: #293d35;
   --muted: #536157;
   --paper: #fffaf0;
   --paper-dark: #eee6d3;
+  --paper-glass: rgb(255 249 232 / 90%);
+  --paper-solid: #fff9e8;
+  --paper-inset: rgb(232 224 199 / 60%);
+  --paper-edge: rgb(255 250 232 / 65%);
+  --paper-blur: blur(14px);
+  --pressed-shadow: inset 0 1px 3px #293d3518;
+  --raised-shadow: inset 0 1px 0 #fff9e8b3, 0 2px 0 #203c3526;
   --line: #cfc7b2;
   --forest: #315c46;
-  --water: #426f70;
+  --water: #345f5d;
   --gold: #d3aa58;
   --danger: #963f32;
-  --shadow: 0 12px 32px #203c3524;
+  --shadow: 0 12px 32px #183a3533;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 }
@@ -22,6 +29,17 @@
 body {
   margin: 0;
   min-width: 320px;
+}
+#root {
+  isolation: isolate;
+}
+#root::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: url("../assets/island-backdrop.webp") center / cover;
 }
 button,
 input,
@@ -35,7 +53,8 @@ button {
   border: 1px solid var(--line);
   border-radius: 10px;
   padding: 9px 14px;
-  background: var(--paper);
+  background: var(--paper-glass);
+  box-shadow: var(--raised-shadow);
   font-weight: 650;
   cursor: pointer;
   transition: transform 120ms;
@@ -75,7 +94,8 @@ select {
   padding: 10px 12px;
   border: 1px solid var(--line);
   border-radius: 9px;
-  background: #fffdf7;
+  background: rgb(255 253 245 / 88%);
+  box-shadow: var(--pressed-shadow);
 }
 input[type="checkbox"] {
   width: 20px;
@@ -254,7 +274,7 @@ small {
   width: 30px;
   height: 40px;
   display: block;
-  color: #695887;
+  color: #76623e;
 }
 .dev-card-face {
   fill: #f0e8d7;
@@ -293,6 +313,13 @@ small {
     animation: none !important;
     transition: none !important;
     scroll-behavior: auto !important;
+  }
+}
+@media (prefers-reduced-transparency: reduce) {
+  :root {
+    --paper-glass: var(--paper-solid);
+    --paper-inset: var(--paper-dark);
+    --paper-blur: none;
   }
 }
 
