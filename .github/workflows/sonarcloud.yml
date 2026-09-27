@@ -17,6 +17,9 @@ concurrency:
 jobs:
   sonarcloud:
     name: SonarCloud Analysis
+    # Skip the whole job for Dependabot PRs, including human-triggered updates.
+    # The merged result is still analyzed by the push-to-main trigger.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -46,7 +49,7 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
           if [ -z "$SONAR_TOKEN" ]; then
-            echo "::error::SONAR_TOKEN is missing. Configure it in both Actions and Dependabot repository secrets; Dependabot runs cannot read Actions secrets. See docs/testing.md."
+            echo "::error::SONAR_TOKEN is missing. Configure it in Actions repository secrets. See docs/testing.md."
             exit 1
           fi
 
