@@ -191,6 +191,9 @@ test("trade and development sheets remain usable and accessible", async ({
     await page
       .getByRole("button", { name: `${card}: Ready`, exact: true })
       .click();
+    if (card === "Year of Plenty") {
+      await page.locator(".special-resource-grid .resource-card.selected").first().hover();
+    }
     await record(page, info, card.replaceAll(" ", "-"));
     await accessible(page);
     await page.keyboard.press("Escape");
